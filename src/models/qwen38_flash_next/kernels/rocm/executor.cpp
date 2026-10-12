@@ -2232,8 +2232,13 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
       half_output ? reinterpret_cast<__half*>(s_.gdn_out) : nullptr;
   // Shift successive rows off the 12 KiB pitch while retaining every half.
   // The existing F32 scratch has room for these slightly padded F16 rows.
+  // The strided kernel is tuned for the full-width projection (k == 6144);
+  // a TP rank's half (k == 3072) has a different pitch and keeps the plain
+  // path, which is what the TP2 split was qualified with.
   const std::uint32_t half_stride =
-      half_output && n_tokens >= 1024 ? l.ssm_out.cols + 32 : 0;
+      half_output && n_tokens >= 1024 && l.ssm_out.cols == 6144
+          ? l.ssm_out.cols + 32
+          : 0;
   // A decode batch's output projection reads the epilogue's Q8_1 rows.
   // All value heads, or a TP rank's half.
   const std::uint32_t value_dim = heads.SsmValueDim();
