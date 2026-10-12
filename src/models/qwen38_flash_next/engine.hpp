@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -17,6 +18,8 @@
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
+
+struct ihipStream_t;
 
 namespace gufo::core {
 class GgufReader;
@@ -31,6 +34,7 @@ struct MtpCandidateLogits;
 class ContinuationAdapter;
 class ContinuationHooks;
 namespace rocm {
+class Communicator;
 class DeviceModel;
 class Executor;
 class Session;
@@ -48,6 +52,15 @@ struct ModelOptions {
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
   std::uint32_t decode_concurrency = 1;
+  /// Optional two-rank expert-parallel identity. World size one preserves the
+  /// existing single-rank path and needs no communicator.
+  std::uint32_t tp_rank = 0;
+  std::uint32_t tp_world_size = 1;
+  int hip_device = 0;
+  std::shared_ptr<rocm::Communicator> communicator;
+  /// Diagnostic observer for MoE inputs and outputs; see Executor::Options. The
+  /// stream parameter is a `hipStream_t`, spelled without the HIP headers.
+  std::function<void(const float*, std::size_t, ihipStream_t*)> moe_observer;
 };
 
 class Session;
@@ -75,7 +88,15 @@ public:
   [[nodiscard]] std::int32_t EosToken() const noexcept;
   [[nodiscard]] bool IsStopToken(std::int32_t token) const noexcept;
   [[nodiscard]] std::uint32_t VocabSize() const noexcept;
+  /// Prompt tokens one prefill step feeds: under TP, up to two trunk
+  /// batches run as an overlapped pair.
   [[nodiscard]] std::uint32_t PrefillCapacity() const noexcept;
+  /// The first trunk batch's rows when a prefill step of `tokens` runs as a
+  /// pair, else 0.
+  [[nodiscard]] std::uint32_t PrefillPairLead(
+      std::uint32_t tokens) const noexcept;
+  /// The widest final prefill pass: a chunk plus a short prompt tail, so a
+  /// prompt just past a chunk takes no second pass.
   [[nodiscard]] std::uint32_t PrefillThroughCapacity() const noexcept;
   [[nodiscard]] std::uint32_t MaxContext() const noexcept {
     return options_.max_context;
@@ -84,6 +105,13 @@ public:
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }
+  [[nodiscard]] std::uint32_t TpRank() const noexcept {
+    return options_.tp_rank;
+  }
+  [[nodiscard]] std::uint32_t TpWorldSize() const noexcept {
+    return options_.tp_world_size;
+  }
+  [[nodiscard]] int HipDevice() const noexcept { return options_.hip_device; }
   [[nodiscard]] std::string ModelName() const;
   [[nodiscard]] const Config& config() const noexcept;
   [[nodiscard]] const tokenization::QwenTokenizer& tokenizer() const noexcept {
@@ -153,11 +181,19 @@ public:
   /// consumption includes proposal and verification draws. A
   /// one-token budget or a model without MTP uses ordinary decoding.
   /// Benchmarks may continue past EOS by setting stop_at_eos to false.
-  [[nodiscard]] bool DecodeStep(std::size_t max_tokens,
-                                sampling::SamplerState& sampler,
-                                DecodeResult* result,
-                                std::string* error_msg = nullptr,
-                                bool stop_at_eos = true);
+  /// `forced_drafts`, when given, fixes the cycle's draft count instead of
+  /// choosing it from this session's acceptance history (a TP2 rank 0's
+  /// choice, mirrored so both ranks run cycles of the same width).
+  [[nodiscard]] bool DecodeStep(
+      std::size_t max_tokens, sampling::SamplerState& sampler,
+      DecodeResult* result, std::string* error_msg = nullptr,
+      bool stop_at_eos = true, std::optional<std::uint32_t> forced_drafts = {});
+  /// The draft count DecodeStep would choose for this budget: from the
+  /// session's acceptance history when the step would speculate at all, else
+  /// none (the step then uses its ordinary width). A TP2 peer's rank 0 chooses
+  /// it and the step runs with it on both ranks.
+  [[nodiscard]] std::optional<std::uint32_t> PlanDecode(
+      std::size_t max_tokens) const;
   struct BatchOutcome {
     bool completed{false};
     std::string error{};
@@ -169,11 +205,22 @@ public:
     DecodeResult* result;
     bool stop_at_eos{true};
     BatchOutcome* outcome{nullptr};
+    /// This request's forced draft count (a TP2 peer's choice), overriding
+    /// the batch's shared plan.
+    std::optional<std::uint32_t> drafts{};
   };
   /// A false return may include completed peers. Inspect each outcome; only
   /// sessions whose persistent state was partly mutated become invalid.
-  [[nodiscard]] static bool DecodeBatch(std::span<const DecodeRequest> requests,
-                                        std::string* error_msg = nullptr);
+  /// `plan`, when given, fixes the batch's draft count (none: each session
+  /// chooses from its own acceptance history) instead of choosing it here.
+  [[nodiscard]] static bool DecodeBatch(
+      std::span<const DecodeRequest> requests, std::string* error_msg = nullptr,
+      const std::optional<std::uint32_t>* plan = nullptr);
+  /// The draft count DecodeBatch would choose for these requests: one for
+  /// the whole batch when every request decodes greedily with MTP, from
+  /// measured cycle costs, else none. A TP2 peer runs the batch with it.
+  [[nodiscard]] static std::optional<std::uint32_t> PlanBatch(
+      std::span<const DecodeRequest> requests);
   struct AdvanceRequest {
     Session* session;
     std::int32_t token;
@@ -265,13 +312,17 @@ private:
   static bool DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
                                 std::string* error_msg);
   template<class Request>
-  static bool RunIsolatedBatch(std::span<const Request> requests,
-                               std::string* error_msg);
+  static bool RunIsolatedBatch(
+      std::span<const Request> requests, std::string* error_msg,
+      const std::optional<std::uint32_t>* plan = nullptr);
   static bool DecodeBatchImpl(std::span<const DecodeRequest> requests,
+                              const std::optional<std::uint32_t>* plan,
                               std::string* error_msg);
   static bool EvaluateBatchImpl(std::span<const AdvanceRequest> requests,
                                 std::string* error_msg);
   struct PendingDecode;
+  /// `batch_drafts` forces the cycle's draft count for a batched step; a
+  /// request's own `drafts` overrides it.
   bool PrepareDecode(const DecodeRequest& request, PendingDecode* pending,
                      std::string* error_msg, bool defer_head = false,
                      std::optional<std::uint32_t> batch_drafts = {});

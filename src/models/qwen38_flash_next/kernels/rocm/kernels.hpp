@@ -182,15 +182,17 @@ void W8A8GemmWave64(const void* w, const void* x_tiled, float* out,
 bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
                    std::uint32_t n_tokens, hipStream_t stream);
 
-/// Stacked Q8_0 QKV projection [13312,2560], head normalization and RoPE.
-/// Writes Q/gates in F32 and K/V caches in F16, preserving separate rounding.
-/// Fixed geometry: 24 query heads, two KV heads, 256 dimensions, 64 rotary.
-/// Requires at least 1024 tokens; cache capacity must include position +
-/// tokens.
+/// Stacked Q8_0 QKV projection [(2 * heads + 2 * kv_heads) * 256, 2560],
+/// head normalization and RoPE: all of the model's 24 query and two KV heads,
+/// or a TP rank's whole query groups. Writes Q/gates in F32 and K/V caches in
+/// F16, preserving separate rounding. Fixed geometry: 256 dimensions, 64
+/// rotary. Requires at least 1024 tokens; cache capacity must include
+/// position + tokens.
 bool AttentionF16Gemm(const void* weights, const __half* input,
                       const float* q_gamma, const float* k_gamma, float* query,
                       float* gate, __half* keys, __half* values,
-                      std::uint32_t n_tokens, const std::uint32_t* position,
+                      std::uint32_t n_tokens, std::uint32_t heads,
+                      std::uint32_t kv_heads, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr);
 
@@ -262,9 +264,10 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const float* swiglu_gate, float* out, __half* out_half,
                    std::size_t m, std::size_t k, hipStream_t stream);
 
-/// Paired Q4_K/Q5_K gate/up GEMM with SwiGLU and F16 output. Uses the same
-/// routing layout as RoutedF16Gemm, with 64 or 128 token rows per tile. The two
-/// projections share one launch and never materialize the gate output.
+/// Paired Q4_K/Q5_K/Q8_0 gate/up GEMM with SwiGLU and F16 output. Uses the
+/// same routing layout as RoutedF16Gemm, with 64 or 128 token rows per tile.
+/// The two projections share one launch and never materialize the gate
+/// output. Q8_0 needs k % 64 == 0, the K-quants k % 256 == 0.
 bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
                         const __half* x, const std::int32_t* tiles,
                         std::uint32_t n_tiles, std::uint32_t tile_rows,
@@ -507,10 +510,27 @@ void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
                float* dst, std::uint32_t n_tokens, std::uint32_t width,
                hipStream_t stream);
 
-/// Add the projected embedding once to each projected hidden branch.
-void MtpAddEmbedding(const float* embedding, float* residual,
-                     std::uint32_t n_tokens, std::uint32_t hidden,
-                     std::uint32_t streams, hipStream_t stream);
+/// residual[t] += addend[t] for each of `n_tokens` rows, broadcasting the
+/// `hidden`-float addend row over the row's `streams` consecutive slices.
+/// MTP adds its projected embedding to every hidden branch this way; the TP
+/// all-reduce adds the peer's partial with `streams` = 1.
+void AddRowsBroadcast(const float* addend, float* residual,
+                      std::uint32_t n_tokens, std::uint32_t hidden,
+                      std::uint32_t streams, hipStream_t stream);
+
+/// Copies `count` floats of a partial into a host-visible send window, then
+/// publishes `value` in `ready` once every block's copy is visible to the
+/// host. `arrivals` counts finished blocks and must start at zero; the last
+/// block resets it.
+void StagePartial(const float* partial, float* send, std::size_t count,
+                  std::uint32_t* arrivals, std::uint64_t* ready,
+                  std::uint64_t value, hipStream_t stream);
+
+/// Holds the stream until host-written `flag` reaches `value`. After `ticks`
+/// of the device wall clock it sets `timed_out` and lets the stream go on.
+void WaitValue(const std::uint64_t* flag, std::uint64_t value,
+               std::uint64_t ticks, std::uint32_t* timed_out,
+               hipStream_t stream);
 
 inline constexpr std::uint32_t kArgmaxParts = 64;
 struct ArgmaxCandidate {
@@ -522,6 +542,19 @@ struct ArgmaxCandidate {
 /// n_tokens * kArgmaxParts candidates.
 void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
             std::uint32_t n_tokens, std::uint32_t vocab, hipStream_t stream);
+
+/// One rank's part of a vocabulary split across two ranks: the argmax of its
+/// `count` logits, whose first entry is vocabulary index `first`, written as
+/// (value, index) floats to slot `part` of `exchange`, whose other `width`
+/// floats are cleared, so a summing all-reduce delivers both candidates.
+/// Part 0 reports index 0 at +infinity when that logit is NaN, as Argmax.
+void SplitArgmaxPart(const float* logits, ArgmaxCandidate* scratch,
+                     float* exchange, std::uint32_t width, std::uint32_t count,
+                     std::uint32_t first, std::uint32_t part,
+                     hipStream_t stream);
+/// The full-vocabulary argmax from both exchanged candidates, as Argmax.
+void SplitArgmaxFinish(const float* exchange, std::int32_t* out,
+                       hipStream_t stream);
 
 /// Gather selected IDs and their original logits from independent rows.
 /// The caller checks finite values only for the verification prefix it visits.

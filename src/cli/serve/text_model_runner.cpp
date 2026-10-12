@@ -21,7 +21,8 @@ namespace gufo::server {
 std::optional<ChatRequest> ConstrainChatRequest(
     const ChatRequest& request, const TextModelRunner& runner,
     sampling::SamplingConfig* sampling,
-    std::optional<sampling::JsonConstraint::ToolFormat>* tool_format) {
+    std::optional<sampling::JsonConstraint::ToolFormat>* tool_format,
+    std::optional<TextGenerationBackend::InitialOutputState> initial) {
   // Output parsing needs the model's dialect even without tool constraints
   // (for example Qwen's whitespace boundary after </think>).
   if (tool_format)
@@ -81,7 +82,7 @@ std::optional<ChatRequest> ConstrainChatRequest(
     constrained.messages.insert(constrained.messages.begin(),
                                 std::move(message));
   }
-  if (runner.InitialOutputState(request) ==
+  if (initial.value_or(runner.InitialOutputState(request)) ==
       TextGenerationBackend::InitialOutputState::kReasoning)
     grammar = sampling::JsonConstraint::WithReasoning(grammar);
   sampling->constraint = runner.BindConstraint(grammar);
@@ -453,9 +454,17 @@ void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
 
 ContinuationCache::SnapshotSupport MakeSnapshotSupport(
     ValidatedRunner* validated, TextRunnerRamCacheOptions options) {
-  if (validated == nullptr || !validated->descriptor.capabilities.snapshot ||
-      !validated->descriptor.capabilities.fork) {
+  if (validated == nullptr) {
     return {};
+  }
+  // The runner decides what may be reused, with or without snapshots.
+  auto state_reusable = [validated](const ContinuationState& state) {
+    return validated->runner->CanReuse(
+        dynamic_cast<const TextRunnerState&>(state));
+  };
+  if (!validated->descriptor.capabilities.snapshot ||
+      !validated->descriptor.capabilities.fork) {
+    return {.state_reusable = std::move(state_reusable)};
   }
   return {
       .restore =
@@ -488,6 +497,14 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
                             validated->snapshot_max_bytes);
           },
       .on_event = EmitSnapshotEvent,
+      .state_reusable = std::move(state_reusable),
+      .snapshot_reusable =
+          [validated](const ContinuationSnapshot& snapshot) {
+            const auto* text_snapshot =
+                dynamic_cast<const TextRunnerSnapshot*>(&snapshot);
+            return text_snapshot != nullptr &&
+                   validated->runner->CanReuse(*text_snapshot);
+          },
   };
 }
 
@@ -1601,6 +1618,10 @@ TextRunnerPool::~TextRunnerPool() = default;
 
 const TextModelRunner& TextRunnerPool::runner() const noexcept {
   return *impl_->validated.runner;
+}
+
+void TextRunnerPool::ClearCache() {
+  impl_->cache.Clear();
 }
 
 std::size_t TextRunnerPool::capacity() const noexcept {

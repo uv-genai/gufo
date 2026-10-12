@@ -55,6 +55,41 @@ top 64 logits; upstream draft-sampler equivalence is not claimed.
 MTP cache projections now keep the same arithmetic across prompt splits.
 Older Flash-Next disk checkpoints are rejected and rebuilt once.
 
+## Full Q8
+
+**Lowest perplexity of all runs, but llama.cpp differs from Gufo more than Q4
+differs from Q8.** WikiText-2 test set, first eight 1024-token windows (4,088
+scored positions), against next-token log-probs saved by
+`llama-perplexity --kl-divergence-base` from a llama.cpp build (`-fa on`, F16
+KV, RPC over the same two hosts) on the same model files. Gufo ran two-host
+TP2.
+
+| Perplexity | Q4 | Q8 |
+| --- | --- | --- |
+| Gufo, TP2 | 2.1093 | 2.1053 |
+| Gufo, one host | 2.1168 | does not fit |
+| llama.cpp | 2.1311 | 2.1218 |
+
+| Pair (reference first) | Mean KL | Same top token |
+| --- | --- | --- |
+| Gufo Q4 one host, Gufo Q4 TP2 | 0.019 | 97.1% |
+| llama.cpp Q8, llama.cpp Q4 | 0.060 | 94.4% |
+| Gufo Q8, Gufo Q4 | 0.067 | 93.4% |
+| llama.cpp Q4, Gufo Q4 | 0.090 | 93.0% |
+| llama.cpp Q8, Gufo Q8 | 0.087 | 93.4% |
+
+Q8 rows were remeasured on October 9 after the routed Q8_0 experts moved to
+the F16 WMMA route (2.0957, 0.093/93.1% and 0.070/94.0% before). The Q8 run
+saved for the Q4 pair is that revision's; on it, Gufo Q4 TP2 scores 2.1182,
+unchanged by the expert route.
+
+Q4 to Q8 moves Gufo about as much as it
+moves llama.cpp, but the two implementations differ by more than that on both
+quantizations; which one is closer to the original model needs an official
+reference. Per-layer embeddings matter: Gufo without them scores
+6.13. `qwen38_flash_next.ngram` checks Q8 rows (cold, cached, batched and
+unaligned reads, truncation and invalid dimensions).
+
 ## Vision
 
 **One Gufo encoder comparison fails:** relative L2 **6.47%** versus official
@@ -126,3 +161,20 @@ Memory: C1/AR/capacity 133121,
 peak global HIP allocation including idle memory. Full commands, counts and
 identities remain in [artifacts](artifacts/bench.json) and the
 [benchmark workflow](../../../.agents/skills/benchmark-model/SKILL.md).
+
+
+RDMA tables refreshed October 9, 2026 (`c85349b5`): Q4 on one host against
+two hosts over USB4 RoCE v2 (`usb4_rdma0`), and the full Q8 model on two
+hosts. Both hosts use balanced power mode (85 W sustained). One CMake `gpu-tp2` binary (SHA-256 prefix `8ce3aabafa3cc807`,
+identical on both hosts) was built in the ROCm 7.2.3 container with RDMA
+enabled and served every table, the one-host runs included: the Nix build's
+rdma-core has no USB4 RDMA provider. HTTP, greedy seed 1, thinking off; the
+single-user depth sweep and the pp2048/tg128 users tables follow the one-host
+method. One warmed sample or cohort per point. Three single-user rows whose
+prefill was far below their neighbours' (Q4 MTP mixed at 65,536 and 258,048,
+Q8 MTP repetitive at 131,072) were measured again with both workloads; the
+tables show the repeat. Each users table starts a fresh server per point and
+prepares every session with one output token before the measured cohort; all
+51 measured completion sets match their fresh one-user AR controls. These
+checks do not establish unquantized-model accuracy. Commands, preparation
+records, hashes, samples and draft counts remain in the artifacts.

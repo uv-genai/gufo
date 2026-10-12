@@ -11,6 +11,8 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
+#include "src/models/qwen38_flash_next/distributed/tp_partition.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -76,6 +78,35 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     AssignError(error_msg, "decode concurrency must be between one and eight");
     return nullptr;
   }
+  if (options.hip_device < 0) {
+    AssignError(error_msg, "HIP device index must be nonnegative");
+    return nullptr;
+  }
+  if (options.tp_world_size != 1 && options.tp_world_size != 2) {
+    AssignError(error_msg,
+                "Flash-Next currently supports TP world sizes one or two");
+    return nullptr;
+  }
+  if (options.tp_world_size == 1 && options.tp_rank != 0) {
+    AssignError(error_msg, "single-rank Flash-Next requires rank zero");
+    return nullptr;
+  }
+  if (options.tp_world_size > 1 && !options.communicator) {
+    AssignError(error_msg, "TP=2 Flash-Next requires a communicator");
+    return nullptr;
+  }
+  if (options.tp_world_size > 1 &&
+      (options.communicator->world_size() != options.tp_world_size ||
+       options.communicator->rank() != options.tp_rank ||
+       options.communicator->device_index() != options.hip_device)) {
+    AssignError(error_msg,
+                "TP communicator identity does not match model rank/device");
+    return nullptr;
+  }
+  if (hipSetDevice(options.hip_device) != hipSuccess) {
+    AssignError(error_msg, "HIP device selection failed");
+    return nullptr;
+  }
   if (options.max_draft_tokens == 0) {
     AssignError(error_msg, "draft token limit must be positive");
     return nullptr;
@@ -97,11 +128,22 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   m->weights_ = std::make_unique<ModelWeights>(std::move(*weights));
   const Config& c = m->weights_->config;
+  std::optional<distributed::TpPartition> partition;
+  const distributed::TpPartition* partition_ptr = nullptr;
+  if (options.tp_world_size > 1) {
+    partition = distributed::TpPartition::Create(
+        c.expert_ff, options.tp_rank, options.tp_world_size, error_msg);
+    if (!partition) {
+      return nullptr;
+    }
+    partition_ptr = &*partition;
+  }
   if (options.max_context == 0 || options.max_context > c.context_length) {
     AssignError(error_msg, "context exceeds the model's " +
                                std::to_string(c.context_length) + " tokens");
     return nullptr;
   }
+  // Under TP2 each rank runs the whole (replicated) vision encoder itself.
   try {
     m->vision_ = qwen::vision::Encoder::Open(
         model_path, options.vision_model_path, c.hidden_size);
@@ -135,13 +177,14 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     }
     m->mtp_weights_ = std::make_unique<MtpWeights>(std::move(*mtp));
   }
-  m->device_ = rocm::DeviceModel::Upload(*m->weights_, *m->reader_,
-                                         m->mtp_weights_.get(),
-                                         m->mtp_reader_.get(), error_msg);
+  m->device_ = rocm::DeviceModel::Upload(
+      *m->weights_, *m->reader_, m->mtp_weights_.get(), m->mtp_reader_.get(),
+      error_msg, partition_ptr);
   if (!m->device_) {
     return nullptr;
   }
   rocm::Executor::Options exec;
+  exec.device_index = options.hip_device;
   exec.max_batch = m->PrefillThroughCapacity();
   exec.max_logit_rows =
       m->mtp_weights_
@@ -149,6 +192,21 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                 exec.max_batch, std::uint64_t{options.max_draft_tokens} + 1))
           : 1;
   exec.max_speculative = exec.max_logit_rows;
+  if (options.communicator) {
+    // One exchange carries a whole prefill batch's partial sums.
+    if (std::size_t{exec.max_batch} * c.hidden_size * sizeof(float) >
+        options.communicator->MaxPartialBytes()) {
+      AssignError(error_msg, "a prefill batch exceeds the TP exchange window");
+      return nullptr;
+    }
+    exec.all_reduce =
+        rocm::Executor::TwoRankAllReduce(options.communicator, c.hidden_size);
+    exec.reduce_status =
+        rocm::Executor::TwoRankReduceStatus(options.communicator);
+    exec.split_reduce =
+        rocm::Executor::TwoRankSplitReduce(options.communicator, c.hidden_size);
+  }
+  exec.moe_observer = options.moe_observer;
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
@@ -202,7 +260,14 @@ std::uint32_t Model::VocabSize() const noexcept {
 }
 
 std::uint32_t Model::PrefillCapacity() const noexcept {
-  return std::min(kPrefillChunkTokens, options_.max_context);
+  // Whole chunks per trunk batch: two batches per step under TP2.
+  const std::uint32_t batches =
+      executor_->PrefillChunk() / executor_->max_batch();
+  return std::min(batches * kPrefillChunkTokens, options_.max_context);
+}
+
+std::uint32_t Model::PrefillPairLead(std::uint32_t tokens) const noexcept {
+  return executor_->PairLead(tokens);
 }
 
 std::uint32_t Model::PrefillThroughCapacity() const noexcept {
@@ -599,12 +664,15 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                    std::unique_ptr<SessionSnapshot>* checkpoint,
                    double* capture_ms, std::span<const std::int32_t> after) {
   rocm::Executor& exec = *model_->executor_;
+  // The final pass may take the prompt's tail; earlier ones whole chunks.
+  const std::size_t widest = prefill ? exec.PrefillChunk() : exec.max_batch();
+  const auto chunk_size = [&](std::size_t remaining) {
+    return remaining <= widest
+               ? remaining
+               : std::min<std::size_t>(model_->PrefillCapacity(), widest);
+  };
   for (std::size_t off = 0; off < tokens.size();) {
-    const auto remaining = tokens.size() - off;
-    const auto capacity = remaining <= exec.max_batch()
-                              ? exec.max_batch()
-                              : model_->PrefillCapacity();
-    const std::size_t n = std::min<std::size_t>(capacity, remaining);
+    const std::size_t n = chunk_size(tokens.size() - off);
     const auto chunk = tokens.subspan(off, n);
     if (MtpEnabled() && !tokens_.empty() &&
         !DraftCatchUp(chunk[0], false, error_msg)) {
@@ -623,15 +691,17 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     }
     // The chunk this loop, or the following Sync, takes next.
     const auto rest = off + n < tokens.size() ? tokens.subspan(off + n) : after;
-    const auto next = rest.first(std::min<std::size_t>(
-        rest.size() <= exec.max_batch() ? exec.max_batch()
-                                        : model_->PrefillCapacity(),
-        rest.size()));
+    const auto next = rest.first(chunk_size(rest.size()));
     if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg,
                       capture.get(), next)) {
       return false;
     }
-    const auto kept = capture && capture->tokens < n ? n - capture->tokens : n;
+    // A chunk of two trunk batches keeps the second one's rows; a checkpoint
+    // keeps the rows after it (the two never meet: see Executor::Forward).
+    const std::uint32_t lead =
+        prefill ? exec.PairLead(static_cast<std::uint32_t>(n)) : 0;
+    const auto kept =
+        capture && capture->tokens < n ? n - capture->tokens : n - lead;
     hidden_base_ = static_cast<std::uint32_t>(
         tokens_.size() + n -
         std::min<std::size_t>(kept, exec.max_speculative()));
@@ -780,12 +850,16 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::size_t room = ContextSize() - tokens_.size();
   const std::size_t cap =
       std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
+  // A forced draft count (a TP2 rank 0's mirrored choice) overrides the
+  // session's own acceptance-history policy, so both ranks run cycles of the
+  // same width even when their histories have drifted apart.
+  const auto& forced = request.drafts ? request.drafts : batch_drafts;
   const std::size_t width =
       MtpEnabled() && cap > 1
-          ? 1 + (batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
-                              : draft_length_.Choose(
-                                    static_cast<std::uint32_t>(cap - 1),
-                                    static_cast<std::uint32_t>(tokens_.size())))
+          ? 1 + (forced ? std::min<std::uint32_t>(*forced, cap - 1)
+                        : draft_length_.Choose(
+                              static_cast<std::uint32_t>(cap - 1),
+                              static_cast<std::uint32_t>(tokens_.size())))
           : cap;
   if (width == 0) {
     result->stop = true;
@@ -976,7 +1050,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
 
 bool Session::DecodeStep(std::size_t max_tokens,
                          sampling::SamplerState& sampler, DecodeResult* result,
-                         std::string* error_msg, bool stop_at_eos) {
+                         std::string* error_msg, bool stop_at_eos,
+                         std::optional<std::uint32_t> forced_drafts) {
   if (continuation_hooks_)
     continuation_hooks_->BeforeExecution();
   if (!valid_) {
@@ -985,7 +1060,8 @@ bool Session::DecodeStep(std::size_t max_tokens,
     return false;
   }
   valid_ = false;
-  const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
+  const DecodeRequest request{this,        max_tokens, &sampler,     result,
+                              stop_at_eos, nullptr,    forced_drafts};
   PendingDecode pending;
   if (!PrepareDecode(request, &pending, error_msg)) {
     return false;
@@ -1009,9 +1085,24 @@ bool Session::DecodeStep(std::size_t max_tokens,
   return ok;
 }
 
+std::optional<std::uint32_t> Session::PlanDecode(std::size_t max_tokens) const {
+  if (!valid_ || !MtpEnabled()) {
+    return std::nullopt;
+  }
+  const std::size_t room = ContextSize() - tokens_.size();
+  const std::size_t cap = std::min<std::size_t>(
+      {max_tokens, room, model_->executor_->max_speculative()});
+  if (cap <= 1) {
+    return std::nullopt;
+  }
+  return draft_length_.Choose(static_cast<std::uint32_t>(cap - 1),
+                              static_cast<std::uint32_t>(tokens_.size()));
+}
+
 template<class Request>
 bool Session::RunIsolatedBatch(std::span<const Request> requests,
-                               std::string* error_msg) {
+                               std::string* error_msg,
+                               const std::optional<std::uint32_t>* plan) {
   if (requests.empty() || requests.size() > 8) {
     AssignError(error_msg, "batch must contain 1..8 sessions");
     return false;
@@ -1072,7 +1163,7 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
   try {
     if (!active.empty()) {
       if constexpr (std::is_same_v<Request, DecodeRequest>)
-        (void)DecodeBatchImpl(active, &shared_error);
+        (void)DecodeBatchImpl(active, plan, &shared_error);
       else
         (void)EvaluateBatchImpl(active, &shared_error);
     }
@@ -1095,12 +1186,20 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
           r.sampler->RestoreDrawState(draws[i]);
         }
         try {
-          if constexpr (std::is_same_v<Request, DecodeRequest>)
+          if constexpr (std::is_same_v<Request, DecodeRequest>) {
+            // The retry must run the cycle width the batch planned, or a
+            // TP2 peer's own policy could pick another and meet a different
+            // collective size.
+            const auto forced =
+                r.drafts ? r.drafts
+                         : (plan != nullptr ? *plan
+                                            : std::optional<std::uint32_t>{});
             outcome.completed =
                 session.DecodeStep(r.max_tokens, *r.sampler, r.result,
-                                   &outcome.error, r.stop_at_eos);
-          else
+                                   &outcome.error, r.stop_at_eos, forced);
+          } else {
             outcome.completed = session.Evaluate(r.token, &outcome.error);
+          }
         } catch (const std::exception& exception) {
           outcome.error = exception.what();
         }
@@ -1127,8 +1226,42 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
 }
 
 bool Session::DecodeBatch(std::span<const DecodeRequest> requests,
-                          std::string* error_msg) {
-  return RunIsolatedBatch(requests, error_msg);
+                          std::string* error_msg,
+                          const std::optional<std::uint32_t>* plan) {
+  return RunIsolatedBatch(requests, error_msg, plan);
+}
+
+std::optional<std::uint32_t> Session::PlanBatch(
+    std::span<const DecodeRequest> requests) {
+  if (requests.size() > 8)
+    return std::nullopt;
+  // Only the requests the batch would run: a TP2 peer plans before the batch
+  // sets aside invalid ones.
+  std::array<MtpBatchController::Row, 8> rows{};
+  std::size_t count = 0;
+  std::uint32_t batch_context = 0;
+  const Session* first = nullptr;
+  for (const auto& r : requests) {
+    if (r.session == nullptr || r.sampler == nullptr || !r.session->valid_ ||
+        r.session->tokens_.empty() || r.max_tokens == 0)
+      continue;
+    if (!r.session->MtpEnabled() || r.sampler->config().uses_random_sampling())
+      return std::nullopt;
+    const auto& exec = *r.session->model_->executor_;
+    const auto cap = std::min<std::size_t>(
+        r.max_tokens, r.session->ContextSize() - r.session->Position());
+    rows[count++] = {&r.session->draft_length_,
+                     static_cast<std::uint32_t>(
+                         std::min<std::size_t>(cap, exec.max_speculative())) -
+                         (cap != 0)};
+    batch_context = std::max(batch_context, r.session->Position());
+    if (first == nullptr)
+      first = r.session;
+  }
+  if (count < 2)
+    return std::nullopt;
+  return first->model_->batch_policy_.Choose(std::span(rows).first(count),
+                                             batch_context);
 }
 
 bool Session::EvaluateBatch(std::span<const AdvanceRequest> requests,
@@ -1137,35 +1270,30 @@ bool Session::EvaluateBatch(std::span<const AdvanceRequest> requests,
 }
 
 bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
+                              const std::optional<std::uint32_t>* plan,
                               std::string* error_msg) {
   if (requests.size() == 1) {
     const auto& r = requests.front();
-    r.outcome->completed = r.session->DecodeStep(
-        r.max_tokens, *r.sampler, r.result, &r.outcome->error, r.stop_at_eos);
+    // The forced draft count (a TP2 peer's plan) overrides this session's
+    // acceptance-history policy, exactly as in the batched path.
+    const auto forced =
+        r.drafts ? r.drafts
+                 : (plan != nullptr ? *plan : std::optional<std::uint32_t>{});
+    r.outcome->completed =
+        r.session->DecodeStep(r.max_tokens, *r.sampler, r.result,
+                              &r.outcome->error, r.stop_at_eos, forced);
     return r.outcome->completed;
   }
   auto& exec = *requests.front().session->model_->executor_;
   std::optional<std::uint32_t> batch_drafts;
   std::uint32_t batch_context = 0;
   auto& policy = requests.front().session->model_->batch_policy_;
-  if (std::ranges::all_of(
-          requests, [](const auto& r) { return r.session->MtpEnabled(); }) &&
-      std::ranges::none_of(requests, [](const auto& request) {
-        return request.sampler->config().uses_random_sampling();
-      })) {
-    std::array<MtpBatchController::Row, 8> rows{};
-    for (std::size_t i = 0; i < requests.size(); ++i) {
-      const auto& r = requests[i];
-      const auto cap = std::min<std::size_t>(
-          r.max_tokens, r.session->ContextSize() - r.session->Position());
-      rows[i] = {&r.session->draft_length_,
-                 static_cast<std::uint32_t>(
-                     std::min<std::size_t>(cap, exec.max_speculative())) -
-                     (cap != 0)};
+  // A given plan (a TP2 peer's) replaces the timing-based choice.
+  batch_drafts = plan != nullptr ? *plan : PlanBatch(requests);
+  if (batch_drafts) {
+    for (const auto& r : requests) {
       batch_context = std::max(batch_context, r.session->Position());
     }
-    batch_drafts =
-        policy.Choose(std::span(rows).first(requests.size()), batch_context);
   }
   const auto cycle_start = std::chrono::steady_clock::now();
   std::vector<PendingDecode> pending(requests.size());
