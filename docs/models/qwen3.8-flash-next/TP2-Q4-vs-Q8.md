@@ -211,3 +211,67 @@ sudo cat /sys/kernel/debug/thunderbolt_ibverbs/summary | grep -E 'striping|error
 One 220-token request moved ~279 MB in each direction; a mixed smoke session
 moved 3,187 MiB. `native_write_striping: 1` with two rails on `path=1` and
 `path=257` confirms both USB4 cables are striped.
+
+## Q4 standalone vs Q4 TP=2 over RDMA
+
+Separate question: Q4 fits one host (61 GB), so is TP2 worth it at all?
+
+Same build, same primary host (`strix-halo-1`), same `--context 32768` and
+`--sessions 4` in both configurations, so the only difference is the
+parallelism. `--context 32768` is required on one host: four full-context
+sessions exceed the request-state claim (TP2 splits state and would cope with
+more, but is pinned to the same value for a matched pair). Measured depths top
+out at 8,345 tokens, far below the cap. Same methodology as above: warm-up,
+REPS=5, salt-derived prompts, `cached=0` on every cell.
+
+| Depth | Metric | one host | TP2 RDMA | TP2/1h |
+|---|---|---|---|---|
+| **short** (258 tok) | prefill | 758.6 tok/s | 623.5 tok/s | 0.82x |
+| | decode | 42.1 tok/s | 52.9 tok/s | **1.26x** |
+| | TTFT | 343.6 ms | 420.1 ms | 1.22x (slower) |
+| **medium** (2,130 tok) | prefill | 1,584.4 tok/s | 1,684.9 tok/s | **1.06x** |
+| | decode | 42.4 tok/s | 48.6 tok/s | **1.15x** |
+| | TTFT | 1,349.6 ms | 1,265.1 ms | **0.94x** |
+| **long** (8,345 tok) | prefill | 1,592.7 tok/s | 1,729.8 tok/s | **1.09x** |
+| | decode | 42.6 tok/s | 45.4 tok/s | **1.07x** |
+| | TTFT | 5,284.8 ms | 4,848.4 ms | **0.92x** |
+| **4-way concurrent** | aggregate decode | 91.5 tok/s | 99.4 tok/s | **1.09x** |
+
+Raw:
+
+```
+=== onehost Q4 ===
+    short   prompt=   258  prefill=  758.6  decode= 42.1 [36.2-44.0]  ttft=  343.6ms  cached=0
+    medium  prompt=  2130  prefill= 1584.4  decode= 42.4 [38.2-46.9]  ttft= 1349.6ms  cached=0
+    long    prompt=  8345  prefill= 1592.7  decode= 42.6 [31.0-49.9]  ttft= 5284.8ms  cached=0
+    conc4  aggregate= 91.5 tok/s  wall=11.2s  cached=0
+
+=== TP2 Q4 (RDMA) ===
+    short   prompt=   262  prefill=  623.5  decode= 52.9 [48.5-56.8]  ttft=  420.1ms  cached=0
+    medium  prompt=  2125  prefill= 1684.9  decode= 48.6 [46.3-52.3]  ttft= 1265.1ms  cached=0
+    long    prompt=  8344  prefill= 1729.8  decode= 45.4 [34.0-54.8]  ttft= 4848.4ms  cached=0
+    conc4  aggregate= 99.4 tok/s  wall=10.3s  cached=0
+```
+
+**Reading it.** TP2 wins on every metric except short-prefill. Decode is +7% to
++26%, medium/long prefill +6% to +9%, concurrency +9%. The single loss is the
+258-token prompt's prefill (0.82x) and TTFT (1.22x): the per-step all-reduce
+latency is not amortised at that size.
+
+Practical rule from this pair: **above roughly 1k prompt tokens TP2 is worth it
+for Q4; below that a single host is better.** For long contexts TP2 also removes
+the memory ceiling entirely, which no throughput number captures.
+
+Note the one-host decode is flat at ~42 tok/s across depths while TP2's declines
+(52.9 -> 45.4) — the long-depth TP2 cells carry wide spread (34.0-54.8), so the
++1.07x there is the weakest number in the table.
+
+### Harness
+
+[`tools/bench/q4_onehost_vs_tp2.py`](../../../tools/bench/q4_onehost_vs_tp2.py).
+Run it **on strix-halo-1**; it launches rank 1 over ssh for the TP2 case.
+
+One trap it encodes: `ibv_devices` prints `name  guid`, and taking the last
+field yields the GUID, which gufo rejects with *"RDMA device <guid> not found
+(have usb4_rdma0, ...)"*. Select the device **name** — the rank scripts sort by
+GUID and return the name.
