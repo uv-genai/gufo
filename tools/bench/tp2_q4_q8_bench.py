@@ -161,21 +161,29 @@ def run_variant(variant: str) -> dict:
                   f"[{min(ds):.1f}-{max(ds):.1f}]  "
                   f"ttft={tt:>7.1f} ms  cached={ck:.0f}  n={len(rows)}",
                   flush=True)
-    # concurrency spot check at the medium depth
+    # Concurrency spot check with a SHORT prompt on purpose: aggregate =
+    # tokens / wall clock, so a long prompt charges every stream's prefill to
+    # "decode" and understates it. A short prompt makes the measure
+    # decode-dominated. Streams still get distinct prompts - identical ones
+    # would hit the prompt cache (3 of 4 skip prefill) and inflate the result.
     t0 = time.time()
-    procs = []
     import concurrent.futures as cf
     with cf.ThreadPoolExecutor(CONCURRENCY) as ex:
-        futs = [ex.submit(sample, prompt_for(2000, f"conc-{i}-"), 256)
+        futs = [ex.submit(sample, prompt_for(200, f"conc-{i}-"), 256)
                 for i in range(CONCURRENCY)]
         rows = [f.result() for f in futs if f.result()]
     wall = time.time() - t0
     if rows:
         total = sum(r["completion_tokens"] for r in rows)
+        bad = [r for r in rows if r["cached_tokens"]]
+        if bad:
+            print(f"    !! concurrency: {len(bad)} cached request(s) "
+                  f"inflated the rate — invalid", flush=True)
         out["conc"] = rows
         print(f"    concurrency={CONCURRENCY}  {len(rows)} ok  "
               f"aggregate decode={total / wall:5.1f} tok/s  "
-              f"wall={wall:.1f}s", flush=True)
+              f"wall={wall:.1f}s  cached="
+              f"{[r['cached_tokens'] for r in rows]}", flush=True)
     stop()
     return out
 

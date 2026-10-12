@@ -49,16 +49,16 @@ and `UD-Q4_K_XL` (4 shards), each with the shared-Q8_0 MTP sidecar and
 
 | Depth | Metric | **Q8_0** | **Q4_K_XL** | Q4/Q8 |
 |---|---|---|---|---|
-| **short** (260 tok) | prefill | 498.5 tok/s | 627.6 tok/s | **+1.26x** |
-| | decode | 47.3 [44.0–49.8] | 50.5 [49.3–54.7] | +1.07x |
-| | TTFT | 524.1 ms | 419.5 ms | 0.80x |
-| **medium** (2,133 tok) | prefill | 1,412.5 tok/s | 1,649.5 tok/s | **+1.17x** |
-| | decode | 44.9 [40.9–47.5] | 49.3 [40.7–52.2] | +1.10x |
-| | TTFT | 1,517.3 ms | 1,291.2 ms | 0.85x |
-| **long** (8,345 tok) | prefill | 1,367.5 tok/s | 1,645.8 tok/s | **+1.20x** |
-| | decode | 48.0 [31.7–52.4] | 56.4 [44.7–58.5] | +1.18x |
-| | TTFT | 6,117.2 ms | 5,101.7 ms | 0.83x |
-| **4-way concurrent** | aggregate decode | 50.3 tok/s | 58.3 tok/s | **+1.16x** |
+| **short** (260 tok) | prefill | 507.3 tok/s | 655.7 tok/s | **+1.29x** |
+| | decode | 48.7 [43.2–49.9] | 54.0 [50.7–55.5] | +1.11x |
+| | TTFT | 515.7 ms | 405.4 ms | 0.79x |
+| **medium** (2,133 tok) | prefill | 1,398.8 tok/s | 1,622.7 tok/s | **+1.16x** |
+| | decode | 44.6 [40.5–47.3] | 49.5 [40.7–52.1] | +1.11x |
+| | TTFT | 1,523.0 ms | 1,312.6 ms | 0.86x |
+| **long** (8,345 tok) | prefill | 1,391.8 tok/s | 1,589.7 tok/s | **+1.14x** |
+| | decode | 47.5 [33.4–52.6] | 56.4 [44.4–59.4] | +1.19x |
+| | TTFT | 6,028.9 ms | 5,281.9 ms | 0.88x |
+| **4-way concurrent** | aggregate decode | 78.5 tok/s | 82.7 tok/s | +1.05x |
 
 ### Memory (from `event=load_completed`)
 
@@ -71,14 +71,16 @@ Load times: 23.3 s (Q8) and 17.9 s (Q4).
 
 ## Observations
 
-- **Q4 prefill is 17–26% faster at every depth.** Prefill is weight-bandwidth
+- **Q4 prefill is 14–29% faster at every depth.** Prefill is weight-bandwidth
   bound, so halving the weight bytes helps directly.
-- **Q4 decode is consistently ahead** (+7% to +18%), though the long-depth
-  spread for Q8 (31.7–52.4) is wide — that cell is genuinely noisy and the
-  +1.18x there is weaker evidence than the short/medium rows.
-- **TTFT 15–20% lower for Q4** — same prefill-bandwidth story.
-- **Q4 scales better under concurrency** (+16% aggregate at 4 streams).
-- **Prefill rate rises with depth** (498 → 1,413 → 1,368 tok/s): fixed per-chunk
+- **Q4 decode is consistently ahead** (+11% to +19%), though the long-depth
+  spread for Q8 (33.4–52.6) is wide — that cell is genuinely noisy.
+- **Concurrency aggregate (78.5 / 82.7 tok/s) exceeds single-stream decode**
+  (48.7 / 54.0), as expected: four sessions overlap better across the TP2 link
+  than one. The Q4 edge narrows to +5% here, which is why the row is not a
+  strong discriminator.
+- **TTFT 12–21% lower for Q4** — same prefill-bandwidth story.
+- **Prefill rate rises with depth** (507 → 1,399 → 1,392 tok/s): fixed per-chunk
   launch overhead amortises on larger prompts. Compare depths, not absolutes.
 - **The decision is really memory, not the ~20%**: Q8 needs both hosts and so
   buys the full-precision model at 262k context where a single host cannot hold
@@ -107,6 +109,31 @@ fails loudly if it is ever non-zero.
 row-for-row either. The old tag
 `research/tp2-rdma-merge-2026-10-12` marks the 0.12.0 base but **carries no
 trustworthy numbers**; re-measure it if a 0.12.0 comparison is ever needed.
+
+### The concurrency row was inflated too, by a different mechanism
+
+The original concurrency row gave all four streams an **identical** prompt, so
+three of the four hit the prompt cache and skipped prefill. A controlled A/B on
+the same load shows it:
+
+| Concurrency shape | wall | aggregate | `cached_tokens` |
+|---|---|---|---|
+| 4 **identical** prompts (old harness) | 15.9 s | 64.2 tok/s | `[0, 2133, 2133, 2133]` |
+| 4 **distinct** prompts (new harness) | 28.0 s | 36.6 tok/s | `[0, 0, 0, 0]` |
+
+Three of four streams in the first row had 2,133 of 2,134 tokens served from
+cache. So the old concurrency figure was inflated by roughly 75%, and an
+intermediate run that fixed the prompts but kept a **long** prompt measured
+50.3 / 58.3 tok/s — lower still, because `tokens / wall clock` charged all four
+real prefills to "decode".
+
+The concurrency row is now measured with a **short** prompt so the ratio is
+decode-dominated by construction, distinct prompts so nothing is cached, and it
+reports the `cached_tokens` vector so either failure would be visible.
+
+Both artifacts share one lesson: **`aggregate = tokens / wall clock` silently
+absorbs prefill**, and gufo's prompt cache is silent. A wrong concurrency number
+looks exactly like a decode regression.
 
 This is worth keeping: a prompt-cache hit is silent, and it looks exactly like a
 2x prefill regression when it is really a measurement artifact.
@@ -140,17 +167,17 @@ real two-host run at ≥1024 tokens.
 ```
 === variant q8 (gufo-qwen3.8-flash-next-tp2-012) ===
   pair ready
-    short   prompt=   260 tok  prefill=  498.5 tok/s  decode= 47.3 [44.0-49.8]  ttft=  524.1 ms  cached=0  n=5
-    medium  prompt=  2133 tok  prefill= 1412.5 tok/s  decode= 44.9 [40.9-47.5]  ttft= 1517.3 ms  cached=0  n=5
-    long    prompt=  8345 tok  prefill= 1367.5 tok/s  decode= 48.0 [31.7-52.4]  ttft= 6117.2 ms  cached=0  n=5
-    concurrency=4  4 ok  aggregate decode= 50.3 tok/s  wall=20.3s
+    short   prompt=   260 tok  prefill=  507.3 tok/s  decode= 48.7 [43.2-49.9]  ttft=  515.7 ms  cached=0  n=5
+    medium  prompt=  2133 tok  prefill= 1398.8 tok/s  decode= 44.6 [40.5-47.3]  ttft= 1523.0 ms  cached=0  n=5
+    long    prompt=  8345 tok  prefill= 1391.8 tok/s  decode= 47.5 [33.4-52.6]  ttft= 6028.9 ms  cached=0  n=5
+    concurrency=4  4 ok  aggregate decode= 78.5 tok/s  wall=13.0s  cached=[0, 0, 0, 0]
 
 === variant q4 (gufo-qwen3.8-flash-next-tp2-012-q4) ===
   pair ready
-    short   prompt=   260 tok  prefill=  627.6 tok/s  decode= 50.5 [49.3-54.7]  ttft=  419.5 ms  cached=0  n=5
-    medium  prompt=  2133 tok  prefill= 1649.5 tok/s  decode= 49.3 [40.7-52.2]  ttft= 1291.2 ms  cached=0  n=5
-    long    prompt=  8345 tok  prefill= 1645.8 tok/s  decode= 56.4 [44.7-58.5]  ttft= 5101.7 ms  cached=0  n=5
-    concurrency=4  4 ok  aggregate decode= 58.3 tok/s  wall=17.6s
+    short   prompt=   260 tok  prefill=  655.7 tok/s  decode= 54.0 [50.7-55.5]  ttft=  405.4 ms  cached=0  n=5
+    medium  prompt=  2133 tok  prefill= 1622.7 tok/s  decode= 49.5 [40.7-52.1]  ttft= 1312.6 ms  cached=0  n=5
+    long    prompt=  8345 tok  prefill= 1589.7 tok/s  decode= 56.4 [44.4-59.4]  ttft= 5281.9 ms  cached=0  n=5
+    concurrency=4  4 ok  aggregate decode= 82.7 tok/s  wall=12.4s  cached=[0, 0, 0, 0]
 ```
 
 ## Reproduce
