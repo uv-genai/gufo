@@ -13,6 +13,12 @@
 Run 2026-10-12 on the two-host Strix Halo pair, on the merge commit
 `58272777` plus `69ef6ae2` (see [Findings](#findings)).
 
+**Base.** Measured against upstream **0.12.0**. Upstream 0.13.0 was merged
+afterwards (version bump, changelog and one doc line — no code change) and
+re-verified with a two-host smoke test only: arithmetic correctness, a
+13,253-token prompt (the >1024 regression case), greedy determinism and RDMA
+traffic all pass. The numbers below were **not** re-measured on 0.13.0.
+
 ## Environment
 
 | | |
