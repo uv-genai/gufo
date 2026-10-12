@@ -18,6 +18,7 @@ Usage:  python3 tools/bench/tp2_q4_q8_bench.py
 from __future__ import annotations
 
 import json
+import hashlib
 import statistics
 import subprocess
 import sys
@@ -33,14 +34,9 @@ MODEL = {
 URL = f"http://127.0.0.1:{PORT}/v1/chat/completions"
 # (label, target prompt tokens, output tokens)
 DEPTHS = [("short", 200, 256), ("medium", 2000, 256), ("long", 8000, 128)]
-REPS = 2
+REPS = 5
+WARMUP = 1                 # unrecorded requests per depth before timing
 CONCURRENCY = 4
-
-FILLER = (
-    "Distributed tensor parallel inference splits the model's tensors across "
-    "several accelerators, so every rank computes a share of each layer and "
-    "the partial results are summed over a high speed link. "
-)
 
 
 def sh(*cmd: str, quiet: bool = True) -> None:
@@ -75,11 +71,22 @@ def stop() -> None:
     time.sleep(4)
 
 
-def prompt_for(target_tokens: int) -> str:
-    # ~13 tokens per FILLER; overshoot then trim is not needed, the server
-    # reports the real prompt_tokens and that is what the rate uses.
-    reps = max(1, target_tokens // 13)
-    return FILLER * reps
+def prompt_for(target_tokens: int, salt: str = "") -> str:
+    # Fill the prompt with words whose content is derived from `salt`, so no
+    # two requests share a prefix or long substring. Repetitive filler is not
+    # safe here: gufo's prompt cache will recognise it and report prefill=0,
+    # silently halving the measured rate. The server reports the real
+    # prompt_tokens and that is what every rate uses.
+    words = ("distributed tensor parallel inference splits large neural network "
+             "tensors across accelerators each rank computes a share of the "
+             "layer partial results summed over a high speed link").split()
+    out = []
+    i = 0
+    while len(out) < target_tokens:
+        seed = hashlib.blake2s(f"{salt}:{i}".encode(), digest_size=4).digest()
+        out.append(words[int.from_bytes(seed, "big") % len(words)])
+        i += 1
+    return " ".join(out)
 
 
 def ask(text: str, max_tokens: int) -> dict | None:
@@ -110,6 +117,7 @@ def sample(text: str, max_tokens: int) -> dict | None:
         "prefill_tps": u.get("prompt_tokens_per_second", 0.0),
         "decode_tps": u.get("completion_tokens_per_second", 0.0),
         "ttft_ms": u.get("gufo", {}).get("ttft_ms", 0.0),
+        "cached_tokens": u.get("prompt_tokens_details", {}).get("cached_tokens", 0),
         "drafted": u.get("draft_tokens", 0),
         "accepted": u.get("draft_tokens_accepted", 0),
     }
@@ -129,25 +137,37 @@ def run_variant(variant: str) -> dict:
     print("  pair ready", flush=True)
     for label, ptok, mtok in DEPTHS:
         rows = []
-        for _ in range(REPS):
-            s = sample(prompt_for(ptok), mtok)
+        for i in range(WARMUP):          # keep cold-start out of the sample
+            ask(prompt_for(ptok, f"warmup-{i}-"), mtok)
+        for i in range(REPS):
+            s = sample(prompt_for(ptok, f"rep-{i}-"), mtok)
             if s:
                 rows.append(s)
         out[label] = rows
         if rows:
+            bad = [r for r in rows if r["cached_tokens"]]
+            if bad:
+                print(f"    !! {label}: {len(bad)} cached request(s) "
+                      f"polluted prefill — treat these rates as invalid",
+                      flush=True)
             pf = statistics.median(r["prefill_tps"] for r in rows)
+            ck = statistics.median(r["cached_tokens"] for r in rows)
             dc = statistics.median(r["decode_tps"] for r in rows)
             tt = statistics.median(r["ttft_ms"] for r in rows)
             pt = statistics.median(r["prompt_tokens"] for r in rows)
+            ds = [r["decode_tps"] for r in rows]
             print(f"    {label:<7} prompt={pt:>6.0f} tok  "
-                  f"prefill={pf:>7.1f} tok/s  decode={dc:>5.1f} tok/s  "
-                  f"ttft={tt:>7.1f} ms", flush=True)
+                  f"prefill={pf:>7.1f} tok/s  decode={dc:>5.1f} "
+                  f"[{min(ds):.1f}-{max(ds):.1f}]  "
+                  f"ttft={tt:>7.1f} ms  cached={ck:.0f}  n={len(rows)}",
+                  flush=True)
     # concurrency spot check at the medium depth
     t0 = time.time()
     procs = []
     import concurrent.futures as cf
     with cf.ThreadPoolExecutor(CONCURRENCY) as ex:
-        futs = [ex.submit(sample, prompt_for(2000), 256) for _ in range(CONCURRENCY)]
+        futs = [ex.submit(sample, prompt_for(2000, f"conc-{i}-"), 256)
+                for i in range(CONCURRENCY)]
         rows = [f.result() for f in futs if f.result()]
     wall = time.time() - t0
     if rows:
