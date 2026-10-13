@@ -13,8 +13,8 @@ See the [changelog](CHANGELOG.md) and [GitHub Releases](https://github.com/gufo-
 for user-facing changes and release history.
 
 > [!NOTE]
-> This is the **Gufo RDMA version** + tp2-decode-draft-mirroring to fix infiniband errors merged with the main branch of the official **Gufo** repository, it includes all the latest features of **Gufo** and performs at about 45 tok/s decode with the UD-Q8_K_XL model. 
-> It supports Dual Strix Halo systems with InfiniBand, RoCE v2 or (dual) USB4 (Thunderbolt) cables between them. Enjoy higher performance thanks to tensor parallelism, larger contexts and a higher quality quantisation: Qwen 3.8 Flash Next Q8.
+> This is the **Gufo RDMA version** + tp2-decode-draft-mirroring pull request to fix infiniband errors merged with the main branch of the official **Gufo** repository, it includes all the latest features of **Gufo** and performs at about 45 tok/s decode with the UD-Q8_K_XL model. 
+> It supports Dual Strix Halo systems with InfiniBand, RoCE v2 or USB4 (Thunderbolt) cables between them. Enjoy higher performance thanks to tensor parallelism, larger contexts and a higher quality quantisation: Qwen 3.8 Flash Next Q8.
 > I am currently using it with two Thuderbolt 4 cables connected to both systems, see [TP2-SETUP](TP2-SETUP.md).
 
 ## Models and benchmarks
