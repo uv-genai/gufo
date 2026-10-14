@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1482,6 +1483,31 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
   // quantization; captured graphs replay the same alternation.
   void* slot = s_.x_q8[q8_slot_];
   q8_slot_ ^= 1u;
+
+  // IU4 phase-1 debug hook: dump the fp32 activations feeding Q8_1 so the
+  // activation-quantisation gate (tools/bench/iu4_act_quant_gate.cpp) runs on
+  // real data. Off unless GUFO_IU4_DUMP_ACTS names a file, capped so a long
+  // run cannot fill a disk. Synchronous device->host copy, so it perturbs
+  // timing; never leave it on for a benchmark.
+  if (const char* dump_path = std::getenv("GUFO_IU4_DUMP_ACTS");
+      dump_path != nullptr && dump_path[0] != '\0') {
+    static std::uint64_t dumped_rows = 0;
+    constexpr std::uint64_t kMaxDumpedRows = 4096;
+    if (dumped_rows < kMaxDumpedRows) {
+      const std::uint64_t take =
+          std::min<std::uint64_t>(n_tokens, kMaxDumpedRows - dumped_rows);
+      std::vector<float> host(static_cast<std::size_t>(take) * k);
+      if (hipMemcpy(host.data(), x, host.size() * sizeof(float),
+                    hipMemcpyDeviceToHost) == hipSuccess) {
+        std::FILE* f = std::fopen(dump_path, "ab");
+        if (f != nullptr) {
+          std::fwrite(host.data(), sizeof(float), host.size(), f);
+          std::fclose(f);
+        }
+        dumped_rows += take;
+      }
+    }
+  }
   if (qfn_mmq_quantize_q8_1(x, slot, static_cast<int>(n_tokens),
                             static_cast<int>(k), stream_) != 0) {
     AssignError(error_msg, "activation quantization failed");

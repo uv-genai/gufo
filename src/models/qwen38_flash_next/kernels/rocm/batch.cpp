@@ -1,6 +1,9 @@
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+#include <vector>
 
 #include "qfn_mmq.h"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
@@ -539,6 +542,34 @@ bool Executor::QuantizeBatch(const float* x, std::uint32_t rows,
     return Fail(error, "batched projection exceeds activation scratch");
   void* quantized = s_.x_q8t;
   q8t_src_ = nullptr;
+
+  // IU4 phase-1 debug hook: dump the fp32 activations feeding Q8_1 so the
+  // activation-quantisation gate (tools/bench/iu4_act_quant_gate.cpp) can be
+  // run on real data. Off unless GUFO_IU4_DUMP_ACTS names an output file, and
+  // capped so a long run cannot fill a disk. Synchronous device->host copy, so
+  // it perturbs timing; never leave it on for a benchmark.
+  if (const char* dump_path = std::getenv("GUFO_IU4_DUMP_ACTS");
+      dump_path != nullptr && dump_path[0] != '\0') {
+    static std::uint64_t dumped_rows = 0;
+    constexpr std::uint64_t kMaxDumpedRows = 4096;
+    const std::uint64_t take =
+        (rows + dumped_rows > kMaxDumpedRows)
+            ? (dumped_rows < kMaxDumpedRows ? kMaxDumpedRows - dumped_rows : 0)
+            : rows;
+    if (take > 0) {
+      std::vector<float> host(static_cast<std::size_t>(take) * cols);
+      if (hipMemcpy(host.data(), x,
+                    host.size() * sizeof(float),
+                    hipMemcpyDeviceToHost) == hipSuccess) {
+        std::FILE* f = std::fopen(dump_path, "ab");
+        if (f != nullptr) {
+          std::fwrite(host.data(), sizeof(float), host.size(), f);
+          std::fclose(f);
+        }
+        dumped_rows += take;
+      }
+    }
+  }
   if (padded != rows &&
       !Check(
           hipMemsetAsync(static_cast<std::uint8_t*>(quantized) +

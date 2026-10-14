@@ -41,16 +41,42 @@ struct Options {
   uint32_t seed = 0x9E3779B9u;
 };
 
-// fp16 round-trip, matching what a half-precision activation buffer does.
+// fp32 -> fp16 round-trip, matching what a half-precision activation buffer
+// does. Biased exponent conversion is e16 = e32 - 127 + 15; getting this wrong
+// silently rescales every value, so main() round-trips known inputs and aborts
+// if this does not reproduce them.
 float ToF16(float f) {
   union { float f; uint32_t u; } u{f};
   const uint32_t sign = (u.u >> 16) & 0x8000u;
-  const int32_t exp = static_cast<int32_t>((u.u >> 23) & 0xFFu) - 127 + 15;
+  const int32_t e32 = static_cast<int32_t>((u.u >> 23) & 0xFFu);
   const uint32_t frac = u.u & 0x7FFFFFu;
-  if (exp <= 0) return 0.0f * (sign ? -1.0f : 1.0f);
-  if (exp >= 31) return (sign ? -1.0f : 1.0f) * 1e30f;
-  return std::ldexp(static_cast<float>((frac >> 13) | 0x400u) / 1024.0f,
-                    exp - 25) * (sign ? -1.0f : 1.0f);
+  if (e32 == 0) return 0.0f * (sign ? -1.0f : 1.0f);  // subnormal -> 0
+  if (e32 == 255) return (sign ? -1.0f : 1.0f) * INFINITY;
+  const int32_t e16 = e32 - 127 + 15;
+  if (e16 <= 0) return 0.0f * (sign ? -1.0f : 1.0f);  // below half range
+  if (e16 >= 31) return (sign ? -1.0f : 1.0f) * INFINITY;
+  const uint32_t bits = sign | (static_cast<uint32_t>(e16) << 10) | (frac >> 13);
+  // Widen half bits back to float without relying on host fp16 support.
+  const uint32_t s = (bits >> 15) & 1u;
+  const uint32_t e = (bits >> 10) & 0x1Fu;
+  const uint32_t m = bits & 0x3FFu;
+  if (e == 0) return (s ? -1.0f : 1.0f) * std::ldexp(static_cast<float>(m), -24);
+  return (s ? -1.0f : 1.0f) * std::ldexp(static_cast<float>(m) + 1024.0f,
+                                         static_cast<int>(e) - 25);
+}
+
+// Abort early if ToF16 rescales or loses the sign of known values.
+bool VerifyF16() {
+  const float probe[] = {1.0f, 2.0f, 0.5f, -1.0f, 3.14159f, 71.62f, -54.45f};
+  for (float v : probe) {
+    const float r = ToF16(v);
+    const float tol = std::fabs(v) * 1e-3f + 1e-6f;
+    if (std::fabs(r - v) > tol || (v < 0.0f) != (r < 0.0f)) {
+      std::fprintf(stderr, "ToF16 broken: in %g out %g\n", v, r);
+      return false;
+    }
+  }
+  return true;
 }
 
 // Per-block quantisation, block = 32 elements, fp16 scale.
@@ -107,8 +133,33 @@ std::vector<BlockQ> QuantInt4(const std::vector<float>& row, size_t cols) {
 }
 
 float Dequant(const BlockQ& blk, size_t i, bool affine) {
-  return affine ? (blk.scale * static_cast<float>(blk.q[i]) - blk.min)
+  // Affine is scale*q + min so q=0 maps to the block min and q=15 to the max.
+  // (A minus sign here silently shifts every reconstructed value and reads as a
+  // catastrophic int4 error; VerifyQuant() below pins it.)
+  return affine ? (blk.scale * static_cast<float>(blk.q[i]) + blk.min)
                 : (blk.scale * static_cast<float>(blk.q[i]));
+}
+
+// Abort early if the affine round-trip does not reproduce its own endpoints.
+bool VerifyQuant() {
+  std::vector<float> row = {-4.0f, -1.0f, 0.0f, 2.0f, 5.0f};
+  while (row.size() < 32) row.push_back(0.0f);
+  const auto q = QuantInt4(row, 32);
+  // row[0] is -4 and is the block minimum, so it must quantise to 0.
+  const float lo = Dequant(q[0], 0, true);
+  float mn = 1e30f, mx = -1e30f;
+  for (float v : row) { mn = std::min(mn, v); mx = std::max(mx, v); }
+  if (std::fabs(lo - mn) > 1e-6f) {
+    std::fprintf(stderr, "int4 affine broken: min %g, expected %g\n", lo, mn);
+    return false;
+  }
+  // fp16 rounding of the scale itself limits this; allow ~1e-3 relative.
+  const float top = q[0].scale * 15.0f + q[0].min;
+  if (std::fabs(top - mx) > std::fabs(mx) * 2e-3f + 1e-5f) {
+    std::fprintf(stderr, "int4 affine broken: max %g, expected %g\n", top, mx);
+    return false;
+  }
+  return true;
 }
 
 // Dot product of a row against a pseudo-random weight row, under one
@@ -131,6 +182,16 @@ double DotWith(const std::vector<float>& acts, const std::vector<float>& w,
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (!VerifyF16()) {
+    std::fprintf(stderr, "fp16 conversion self-check failed; refusing to "
+                         "report numbers\n");
+    return 3;
+  }
+  if (!VerifyQuant()) {
+    std::fprintf(stderr, "int4 affine self-check failed; refusing to report "
+                         "numbers\n");
+    return 3;
+  }
   Options opt;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
