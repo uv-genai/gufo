@@ -12,7 +12,7 @@ exec "$GUFO" serve --host 127.0.0.1 --port "$PORT" --max-request-bytes 268435456
   --served-model-name "${SERVED_MODEL_NAME:-Qwen3.8 Flash Next}" \
   --model "$MODEL_DIR/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf" \
   --speculative mtp \
-  --mtp-model "$MODEL_DIR/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" \
+  --mtp-model "$MODEL_DIR/MTP/mtp-Qwen3.8-Flash-Next-shared-BF16.gguf" \
   --mmproj "$MODEL_DIR/mmproj-BF16.gguf" \
   --context "${CONTEXT:-8192}" \
   --sessions "${SESSIONS:-1}"
