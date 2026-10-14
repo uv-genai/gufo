@@ -3,44 +3,66 @@
 ## Platform and build
 
 Production targets Linux x86-64 AMD Strix Halo (`gfx1151`) only. CMake owns
-compiler flags, dependencies and installation; Nix supplies the pinned toolchain.
-Linux source-build prerequisites are in [README.md](README.md#build-from-source).
+compiler flags, dependencies and installation; the system ROCm toolchain at
+`/opt/rocm` supplies the compiler. Linux source-build prerequisites are in
+[README.md](README.md#build-from-source).
+
+Every configure on this host needs the same environment and the same three
+flags. Set the environment once per shell:
 
 ```sh
-nix build                              # production package, no tests/tools
-./result/bin/gufo diagnose
-nix build .#checks.x86_64-linux.pr      # bounded hosted CPU/repository checks
-nix develop                            # GPU development and reference tools
-
-# Same production build without Nix, with the documented dependencies installed
-cmake --preset release
-cmake --build --preset release --parallel 4
+unset ROCM_PATH
+export PATH=/opt/rocm/bin:/opt/rocm/core/lib/llvm/bin:$PATH
 ```
 
-Stage only task-owned paths before Nix builds; flakes include tracked files.
-Measure performance with `result/bin/gufo` or `build/release/gufo`. Preserve
-compiler/dependency versions when comparing results.
+Pass these three flags at every `cmake --preset` invocation:
+
+| flag | why |
+| --- | --- |
+| `-DCMAKE_HIP_COMPILER=/opt/rocm/core/lib/llvm/bin/clang++` | CMake's default HIP compiler autodetection does not resolve on this host |
+| `-DCMAKE_CXX_FLAGS="-include format"` | works around HIP's `__noinline__` macro colliding with GCC 16's `<format>` |
+| `-DCMAKE_HIP_FLAGS="-include format"` | same collision on the HIP side |
+
+```sh
+cmake --preset release \
+  -DCMAKE_HIP_COMPILER=/opt/rocm/core/lib/llvm/bin/clang++ \
+  -DCMAKE_CXX_FLAGS="-include format" \
+  -DCMAKE_HIP_FLAGS="-include format"
+cmake --build --preset release --parallel 4
+./build/release/gufo diagnose
+```
+
+The last two flags are host workarounds, not properties of the project, so
+they are passed at configure time and are deliberately absent from the
+presets. Do not bake them in.
+
+Measure performance with `build/release/gufo`. Preserve compiler and
+dependency versions when comparing results.
 
 ## Focused tests
 
-Formatting and Python repository checks may run on the editing host; they do
-not need the remote GPU. Before committing C++ changes, run the shared CI check:
+Formatting and Python repository checks run on the editing host; they do not
+need the GPU. Before committing C++ changes, run the shared CI check:
 
 ```sh
-nix shell --inputs-from . nixpkgs#clang-tools -c python3 tools/ci/check-format.py
+python3 tools/ci/check-format.py
 # Add --fix to apply formatting, then rerun the check.
 ```
 
 Run the smallest check covering the change. `gpu-test` is RelWithDebInfo with
-assertions enabled. Build only the affected target during iteration:
+assertions enabled. Build only the affected target during iteration, passing
+the same three flags as the release configure above:
 
 ```sh
-nix develop -c cmake --preset gpu-test
-nix develop -c cmake --build --preset gpu-test --target <test-target>
-nix develop -c ctest --preset gpu-full -R '^<test-name>$' --output-on-failure
+cmake --preset gpu-test \
+  -DCMAKE_HIP_COMPILER=/opt/rocm/core/lib/llvm/bin/clang++ \
+  -DCMAKE_CXX_FLAGS="-include format" \
+  -DCMAKE_HIP_FLAGS="-include format"
+cmake --build --preset gpu-test --target <test-target>
+ctest --preset gpu-full -R '^<test-name>$' --output-on-failure
 ```
 
-The same CMake/CTest commands work outside Nix. `cmake --build --preset pr`
+`cmake --build --preset pr`
 runs the hosted contract suite after configuring `cpu-test`. Full CPU checks,
 sanitisers, GPU/operator/model checks and H3 quality tools remain available
 locally; see [docs/TESTING.md](docs/TESTING.md). Do not run full model sweeps,
