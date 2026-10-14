@@ -20,7 +20,7 @@ Usage: tools/prof/decode_trace.py TRACE.csv [--gap-ms 0.5] [--top 20]
 import argparse
 import csv
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 
 def load(path):
@@ -76,6 +76,33 @@ def shapes(rows, fragment, tokens, top):
     return 0
 
 
+def order(rows, fragment, top):
+    """Grid-shape transitions, to find projections issued back to back.
+
+    A transition that always goes to the same successor identifies a fixed
+    dispatch pair - the shape a fusion would collapse.
+    """
+    tail = rows[-1]["start"] - 2_500_000_000
+    dec = [r for r in rows if r["start"] >= tail]
+    seq = [r["grid"] for r in dec if fragment in r["name"]]
+    if len(seq) < 2:
+        print("not enough dispatches", file=sys.stderr)
+        return 1
+    succ = defaultdict(Counter)
+    for a, b in zip(seq, seq[1:]):
+        succ[a][b] += 1
+    print(f"grid-shape transitions for {fragment!r} ({len(seq)} dispatches):")
+    for a in sorted(succ, key=lambda k: -sum(succ[k].values()))[:top]:
+        total = sum(succ[a].values())
+        for b, c in succ[a].most_common(4):
+            share = 100.0 * c / total
+            mark = "  <- always" if share > 99.5 else ""
+            print(
+                f"  {a:>9} -> {b:>9}   {c:6d}   {share:5.1f}%{mark}"
+            )
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("trace")
@@ -92,6 +119,11 @@ def main():
         default=64,
         help="tokens generated, used to normalise per-token counts",
     )
+    ap.add_argument(
+        "--order",
+        metavar="NAME_FRAGMENT",
+        help="print grid-shape transition counts, to find fixed dispatch pairs",
+    )
     args = ap.parse_args()
 
     rows = load(args.trace)
@@ -101,6 +133,8 @@ def main():
 
     if args.shapes:
         return shapes(rows, args.shapes, args.tokens, args.top)
+    if args.order:
+        return order(rows, args.order, args.top)
 
     t0 = rows[0]["start"]
     t1 = max(r["end"] for r in rows)
