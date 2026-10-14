@@ -23,9 +23,39 @@ These were measured on this toolchain, not assumed:
   `element = row / 2`, `lane = (row % 2) * 16 + col`.
 - No fp8/fp4/fp6 matrix instruction exists on gfx1151, so ROCmFP/ROCmFPX
   cannot be used.
-- `wmma_i32_16x16x32_iu4_w32_gfx12` (K=32, the 2x-MAC form) is unreachable:
-  it needs `wmma-128b-insts`, and enabling that feature segfaults this
-  ROCm 7.2.3 clang during codegen. K=16 is the ceiling for now.
+- `wmma_i32_16x16x32_iu4_w32_gfx12` (K=32, the 2x-MAC form) is **unavailable
+  on this hardware and never will be** - see the ISA note below. K=16 is the
+  ceiling on Strix Halo, permanently.
+
+## ISA note: gfx1151 is RDNA 3.5, not RDNA 4
+
+An earlier version of this document called gfx1151 "RDNA4". That was wrong and
+it matters. The compile line for `--offload-arch=gfx1151` links
+`oclc_isa_version_1151.bc`, i.e. **ISA 11.5.1, the gfx11 family**. RDNA 4 is
+ISA 12 (gfx1200/1250).
+
+The K=32 builtin is named `..._iu4_w32_gfx12` and requires the
+`wmma-128b-insts` feature, which LLVM documents as "WMMA instructions where A
+and B matrices do not have duplicated data" - a gfx12-family characteristic.
+On gfx1151 supplying that feature makes this ROCm 7.2.3 clang segfault during
+codegen instead of erroring cleanly:
+
+```
+error: '__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12'
+       needs target feature wmma-128b-insts,wavefrontsize32
+# with the feature supplied:
+clang++: error: unable to execute command: Segmentation fault (core dumped)
+```
+
+That is a compiler failing to reject an out-of-target instruction, not a bug
+with a pending fix. No future ROCm will make ISA 12 instructions execute on ISA
+11 silicon, so this is not something to wait for. Gufo's own `mma.hip.hpp`
+makes the same split: the `_gfx12` builtin sits under `#if defined(RDNA4)` and
+the unsuffixed one under `#elif defined(RDNA3)`.
+
+The working K=16 form carries no `_gfx12` suffix and needs no
+`wmma-128b-insts`, consistent with it being a native gfx11 instruction; it
+compiled, executed and matched the iu8 scalar reference.
 
 ## Design decisions
 
@@ -108,5 +138,5 @@ Check: a real gain at the batch sizes actually served.
 - Int4 activations may be too lossy (Phase 1 exists to find out early).
 - The 1.61x is a synthetic chain; real decode gain depends on keeping matrix
   units fed at the tile sizes actually used. It may be much less, or nothing.
-- The K=32 form would roughly double MACs and is blocked purely by a clang
-  codegen bug, not by hardware.
+- The K=32 form would roughly double MACs but is ISA 12 only, so it is
+  permanently out of reach here rather than merely blocked.
