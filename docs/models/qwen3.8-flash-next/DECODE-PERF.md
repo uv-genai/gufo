@@ -270,12 +270,66 @@ matching the template instantiation in the trace name
 `mul_mat_vec_q8<1, false, 1, false, false>` against the call sites at
 `mmvq.hip.cpp:648-651` and the batched ones at `:661-664`.
 
-## Open questions
+## Host overhead: 13.2% of decode, mostly diffuse dispatch latency
+
+Decomposing the 330 ms of idle in the decode tail (82,347 gaps):
+
+| band | gaps | total ms | share of idle |
+| --- | ---: | ---: | ---: |
+| > 5 ms | 4 | 45.90 | 13.9% |
+| 2-5 ms | 12 | 32.40 | 9.8% |
+| 1-2 ms | 6 | 8.86 | 2.7% |
+| 0.5-1 ms | 15 | 13.02 | 3.9% |
+| **< 0.5 ms** | **82,310** | **230.21** | **69.7%** |
+
+Two thirds of the idle is the **diffuse** cost of issuing 82k kernels:
+230 ms over 82,310 gaps, about **2.8 us per gap**. That is ordinary dispatch
+latency between consecutive kernels and only falls with fewer kernels, not
+with better ones. It should not be chased as a bug.
+
+The large stalls are rare: **22 gaps above 1 ms totalling 87 ms**, which is
+**3.5% of decode**. The top 10 account for 65.6 ms.
+
+Nineteen of those 22 are preceded by `HcCombineKernel<float>` and followed by
+`quantize_q8_1`. That is the **unfused** path: at
+`executor.cpp:1891-1899` the combine quantizes its own output via
+`HcCombineQ8_1` when the guard
+`!MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim())` holds, and otherwise falls
+back to `HcCombine` (f32 out) plus a separate `quantize_q8_1`. The trace shows
+the fallback.
+
+But note the rate: `HcCombineKernel` fires **6,147 times** (96 per token) and
+only 19 are followed by a stall above 1 ms - **0.3%**. So this is not a
+systematic rejection of the fused path; it is 22 rare stalls, about 0.3 per
+token. Whether they are the unfused fallback firing at a particular shape, or
+something unrelated on the host that merely happens to land there, has not
+been established.
+
+**Sizing:** worth at most 3.5% of decode, and only if every one of those 22
+stalls is attributable and removable. Far smaller than the dense GEMV question
+and far smaller than the fusion idea looked before arithmetic killed it. Do not
+start here.
 
 - **First: which launch produces gridX in the hundreds of thousands.** Until
   that is known, N, the bandwidth estimate and therefore whether dense GEMV is
   optimizable at all are all undetermined.
 - After that, whether `mul_mat_vec_q` coalesces well at M=1.
+
+## Open questions, in priority order
+
+1. **Which launch produces gridX in the hundreds of thousands.** Match the
+   trace's `mul_mat_vec_q8<1, false, 1, false, false>` against the call sites
+   at `mmvq.hip.cpp:648-651` and the batched paths at `:661-664`. Until this
+   is answered, N, the bandwidth estimate and whether 55.5% of decode is
+   optimizable at all are undetermined. **This gates everything.**
+2. **The concurrency / occupancy contradiction.** One stream measures 87.7%
+   GPU-busy, which caps aggregate concurrency gain at about 1.14x, yet 4
+   streams were previously measured at 2.2x against an ideal 4x. Either the
+   earlier run was in a different regime (short prompts, cold cache, more
+   prefill) or one figure is being read wrong. Resolve by tracing 4 streams at
+   steady-state decode with a warm cache.
+3. **The 22 rare stalls after `HcCombineKernel`.** At most 3.5% of decode, and
+   only if each is attributable. Lowest priority.
 
 ## Files
 
