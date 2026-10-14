@@ -113,3 +113,12 @@ quality; successful optimizations become the default, without extra switches.
   version and changelog updates to the release workflow.
 - Prefer `jj` when available (`jj version`); otherwise use Git.
 - Follow the user's remote workflow and preserve unrelated work.
+
+## TP2 (two-host Flash-Next)
+
+Launchers live in [tools/tp2/](tools/tp2/); ship the same `build/release/gufo`
+to `strix-halo-1.local` before starting a pair. Start rank 0, then rank 1
+within 30 s. Verify TP2 with **generation text**, not HTTP 200: a rank-0-only
+restore or a residual that never settles returns an empty completion with no
+error. Session reuse is the usual desync point; see
+[TP2.md](docs/models/qwen3.8-flash-next/TP2.md).

@@ -1,0 +1,62 @@
+========================================================================
+Q4 Flash-Next TP2 RDMA benchmark
+2x USB4 Thunderbolt, native_write_striping=Y, ib_write_bw ~37 Gb/s
+greedy, thinking off, MTP on. Pair restarted every block (leak workaround).
+========================================================================
+
+### mixed depth~0 pp+tg128
+  pp= 1102.5 tg=  79.2 ttft= 1156.4 draft=14/13(93%) prompt= 1267 gen=  17 stop
+
+### mixed depth~4096 pp+tg128
+  pp= 1283.9 tg=  62.1 ttft= 2949.6 draft=16/12(75%) prompt= 3775 gen=  17 stop
+
+### mixed depth~8192 pp+tg128
+  pp= 1328.4 tg=  62.0 ttft= 4745.7 draft=16/12(75%) prompt= 6286 gen=  17 stop
+
+### repetitive depth~0 pp+tg128
+  pp= 1189.6 tg=  69.3 ttft= 1548.3 draft=7/7(100%) prompt= 1833 gen=  10 stop
+
+### repetitive depth~4096 pp+tg128
+  pp= 1342.4 tg=  56.5 ttft= 4088.6 draft=10/7(70%) prompt= 5474 gen=  10 stop
+
+### repetitive depth~8192 pp+tg128
+  pp= 1306.0 tg=  61.5 ttft= 6995.3 draft=10/7(70%) prompt= 9114 gen=  10 stop
+
+### deep 4096 tokens tg64
+  pp= 1187.2 tg=  60.5 ttft= 2132.7 draft=16/12(75%) prompt= 2521 gen=  17 stop
+
+### deep 8192 tokens tg64
+  pp= 1279.2 tg=  61.4 ttft= 3943.7 draft=16/12(75%) prompt= 5030 gen=  17 stop
+
+### deep 16384 tokens tg64
+  pp= 1354.8 tg=  63.5 ttft= 7437.2 draft=16/12(75%) prompt=10049 gen=  17 stop
+
+### tg256 mixed
+  pp=  766.7 tg=  45.2 ttft=  839.8 draft=60/40(67%) prompt=  639 gen=  83 stop
+
+### tg256 repetitive
+  pp=  862.2 tg=  74.5 ttft= 1076.1 draft=7/7(100%) prompt=  923 gen=  10 stop
+
+### multi users=1
+  sum_tg=  74.3  wall= 1.16s  ok=1/1  sum_gen=10
+    tg=  74.3 prompt=923 gen=10
+
+### multi users=2
+  sum_tg=  80.6  wall= 2.99s  ok=2/2  sum_gen=74
+    tg=  34.6 prompt=923 gen=10
+    tg=  46.0 prompt=639 gen=64
+
+### multi users=4
+  sum_tg= 126.4  wall= 5.57s  ok=4/4  sum_gen=148
+    tg=  31.2 prompt=923 gen=10
+    tg=  31.5 prompt=639 gen=64
+    tg=  30.0 prompt=923 gen=10
+    tg=  33.7 prompt=639 gen=64
+
+### TTFT x4 short
+  pp=   71.7 tg=  23.8 ttft=  299.3 draft=1/0(0%) prompt=   21 gen=   1 stop
+  pp=  128.2 tg=  27.1 ttft=  165.9 draft=1/0(0%) prompt=   21 gen=   1 stop
+  pp=  130.1 tg=  26.9 ttft=  163.9 draft=1/0(0%) prompt=   21 gen=   1 stop
+  pp=  129.9 tg=  27.0 ttft=  164.0 draft=1/0(0%) prompt=   21 gen=   1 stop
+
+done

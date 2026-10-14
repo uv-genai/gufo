@@ -10,6 +10,7 @@
 #include <string_view>
 #include <utility>
 
+#include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/response_format.hpp"
 #include "src/core/json.hpp"
 
@@ -809,6 +810,36 @@ std::unique_ptr<TextRunnerState> TpMirroredRunner::CreateState() const {
   return std::make_unique<State>(this, std::move(inner), next_state_id_++);
 }
 
+bool TpMirroredRunner::UsesComponentCache() const {
+  // The component cache restores slots through the model adapter without
+  // sending rank 1 a restore instruction, so the ranks' collective sequences
+  // diverge at the first session reuse. TP2 keeps the mirrored snapshot
+  // cache (CreateState / Snapshot / RestoreOrFork).
+  (void)inner_;
+  return false;
+}
+
+std::unique_ptr<ComponentCacheResources>
+TpMirroredRunner::CreateComponentCacheResources(cache::ResourceLedger& ledger,
+                                                std::size_t ram) const {
+  return inner_->CreateComponentCacheResources(ledger, ram);
+}
+
+std::unique_ptr<TextRunnerState> TpMirroredRunner::BindComponentState(
+    cache::Adapter& adapter, cache::Slot& slot) const {
+  auto inner = inner_->BindComponentState(adapter, slot);
+  if (inner == nullptr) {
+    return nullptr;
+  }
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return std::make_unique<State>(this, std::move(inner), next_state_id_++);
+}
+
+void TpMirroredRunner::ReconcileComponentState(TextRunnerState& state,
+                                               std::size_t position) const {
+  inner_->ReconcileComponentState(Mirrored(state).inner(), position);
+}
+
 std::optional<TextDecodeSelection> TpMirroredRunner::PreviewFirstToken(
     TextRunnerState& state, sampling::SamplerState& sampler) const {
   return inner_->PreviewFirstToken(Mirrored(state).inner(), sampler);
@@ -866,6 +897,21 @@ TextPrefillStep TpMirroredRunner::Prefill(
     DigestTpPrefill(digest, step, inner_->CheckpointPosition(mirrored.inner()));
   });
   return step;
+}
+
+TextPrefillStep TpMirroredRunner::PrefillThrough(
+    TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+    std::size_t offset, std::size_t max_input_tokens, std::size_t boundary,
+    std::unique_ptr<TextRunnerSnapshot>* checkpoint,
+    const std::function<std::unique_ptr<TextRunnerSnapshot>()>& capture) const {
+  // Rank 1 executes kPrefill via Prefill. In-pass checkpoints must not
+  // change how many collective exchanges this rank issues, or the two
+  // ranks' verbs operation ids drift and a later all-reduce hangs. Run the
+  // same Prefill path and leave `checkpoint` empty (as a skipped capture).
+  (void)boundary;
+  (void)checkpoint;
+  (void)capture;
+  return Prefill(state, prompt, offset, max_input_tokens);
 }
 
 TextDecodeSelection TpMirroredRunner::SelectNext(

@@ -252,6 +252,7 @@
             files = [
               ".clang-format"
               "CMakeLists.txt"
+              "docs/RELEASING.md"
               "tools/prof/prof.py"
               "tools/bench/speculative-corpus.py"
             ];

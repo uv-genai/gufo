@@ -1,0 +1,6 @@
+# tp2-q8 concurrent  prompt~2K tg128  URL http://192.168.1.22:8000/v1/chat/completions
+ users   sum_tg    wall    ok  sum_gen          per-user tg
+     1     40.6    3.65  1/1       94  [40.6]
+     2     89.2    6.11  2/2      188  [42.5, 46.6]
+     4     93.2    8.83  4/4      409  [21.8, 21.8, 23.3, 26.2]
+done

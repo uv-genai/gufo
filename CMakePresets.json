@@ -19,7 +19,7 @@
     {
       "name": "release",
       "displayName": "Release",
-      "description": "Production gfx1151 build; same optimization as the Nix package",
+      "description": "Production gfx1151 build",
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",

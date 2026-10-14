@@ -5,34 +5,38 @@ cables as RoCE v2 devices ([below](#usb4)). It serves Q4 and full
 Q8, AR and MTP, images, concurrent requests and history reuse. It needs
 libibverbs and the build option `GUFO_ENABLE_TP2_RDMA` (off by default). Its
 measurements are in [EXPERIMENTS.md](EXPERIMENTS.md#tp2), not in the published
-one-host tables.
+one-host tables. The 2026-10-14 post-merge Q4/Q8 depth and concurrency series
+is [2026-10-14-tp2-depth-series.md](2026-10-14-tp2-depth-series.md).
 
 ## Build
 
 ```sh
-nix develop --inputs-from .#tp2-rdma -c cmake --preset gpu-tp2
-nix develop --inputs-from .#tp2-rdma -c cmake --build --preset gpu-tp2 --target gufo
-
-# Release binary with TP2
-cmake --preset release -DGUFO_ENABLE_TP2_RDMA=ON
+# Release binary with TP2 (native ROCm toolchain; see AGENTS.md for flags)
+cmake --preset release -DGUFO_ENABLE_TP2_RDMA=ON \
+  -DCMAKE_HIP_COMPILER=/opt/rocm/core/lib/llvm/bin/clang++ \
+  -DCMAKE_CXX_FLAGS="-include format" -DCMAKE_HIP_FLAGS="-include format"
 cmake --build --preset release --parallel 4
 ```
 
 ## Run
 
-Start rank 0 first, and rank 1 within 30 s. `RANK0_ADDRESS` is where rank 1
-reaches rank 0's TCP bootstrap. Both ranks need the same model files and the
-same `--tp-control-token`, `--context`, `--prefill-chunk`, `--sessions`, MTP
-settings and `--mmproj` use; the handshake names any setting that differs.
+Canonical launchers: [tools/tp2/](../../../tools/tp2/) (`rank0-q4.sh`,
+`rank1-q4.sh`, `rank0-q8.sh`, `rank1-q8.sh`, `swap.sh`). They use
+`build/release/gufo` on both hosts; copy that binary to `strix-halo-1.local`
+first. Start rank 0 first, and rank 1 within 30 s. `RANK0_ADDRESS` is where
+rank 1 reaches rank 0's TCP bootstrap. Both ranks need the same model files
+and the same `--tp-control-token`, `--context`, `--prefill-chunk`,
+`--sessions`, MTP settings and `--mmproj` use; the handshake names any setting
+that differs.
 
 ```sh
-# rank 0: public HTTP server
-build/gpu-tp2/gufo serve llm --model "$MODEL" --speculative mtp --mtp-model "$MTP" \
+# rank 0: public HTTP server (see tools/tp2/rank0-q4.sh)
+build/release/gufo serve llm --model "$MODEL" --speculative mtp --mtp-model "$MTP" \
   --tp-world-size 2 --tp-rank 0 --tp-bootstrap-port 18515 \
   --tp-control-port 18516 --tp-control-token SHARED_TOKEN --sessions 4
 
 # rank 1: worker only, no public HTTP port
-build/gpu-tp2/gufo serve llm --model "$MODEL" --speculative mtp --mtp-model "$MTP" \
+build/release/gufo serve llm --model "$MODEL" --speculative mtp --mtp-model "$MTP" \
   --tp-world-size 2 --tp-rank 1 --tp-bootstrap-host RANK0_ADDRESS \
   --tp-bootstrap-port 18515 --tp-control-port 18516 \
   --tp-control-token SHARED_TOKEN --sessions 4
@@ -171,7 +175,11 @@ Every model call binds the communicator's scope to its instruction's index on
 both ranks. Rules the compiler does not enforce: every state-changing call must
 pass through the wrapper; a request's cancellation check is never passed to the
 model session, which could strand rank 1 inside an exchange; TP2 must not
-change the cache's boundaries.
+change the cache's boundaries. **Restore and prefill must issue the same
+collectives on both ranks.** The component cache's adapter restore is rank-0
+only, so TP2 uses the mirrored snapshot cache (`UsesComponentCache` is false
+on `TpMirroredRunner`) and `PrefillThrough` runs `Prefill`. Otherwise the
+first session reuse diverges `operation_id`s and a later all-reduce hangs.
 
 **Disk cache.** Each rank keeps its own half of a snapshot on its own disk.
 Rank 0's continuation disk store decides what is saved, restored and evicted,
@@ -215,7 +223,7 @@ request's states and snapshots are not reused.
 - `tools/bench/model-bench.py` launches both ranks through a `gufo.tp2`
   overlay in `bench.json` (`remote_host`, `bootstrap_host`, ports, token,
   container and binary); it runs the single-user and users tables, with the
-  container `gpu-tp2` build over USB4 (the Nix build lacks its RDMA provider).
+  container `gpu-tp2` build over USB4.
 
 ## Qualifying a change
 

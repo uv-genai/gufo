@@ -197,6 +197,16 @@ public:
   [[nodiscard]] std::string Decode(
       std::span<const TextRunnerToken> tokens) const override;
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override;
+  /// Forwards the component cache to the wrapped runner so rank 0's pool
+  /// binds mirrored states through the same slots the cache owns.
+  [[nodiscard]] bool UsesComponentCache() const override;
+  [[nodiscard]] std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResources(cache::ResourceLedger& ledger,
+                                std::size_t ram) const override;
+  [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
+      cache::Adapter& adapter, cache::Slot& slot) const override;
+  void ReconcileComponentState(TextRunnerState& state,
+                               std::size_t position) const override;
   [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
       TextRunnerState& state, sampling::SamplerState& sampler) const override;
   void PreparePrefixReuse(
@@ -206,6 +216,14 @@ public:
   [[nodiscard]] TextPrefillStep Prefill(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t max_input_tokens) const override;
+  /// Mirrors the same `kPrefill` as Prefill so rank 1 stays in step; the
+  /// inner runner takes the in-pass checkpoint capture.
+  [[nodiscard]] TextPrefillStep PrefillThrough(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens, std::size_t boundary,
+      std::unique_ptr<TextRunnerSnapshot>* checkpoint,
+      const std::function<std::unique_ptr<TextRunnerSnapshot>()>& capture = {})
+      const override;
   [[nodiscard]] TextDecodeSelection SelectNext(
       TextRunnerState& state, sampling::SamplerState& sampler) const override;
   void Advance(TextRunnerState& state, TextRunnerToken token) const override;

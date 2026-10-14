@@ -1,21 +1,62 @@
-# Gufo: the Strix Halo inference engine
+# Gufo RDMA: The ***Open Source*** Strix Halo AI engine
 
 <p align="center">
-  <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180"><img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
+  <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
-Gufo is a vertical local inference engine specifically built and optimized for the AMD Strix Halo hardware:
-Ryzen AI MAX+ 395 systems with Radeon 8060S (`gfx1151`), up to 128 GiB of unified memory.
+Gufo is a vertical local inference engine specifically built and optimized for
+the AMD Strix Halo hardware: Ryzen AI MAX+ 395 systems with Radeon 8060S
+(`gfx1151`), up to 128 GiB of unified memory.
 
-**Contributions are welcome!**
+> [!IMPORTANT]
+> **This repository is a fork** of
+> [gufo-org/gufo](https://github.com/gufo-org/gufo) that adds **RDMA tensor
+> parallelism (TP2)** for two Strix Halo hosts. It tracks upstream `main` and
+> keeps every one-host feature and fix; the forked work is the two-host path
+> (InfiniBand, RoCE v2, or USB4/Thunderbolt) and its launchers and benchmarks.
+>
+> - **TP2**: Qwen3.8 Flash-Next (Q4 or full Q8) across two machines
+> - **Link**: two Thunderbolt 4 / USB4 cables, write-striping both rails
+>   (~37 Gb/s measured), or InfiniBand / RoCE v2
+> - **Launchers**: [tools/tp2/](tools/tp2/) · setup guide [TP2-SETUP.md](TP2-SETUP.md)
+> - **Design and limits**: [TP2.md](docs/models/qwen3.8-flash-next/TP2.md)
+>
+> See the [changelog](CHANGELOG.md) and
+> [GitHub Releases](https://github.com/gufo-org/gufo/releases) for upstream
+> release history.
 
-See the [changelog](CHANGELOG.md) and [GitHub Releases](https://github.com/gufo-org/gufo/releases)
-for user-facing changes and release history.
+## Why this fork
 
-> [!NOTE]
-> This is the **Gufo RDMA version** + tp2-decode-draft-mirroring pull request to fix infiniband errors merged with the main branch of the official **Gufo** repository, it includes all the latest features of **Gufo** and performs at about 45 tok/s decode with the UD-Q8_K_XL model. 
-> It supports Dual Strix Halo systems with InfiniBand, RoCE v2 or USB4 (Thunderbolt) cables between them. Enjoy higher performance thanks to tensor parallelism, larger contexts and a higher quality quantisation: Qwen 3.8 Flash Next Q8.
-> I am currently using it with two Thuderbolt 4 cables connected to both systems, see [TP2-SETUP](TP2-SETUP.md).
+On one host, Flash-Next decode and prefill are already excellent. **TP2 is
+faster than one host at every concurrency we measured**, and it holds contexts
+and the full Q8 model that do not fit a single 128 GiB APU. After merging
+upstream v0.15.0 (PR #571 wide prefill kernels), a matched binary on this
+fork’s two-host pair reports (Q4 MTP, `pp2048 / tg128`, 2026-10-14):
+
+| Depth (tokens) | 1-host pp | **TP2 pp** | 1-host tg | **TP2 tg** |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 1471 | 1450 | 38 | **49** |
+| 4,096 | 1547 | **1692** | 34 | **51** |
+| 8,192 | 1526 | **1766** | 36 | **57** |
+| 16,384 | 1545 | **1841** | 36 | **38** |
+| 32,768 | 1513 | **1814** | 39 | **48** |
+| 65,536 | 1495 | **1860** | 41 | **49** |
+| 131,072 | 1448 | **1782** | 33 | **46** |
+
+Concurrent decode (sum of per-user tok/s, ~2K prompt + 128 tokens):
+
+| Users | 1-host Q4 | **TP2 Q4** | TP2 Q8 |
+| ---: | ---: | ---: | ---: |
+| 1 | 37 | **40** | 41 |
+| 2 | 58 | **81** | **89** |
+| 4 | 86 | **113** | 93 |
+| 6 | 108 | **181** | — |
+| 8 | 130 | 150 | — |
+
+Method, raw logs and Q8 depth series:
+[2026-10-14-tp2-depth-series.md](docs/models/qwen3.8-flash-next/2026-10-14-tp2-depth-series.md).
+Published one-host tables stay under
+[docs/models](docs/models/README.md).
 
 ## Models and benchmarks
 
@@ -24,7 +65,7 @@ All model documentation lives under [docs/models](docs/models/README.md):
 | Model | Inference modes | Hugging Face weights | Benchmarks | Quality |
 | --- | --- | --- | --- | --- |
 | [Qwen3.8 27B](docs/models/qwen3.8-27b/README.md) | Q4/Q8, images, AR, DFlash2 | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_XL.gguf) / [Q8_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q8_K_XL.gguf) · [DFlash2 Q4_K_M](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/blob/2d9571f8ce46e151f61c6499c99dee6079e1d610/Qwen3.8-27B-DFlash2-Q4_K_M.gguf) | Q4: **656.33 tok/s pp**; up to **70.56 tok/s tg** single user and **123.00 aggregated tok/s** on 8 concurrent requests with DFlash2 · [Benchmarks](docs/models/qwen3.8-27b/BENCHMARKS.md) | [Quality](docs/models/qwen3.8-27b/QUALITY.md) |
-| [Qwen3.8 Flash-Next](docs/models/qwen3.8-flash-next/README.md) | Q4, images, AR, MTP | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/38bb39ee97821de2c9009abb7e93950eec396e66/UD-Q4_K_XL) · [MTP Q8_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf) | **1,702.93 tok/s pp**; up to **65.25 tok/s tg** single user and **184.74 aggregated tok/s** on 8 concurrent requests with MTP · [Benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md) | [Quality](docs/models/qwen3.8-flash-next/QUALITY.md) |
+| [Qwen3.8 Flash-Next](docs/models/qwen3.8-flash-next/README.md) | Q4/Q8, images, AR, MTP, **TP2** | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/38bb39ee97821de2c9009abb7e93950eec396e66/UD-Q4_K_XL) · [MTP Q8_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf) | One host: **1,702.93 tok/s pp**; up to **65.25 tok/s tg** · **TP2** up to **1,860 tok/s pp** and **79 tok/s tg**, **181 tok/s** sum at 6 users · [Benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md) · [TP2 series](docs/models/qwen3.8-flash-next/2026-10-14-tp2-depth-series.md) | [Quality](docs/models/qwen3.8-flash-next/QUALITY.md) |
 | [DeepSeek V4 Flash](docs/models/deepseek-v4-flash/README.md) | AR, DSpark | [antirez Flash 0731 IQ2XXS](https://huggingface.co/antirez/deepseek-v4-gguf/blob/1cd7b564460821938add0475a60b942c409295e0/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf) · [DSpark](https://huggingface.co/antirez/deepseek-v4-gguf/blob/e7f04037032990db0346398d249baf9fb9df1ccc/DeepSeek-V4-Flash-DSpark-support-0731.gguf) | **484.62 tok/s pp**; up to **26.62 tok/s tg** single user and **54.74 aggregated tok/s** on 8 concurrent requests with DSpark · [Benchmarks](docs/models/deepseek-v4-flash/BENCHMARKS.md) | [Quality](docs/models/deepseek-v4-flash/QUALITY.md) |
 | [Qwen3-ASR 1.7B](docs/models/qwen3-asr/README.md) | Speech recognition | [BF16](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/tree/7278e1e70fe206f11671096ffdd38061171dd6e5) | **15.27× realtime** · [Benchmarks](docs/models/qwen3-asr/BENCHMARKS.md) | [Quality](docs/models/qwen3-asr/QUALITY.md) |
 | [Qwen3-TTS 1.7B](docs/models/qwen3-tts/README.md) | Speech synthesis and voice cloning | BF16 [CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) / [VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) / [Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Up to **2.54× realtime**; **201 ms** to first audio (CustomVoice) · [Benchmarks](docs/models/qwen3-tts/BENCHMARKS.md) | [Quality](docs/models/qwen3-tts/QUALITY.md) |
@@ -37,13 +78,33 @@ individual request decode rates. Qwen27B's single-user peak uses the short-promp
 C1 workload. Audio excludes loading.
 Each model guide lists the required files and complete benchmark settings.
 
-**Two hosts.** Qwen3.8 Flash-Next can also run across two Strix Halo hosts
-connected by InfiniBand, RoCE v2 or USB4 cables, with tensor parallelism over
-RDMA (TP2): faster
-decode and prefill than one host, and room for checkpoints that do not fit one.
-It is the only model with multi-host support so far and needs an optional build
-with libibverbs (`-DGUFO_ENABLE_TP2_RDMA=ON`); see
-[TP2](docs/models/qwen3.8-flash-next/TP2.md).
+## Two hosts (TP2)
+
+Qwen3.8 Flash-Next runs as TP=2 over RDMA on two Strix Halo machines. It is
+the only multi-host model so far. The binary needs libibverbs and
+`-DGUFO_ENABLE_TP2_RDMA=ON`.
+
+```sh
+# After the shared CMake configure in “Build from source”:
+cmake --preset release -DGUFO_ENABLE_TP2_RDMA=ON
+cmake --build --preset release --parallel 4
+```
+
+Copy the same `build/release/gufo` to the peer, then use the launchers (Q4
+shown; `*-q8.sh` for the full Q8 model):
+
+```sh
+# rank 0 (HTTP API on :8000) — start first
+tools/tp2/rank0-q4.sh 8000
+
+# rank 1 (worker) — within 30 s
+tools/tp2/rank1-q4.sh
+```
+
+`tools/tp2/swap.sh` drives both ranks for llama-swap. Ports, control token and
+RDMA device selection are in the scripts. From bare metal to striped USB4:
+[TP2-SETUP.md](TP2-SETUP.md). Protocol, cache rules and qualification:
+[TP2.md](docs/models/qwen3.8-flash-next/TP2.md).
 
 ## Philosophy
 
@@ -143,27 +204,9 @@ Reasoning tokens count toward that response limit.
 ## Build from source
 
 Linux x86-64 on AMD Strix Halo (`gfx1151`) is the supported target. CMake owns
-one production configuration for both Nix and ordinary Linux builds. Tests,
-profilers, tuning executables and Python reference runners are not installed
-with the production package. No `build.sh` wrapper is needed.
-
-### With Nix
-
-```sh
-nix build
-./result/bin/gufo diagnose
-./result/bin/gufo serve llm --model /path/to/model.gguf
-```
-
-[flake.lock](flake.lock) pins the dependencies. `nix develop` adds profiling,
-model-download and independent evaluation tools; these are not runtime
-requirements. Optional benchmark baselines are selected separately with
-`nix shell .#ds4-reference`, `.#llama-cpp-reference` or
-`.#llama-cpp-mtp-reference`; see [benchmarking](docs/BENCHMARKS.md).
-See [testing](docs/TESTING.md) for the small hosted CI suite and
-explicit local quality checks.
-
-### Without Nix
+one production configuration for ordinary Linux builds. Tests, profilers, tuning
+executables and Python reference runners are not installed with the production
+package. No `build.sh` wrapper is needed.
 
 Install a C++20 compiler, CMake 3.21+, Ninja, pkg-config and the
 following development libraries. The currently qualified toolchain is GCC
@@ -177,6 +220,7 @@ not production build or runtime requirements.
 | hipCUB, rocPRIM, rocWMMA headers | Compiled GPU kernels |
 | ICU, libcurl, OpenSSL, libpng, libjpeg, libwebp | Tokenization, HTTPS, hashing and images |
 | FFmpeg and ffprobe | Video/audio output; invoked as separate executables |
+| libibverbs (rdma-core) | Optional TP2 two-host path (`-DGUFO_ENABLE_TP2_RDMA=ON`) |
 
 Install ROCm using [AMD's Linux instructions](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/).
 Use the development packages for the libraries above. ROCm normally installs
@@ -208,13 +252,13 @@ Use `cmake --install build/release` to install Gufo,
 its runtime data and license notices. The GPU driver must allow your user to
 access `/dev/kfd` and `/dev/dri`; model weights are acquired separately.
 
-The same source, compiler flags and install rules serve both builds. Nix pins
-the complete toolchain for reproducible comparisons; changing the compiler or
-math libraries requires the affected model's quality checks.
+Changing the compiler or math libraries requires the affected model's quality
+checks. See [testing](docs/TESTING.md) and [benchmarking](docs/BENCHMARKS.md).
 
 ## License
 
-Gufo's original code is [MIT licensed](LICENSE). Adapted code and dependencies
+Gufo's original code is [MIT licensed](LICENSE). This fork adds RDMA/TP2 work
+under the same license. Adapted code and dependencies
 retain their own notices in [NOTICE](NOTICE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 and `licenses/`, installed under `share/licenses/gufo`. Model weights are not
 bundled and retain their publishers' terms.
