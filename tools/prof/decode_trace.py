@@ -9,9 +9,13 @@ It answers the three questions behind the decode optimisation work:
   * how much of the wall clock is the GPU idle (occupancy), and what dispatch
     precedes the largest idle gaps - that is what exposes launch-bound and
     host-bound behaviour;
-  * how the passes split (warm-up prefill, timed prefill, decode).
+  * how the passes split (warm-up prefill, timed prefill, decode);
+  * --shapes groups one kernel by grid dimension, which is how separate
+    dispatches of the same templated kernel are told apart into distinct
+    projections when their row widths differ.
 
 Usage: tools/prof/decode_trace.py TRACE.csv [--gap-ms 0.5] [--top 20]
+                                   [--shapes NAME_FRAGMENT] [--tokens N]
 """
 import argparse
 import csv
@@ -36,8 +40,8 @@ def load(path):
                     "start": start,
                     "end": end,
                     "dur": end - start,
-                    "grid": r.get("Grid_X", "?"),
-                    "block": r.get("Workgroup_Size", "?"),
+                    "grid": int(r.get("Grid_Size_X", 0) or 0),
+                    "wg": int(r.get("Workgroup_Size_X", 0) or 0),
                     "dispatch": int(r.get("Dispatch_Id", 0)),
                 }
             )
@@ -45,17 +49,58 @@ def load(path):
     return rows
 
 
+def shapes(rows, fragment, tokens, top):
+    """Group one kernel by grid shape, to separate projections sharing a name."""
+    # Decode is the final continuous stretch; take the tail of the trace.
+    tail = rows[-1]["start"] - 2_500_000_000
+    dec = [r for r in rows if r["start"] >= tail]
+    agg = {}
+    for r in dec:
+        if fragment not in r["name"]:
+            continue
+        key = (r["grid"], r["wg"])
+        e = agg.setdefault(key, [0, 0])
+        e[0] += 1
+        e[1] += r["dur"]
+    if not agg:
+        print(f"no decode dispatch matches {fragment!r}", file=sys.stderr)
+        return 1
+    print(f"grid shapes for {fragment!r} in the decode tail:")
+    print(f"  {'gridX':>9}{'wg':>6}{'count':>7}{'per tok':>9}{'avg us':>9}{'total ms':>10}")
+    for (gx, wg), (count, total) in sorted(agg.items(), key=lambda kv: -kv[1][0])[:top]:
+        print(
+            f"  {gx:>9}{wg:>6}{count:>7}{count / tokens:>9.2f}"
+            f"{total / count / 1e3:>9.1f}{total / 1e6:>10.1f}"
+        )
+    print(f"\ndistinct shapes: {len(agg)}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("trace")
     ap.add_argument("--gap-ms", type=float, default=0.5)
     ap.add_argument("--top", type=int, default=20)
+    ap.add_argument(
+        "--shapes",
+        metavar="NAME_FRAGMENT",
+        help="group this kernel by grid shape instead of printing the rollup",
+    )
+    ap.add_argument(
+        "--tokens",
+        type=int,
+        default=64,
+        help="tokens generated, used to normalise per-token counts",
+    )
     args = ap.parse_args()
 
     rows = load(args.trace)
     if not rows:
         print("no kernel dispatch rows found", file=sys.stderr)
         return 1
+
+    if args.shapes:
+        return shapes(rows, args.shapes, args.tokens, args.top)
 
     t0 = rows[0]["start"]
     t1 = max(r["end"] for r in rows)
