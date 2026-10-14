@@ -10,9 +10,18 @@ extrapolated.
 
 ## Order of work
 
-Agreed as **3, 1, 2** - per-step cost, then concurrency, then GEMV bytes - and
-then reordered by data: **the GEMV path is the real target**. See
-"Dispatch map" below. Concurrency and per-step overhead are secondary.
+Agreed as **3, 1, 2** - per-step cost, then concurrency, then GEMV bytes. The
+profile then re-pointed at the GEMV path, and arithmetic has since narrowed it
+again. The current state, in one line each:
+
+- **Per-step / launch overhead**: measured at 12.26% of the decode pass. Real,
+  small, not the main lever.
+- **Concurrency**: not re-examined since. Expect it to be bounded by the same
+  GPU-bound decode, so revisit only after the dense-GEMV question closes.
+- **GEMV fusion**: **rejected.** Arithmetic below shows the shared activation
+  is 0.019% of the traffic. Do not build it.
+- **Dense GEMV, the open question**: 55.5% of decode time, and whether it is at
+  the memory wall is undetermined. Resolving that is the next task.
 
 Related: the IU4/quantisation study is a separate, closed body of work on
 branch `iu4`, tagged `research/iu4-instruction-study-2026-10-14`. It is a
@@ -152,35 +161,75 @@ The linear/GDN path has the same shape of opportunity: `ssm_in` and
 `ssm_alpha_beta` both consume `x`
 (`executor.cpp:2204` and `:2219`).
 
-## What a fusion would save
+**The shared input is real but does not by itself yield an optimisation** - see
+the arithmetic below. Do not treat it as a work item on its own.
 
-The `81920`/`327680` pair is 97 pairs per token at 44.1 + 18.1 = 62.2 us, about
-6.0 ms per token, roughly **32% of decode GPU time**.
+## The fusion idea does not survive arithmetic - do not build it
 
-`524288` is the single largest dense GEMV cost at 477 ms (22%) and always
-precedes `81920`, so if Q, K, V and indexer_k come off one shared input, a
-kernel handling **unequal output widths** would cover more than half of dense
-GEMV time.
+The dispatch map and the shared-input finding make a fusion look attractive,
+but the memory-traffic argument for it is wrong, and it is worth being explicit
+about why so nobody re-derives it.
 
-The gain is **not** dispatch count - occupancy is already 87.7%. It is:
+For an M=1 GEMV the weights dominate traffic. With K=2560 and Q8_0 at 34 bytes
+per 32 weights, one activation row is **2.81 KiB** against **30.64 MB** of
+weights for a representative Q/K/V trio:
 
-- **activation memory traffic**: reading `s_.mixed` once instead of three or
-  four times;
-- **wave utilisation**: larger kernels over more output columns occupy the 20
-  CUs better than three narrow ones.
+| N_out | weights | activation share |
+| ---: | ---: | ---: |
+| 2560 | 6.96 MB | 0.0413% |
+| 5120 | 13.93 MB | 0.0207% |
+| 10240 | 27.85 MB | 0.0103% |
 
-## Open questions before writing a kernel
+Fusing three such projections to read `s_.mixed` once saves **5.62 KiB out of
+30.64 MB, or 0.019%**. The activation is free either way; the weight-to-
+activation ratio is about 2700:1. The "read the activation once instead of
+three times" argument that the shared input suggested does not apply at M=1,
+where the activation is negligible next to the weights it selects.
 
-- Confirm the gridX shapes map to `attn_q` / `attn_k` / `attn_v` / `indexer_k`
-  and not to something else. Deriving N from gridX needs the kernel's launch
-  geometry in `kernels.hip.cpp`, which has not been read yet. The cadence
-  (about two per layer across 48 layers) is consistent but not proof.
-- Establish the arithmetic-intensity argument quantitatively. Occupancy at
-  87.7% means the saving must come from bytes and utilisation; size that
-  before committing, rather than assuming.
-- Decide whether to extend `stackable()` to unequal `cols` (a padded or
-  banded stack) or write a dedicated multi-width GEMV. The former reuses the
-  existing Q8_0 path; the latter is more control.
+That leaves only two possible wins, both small:
+
+- **launch overhead**, capped by the measured 12.26% idle, of which this pair
+  is only part;
+- **wave utilisation**, unmeasured.
+
+Neither justifies a kernel against 55.5% of decode time. The dispatch map is
+recorded as understanding, not as a work item.
+
+## What the numbers actually point at
+
+If the dense GEMV is bandwidth-bound, the only lever on 55.5% of decode time is
+**fewer weight bytes** - quantising those projections, which costs quality - or
+reading fewer of them. Kernel work cannot help a kernel already at the memory
+wall.
+
+Whether they are at the wall was unknown when this section was written, and
+that made it the decisive question. Strix Halo LPDDR5x peaks near **256 GB/s**.
+Taking that peak, the measured runtimes imply:
+
+| shape | us | bytes at peak | implied N | effective BW |
+| ---: | ---: | ---: | ---: | ---: |
+| 327680 | 18.1 | 4.63 MB | 1704 | 256 GB/s |
+| 81920 | 44.1 | 11.29 MB | 4151 | 256 GB/s |
+| 524288 | 207.2 | 53.04 MB | 19501 | 256 GB/s |
+
+For comparison a single N=2560 projection is 6.96 MB, or **27.2 us at peak**;
+the measured 18.1 and 44.1 us bracket that. So the shapes are consistent with
+running at or near peak bandwidth - which would mean there is nothing to gain -
+but the reasoning is circular: N was assumed to derive the bandwidth.
+
+## Open questions
+
+- **First and decisive: the real N behind each gridX.** Read the launch
+  geometry in `src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp` and
+  derive N from gridX. Until then every bandwidth figure above is circular.
+  If N puts the kernel at roughly 90-100% of 256 GB/s, the dense GEMV is
+  irreducible and effort should move to the MoE expert path or to reducing
+  weight bytes. If N sits well below, there is kernel headroom and the target
+  is coalescing inside `mul_mat_vec_q`, not fusion.
+- Only after that, map gridX to `attn_q` / `attn_k` / `attn_v` / `indexer_k`.
+  The cadence (about two per layer across 48 layers) is consistent but not
+  proof.
+- Whether `mul_mat_vec_q` coalesces efficiently at M=1.
 
 ## Files
 
