@@ -217,19 +217,65 @@ the measured 18.1 and 44.1 us bracket that. So the shapes are consistent with
 running at or near peak bandwidth - which would mean there is nothing to gain -
 but the reasoning is circular: N was assumed to derive the bandwidth.
 
+## What the kernel source establishes, and what it does not
+
+`src/models/qwen38_flash_next/kernels/rocm/mmq/mmvq.hip.cpp` holds the dense
+kernel. For `tokens == 1` the launch is:
+
+```cpp
+template <int tokens>
+static void launch_q8(..., int k, int rows, ...) {
+    ...
+    mul_mat_vec_q8<tokens, false><<<rows, 32, 0, stream>>>(...)
+```
+
+So for that path **gridX is `rows`, one wave of 32 threads per output row**.
+That is a solid, reusable fact.
+
+It does **not** reconcile with the measured gridX, and the discrepancy is
+unresolved. If `rows` were the projection's output dimension and K were 2560,
+shape 327680 would move
+
+```
+327680 rows x (2560/32) blocks x 34 bytes = 891 MB in 18.1 us = 49 TB/s
+```
+
+which is physically impossible on LPDDR5x. Working backwards, 18.1 us at
+256 GB/s is 4.63 MB, or about 14 bytes per row - not a legal Q8_0 row width.
+
+Two readings are possible and neither has been checked:
+
+- the large-grid dispatches come from a **different launch**, for instance
+  `mul_mat_vec_moe_grouped` (`mmvq.hip.cpp:617`, `<<<grid, 64>>>`) or the
+  batched variants `launch_q8_batch` / `launch_q8_matrix`, rather than
+  `launch_q8<1>`;
+- or `rows` is expert-stacked rather than a single projection's width.
+
+Note all five gridX are exact multiples of 512 (`num_experts`):
+
+```
+ 327680 = 512 x 640      81920 = 512 x 160
+ 524288 = 512 x 1024    425984 = 512 x 832
+7946240 = 512 x 15520
+```
+
+and 640 is `expert_ff`. That is suggestive of expert-stacked weights, but
+synchronising every shape with a single factor is not proof and the bandwidth
+arithmetic contradicts the naive reading. **Do not size any optimisation on
+these gridX until the launch site for these dispatches is identified.**
+
+The immediate next task is therefore narrower than it was: find which launch
+in `mmvq.hip.cpp` (or elsewhere) produces a gridX of this magnitude, by
+matching the template instantiation in the trace name
+`mul_mat_vec_q8<1, false, 1, false, false>` against the call sites at
+`mmvq.hip.cpp:648-651` and the batched ones at `:661-664`.
+
 ## Open questions
 
-- **First and decisive: the real N behind each gridX.** Read the launch
-  geometry in `src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp` and
-  derive N from gridX. Until then every bandwidth figure above is circular.
-  If N puts the kernel at roughly 90-100% of 256 GB/s, the dense GEMV is
-  irreducible and effort should move to the MoE expert path or to reducing
-  weight bytes. If N sits well below, there is kernel headroom and the target
-  is coalescing inside `mul_mat_vec_q`, not fusion.
-- Only after that, map gridX to `attn_q` / `attn_k` / `attn_v` / `indexer_k`.
-  The cadence (about two per layer across 48 layers) is consistent but not
-  proof.
-- Whether `mul_mat_vec_q` coalesces efficiently at M=1.
+- **First: which launch produces gridX in the hundreds of thousands.** Until
+  that is known, N, the bandwidth estimate and therefore whether dense GEMV is
+  optimizable at all are all undetermined.
+- After that, whether `mul_mat_vec_q` coalesces well at M=1.
 
 ## Files
 
