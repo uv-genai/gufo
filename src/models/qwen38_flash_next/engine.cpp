@@ -966,9 +966,14 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const bool sampled = sampler.config().uses_random_sampling();
   const bool gpu_greedy = sampler.config().temperature == 0.0F;
   const bool gpu_verification = gpu_greedy;
-  if (allow_subset && !SyncDraftVocab(error_msg))
+  // The small-head path scores a local draft table and skips TP2's split
+  // argmax all-reduce; the full-head greedy path performs that all-reduce.
+  // Ranks that disagree on `draft_subset` therefore hang in verbs. Keep the
+  // collective sequence uniform: only single-host may take the subset.
+  const bool subset_ok = allow_subset && model_->TpWorldSize() == 1;
+  if (subset_ok && !SyncDraftVocab(error_msg))
     return false;
-  pending->draft_subset = allow_subset && model_->draft_subset_ &&
+  pending->draft_subset = subset_ok && model_->draft_subset_ &&
                           draft_vocab_.Fits(anchor, [&](std::int32_t token) {
                             return model_->InDraftSubset(token);
                           });

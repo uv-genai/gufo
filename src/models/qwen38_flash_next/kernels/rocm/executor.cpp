@@ -2971,9 +2971,9 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
   // IDs after a full-row argmax instead.
   const std::uint32_t half = output.rows / 2;
   const std::size_t width = config().hidden_size;
-  if (draft == nullptr && token && !candidates && model_->tp_world_size() == 2 &&
-      output.type == GgmlType::kQ8_0 && output.cols % 32 == 0 &&
-      output.rows % 2 == 0 && half >= width) {
+  if (draft == nullptr && token && !candidates &&
+      model_->tp_world_size() == 2 && output.type == GgmlType::kQ8_0 &&
+      output.cols % 32 == 0 && output.rows % 2 == 0 && half >= width) {
     const std::uint32_t rank = model_->tp_rank();
     DeviceTensor part = output;
     part.rows = half;
@@ -2998,9 +2998,8 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
   const std::uint32_t prefix = model_->draft_output().rows;
   const std::uint32_t rows =
       draft != nullptr ? prefix + kMtpDraftExtraRows : output.rows;
-  if (!(draft != nullptr
-            ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
-            : Dense(output, s_.mixed, s_.logits, 1, error_msg))) {
+  if (!(draft != nullptr ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
+                         : Dense(output, s_.mixed, s_.logits, 1, error_msg))) {
     return false;
   }
   const auto count = std::min<std::uint32_t>(rows, kMtpCandidates);
