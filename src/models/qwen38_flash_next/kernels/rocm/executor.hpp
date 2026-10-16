@@ -648,6 +648,9 @@ private:
     bool speculative;
     Session::Control* control;  ///< the positions its kernels read
     std::uint32_t emb_row;      ///< its first fetched n-gram row
+    /// True when the caller already waited for this chunk's n-gram rows;
+    /// Ple must not WaitRead them a second time.
+    bool embeddings_ready{false};
   };
   /// A trunk layer's GDN or attention block with its PLE and mixer, the
   /// output in s_.block_out. A split block's output is this rank's partial;

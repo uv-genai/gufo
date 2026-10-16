@@ -3325,7 +3325,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                          .sparse = sparse,
                          .speculative = speculative,
                          .control = session.control_,
-                         .emb_row = 0};
+                         .emb_row = 0,
+                         .embeddings_ready = embeddings_ready};
   bool normed = false;  ///< xn holds the next mixer's grouped norm of res
   for (std::uint32_t il = first_layer; il < end_layer; ++il) {
     if (!session.CheckCancellation(error_msg)) {
@@ -3754,8 +3755,9 @@ bool Executor::MixerPart(Session& session, std::uint32_t il,
   const Config& c = config();
   const DeviceLayer& l = model_->layers()[il];
   const std::uint32_t n = batch.n;
-  if (c.IsPleLayer(il) && !Ple(l, session, n, s_.res, batch.speculative,
-                               error_msg, false, checkpoint, batch.emb_row)) {
+  if (c.IsPleLayer(il) &&
+      !Ple(l, session, n, s_.res, batch.speculative, error_msg,
+           batch.embeddings_ready, checkpoint, batch.emb_row)) {
     return false;
   }
   // Both stacked SSM projections consume the same F16 input. Avoid writing
