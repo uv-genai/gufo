@@ -1,10 +1,16 @@
 # DeepSeek V4.1 Flash — support plan
 
 Status: **planned, not implemented.** Gufo today runs **DeepSeek V4 Flash**
-(single host, no tensor parallel, no weight streaming). This document records
-the capacity analysis and the intended design for **V4.1 Flash** on one or two
-Strix Halo (`gfx1151`) hosts, including **NVMe weight streaming** and how it
-would meet the existing **TP2 / RDMA** stack.
+(single host, resident, no TP). This plan covers **DeepSeek V4.1 Flash**
+(**1017** checkpoints included): capacity on one and two Strix Halo
+(`gfx1151`) hosts, **NVMe weight/Engram streaming**, and **TP2/RDMA**.
+
+**Goals (always):**
+
+1. **Single-host** V4.1 serving first.  
+2. **TP2** (two-host RDMA) as a first-class path, not an afterthought.  
+3. Start from **streaming** (Engram and/or experts on disk) because that is
+   what makes the model fit.
 
 Related: [V4 Flash](../deepseek-v4-flash/README.md) ·
 [Flash-Next TP2](../qwen3.8-flash-next/TP2.md) ·
@@ -16,211 +22,197 @@ Related: [V4 Flash](../deepseek-v4-flash/README.md) ·
 
 | | |
 | --- | --- |
-| Hub | [`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) |
+| Hub | [`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) · [1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) |
 | Scale | **763B** total · **552B** backbone · **~196B** Engram · vision encoder |
 | Active per token | **~8B** prefill · **~16B** decode |
-| Architecture | Causal Encoder-Decoder (20 enc + 20 dec), CSA2 sparse attention, Engram memory |
+| Architecture | Causal Encoder-Decoder (20+20), CSA2 sparse attention, Engram |
 | MoE | **384** routed experts, **6** active + **1** shared |
-| Context | up to **1M** tokens; FP4 KV ~**890 B/token** |
-| Official weights | **FP8** (safetensors); community GGUFs exist |
+| Context | up to **1M** tokens; FP4 KV ~**890 B/token** (~0.89 GB full 1M) |
+| Official weights | **FP8** (hundreds of GB) |
 
-V4.1 is **not** a drop-in for `src/models/deepseek_v4_flash/` (V4 Flash
-0731). It needs a **new model package** and encoding path.
+V4.1 is **not** a drop-in for `src/models/deepseek_v4_flash/`. It needs a
+**new model package** and encoding path.
 
 ---
 
-## 2. Capacity on two Strix Halo hosts
+## 2. Why FP8 / plain GGUF do not fit two hosts
 
-| Representation | Approx. weight size | Fits 2×128 GiB resident? |
+| Representation | Approx. size | 2×128 GiB resident (~240 GiB usable) |
 | --- | ---: | --- |
-| FP8 (official) | ~763 GB | No |
-| 4-bit | ~380 GB | No |
-| 2-bit | ~190 GiB | At/over budget after KV, vision, RDMA, OS |
+| Official FP8 | ~763 GB | No |
+| Q4-class GGUF | ~380 GB | No |
+| Q2 / IQ2-style (with Engram in-file) | ~150–360 GB | No or only with streaming |
 
-Two hosts give roughly **~240 GiB** usable unified memory together. **Resident
-TP2 cannot hold V4.1.** The viable two-host strategy without more machines is
-**streaming**: keep a hot working set in RAM/GPU and the rest on NVMe.
+**Resident-only TP2 is not enough.** The plan always pairs:
 
-Low activated parameters reduce **compute**, not **weight residency**.
+- **streaming** (bulk off GPU: Engram ± experts), and  
+- **single-host** and **TP2** runtime modes.
 
 ---
 
-## 3. Streaming design
+## 3. Artifact survey (1017 and close)
 
-### 3.1 Placement tiers
+Survey date: **2026-10-18**. Sizes from HF cards/trees; **measure** before
+committing to a download.
+
+| Artifact | Base / quant | Engram | Fits 1×128? | Fits 2×128? | Runtime notes |
+| --- | --- | --- | --- | --- | --- |
+| **[Baekpica 1017 VQ-GGUF](https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF)** | **~113.6 GB** base (YoungAi `vq8sh14-q4k-mtpnative`) + ~1 GB vision | **~203 GB** (2×~101.5 GB), **read from SSD** (`--engram-dir`) | **Yes for weights** (~106 GiB loaded); Engram on disk | Yes (same or TP + half experts later) | **Primary near-term candidate.** Custom `vqblob` GGUF; **ds4-dfm-rs / YoungAi**, not stock llama.cpp |
+| **[YoungAi V4.1 Flash](https://huggingface.co/wenzhouwu/YoungAi-DeepSeek-V4.1-Flash)** (and **-1017**) | Same recipe, **113.6 GB** base | Same on-disk tables | Same as Baekpica | Same | Reference recipe + `ds4-server`; ~317 GB download |
+| **[mrfakename 1017 GGUF](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF)** | llama.cpp-style **Q2_K…Q8_0** (repo ~1.56 TB total) | Likely in-file / large shards | Depends on quant (Q2 may still be >100 GB + Engram) | Possible only if chosen quant+Engram ≤ budget **or** streamed | Stock **llama.cpp** path — good long-term for a gufo port shaped like other GGUFs |
+| **[acrogenesis 1017 IQ2_XXS](https://huggingface.co/acrogenesis/DeepSeek-V4.1-Flash-1017-IQ2_XXS-GGUF)** | IQ2 experts + Q8 dense; tree **~359 GB** (shards incl. large Engram pieces) | In GGUF set | No if all resident | Only with **streaming** | llama.cpp-tagged; verify Engram vs base split before use |
+| **[antirez V4.1 GGUF](https://huggingface.co/antirez/deepseek-v4.1-flash-gguf)** | Q2 **~366 GB**, Q4 **~519 GB** | In file | No | No without heavy streaming | ds4/Metal-oriented; not a two-host resident fit |
+| Official FP8 / 4-bit community | ~380–763 GB | n/a | No | No | Out of scope for resident |
+
+**Takeaway:** the **YoungAi VQ / Baekpica 1017** line is the only surveyed
+path where **base weights** fit **one** 128 GiB host **and** the oversized
+**Engram** is already designed to **live on NVMe**. That is the pattern to
+productize first.
+
+### 3.1 What the Baekpica/YoungAi card means (short)
+
+- **“510 GB → ~114 GB base”** — aggressive **VQ** (~1.6 bit/weight on MoE)
+  + q4_K on dense; quality is **lossy** (~69–79% same top-1 vs FP8).  
+- **Engram `2 × ~101 GB` read in rows from local SSD** — streaming already.  
+- **Resident ~106 GiB** — matches one Strix Halo with headroom if KV stays
+  small (full 1M KV ~0.89 GB).  
+- **Must use 1017 Engram tables with 1017 weights** — mismatch loads
+  silently.  
+- **Not vanilla llama.cpp** — needs YoungAi tools or `ds4-dfm-rs`.
+
+---
+
+## 4. Streaming design (start here)
+
+### 4.1 Placement tiers
 
 | Tier | Contents |
 | --- | --- |
-| **T0 Device** | Dense/attention/embeddings (or TP shards), hot expert cache, active KV/CSA2 |
-| **T1 Host pin** | IO staging, completion rings |
-| **T2 Page cache** | Recently read expert/Engram blocks (OS) |
-| **T3 NVMe** | Full quantized GGUF / expert-major shards (per host, local disk) |
+| **T0 Device** | Dense/attention/embeddings, hot expert cache, active KV/CSA2 |
+| **T1 Host pin** | IO staging |
+| **T2 Page cache** | Hot Engram/expert pages (OS) |
+| **T3 NVMe** | Full GGUF / Engram shards (local SSD per host) |
 
-T0+T1 budget target: about **40–70 GiB** per host, leaving room for KV and the OS.
+**T0+T1 budget:** ~**40–70 GiB** for streaming mode; for the VQ artifact
+much of T0 is the **~106 GiB base**, so **Engram must stay in T3** (as
+designed on DGX Spark).
 
-### 3.2 Resident vs streamed
+### 4.2 Two streaming flavors (both in plan)
 
-| Component | Policy |
-| --- | --- |
-| Embeddings, attention/CSA2, norms, routers | Resident |
-| Shared expert | Resident (or pinned) |
-| Routed experts (384) | **Stream** (LRU device cache) |
-| Engram (~196B) | **Stream by page** (sparse) |
-| Vision encoder | Optional; omit for text-only first cut |
-| KV / CSA2 index | Resident budget; host managed memory if tight (not per-token NVMe) |
+| Flavor | What streams | When |
+| --- | --- | --- |
+| **A. Engram-only (v1)** | Engram n-gram tables from disk; base resident | **Start here** — matches Baekpica/YoungAi; simplest |
+| **B. Expert streaming (v2)** | Routed experts ± Engram; dense resident | When base quant is still too big (plain Q2/IQ2) or TP needs more headroom |
 
-### 3.3 On-disk layout
+### 4.3 Engram streaming (v1 — proven pattern)
 
-Prefer **expert-major** blobs so a miss is one contiguous read:
+- Tables on **local NVMe**; row/page reads into pinned staging → GPU.  
+- Double-buffer; prefetch next lookup while compute runs.  
+- Wrong Engram revision vs weights = silent quality bug — **checksum** both.  
+- Snapshot/session state does **not** include the whole table.
 
-```
-model.gguf
-  dense/
-  experts/e{layer}.{expert}.bin   # or packed groups
-  engram/page_{n}.bin
-  index.json                      # offsets, quant block size, checksums
-```
+### 4.4 Expert cache (v2)
 
-Align blobs to quant blocks and NVMe-friendly sizes (4 KiB pages; 64–256 KiB
-optional read size). For TP, package each expert as the rank’s
-`[ff_begin:ff_count]` slice so each host stores/loads **half** the expert bytes.
-
-### 3.4 Device expert cache
-
-- Slots: `{layer, expert_id, LRU tick, device buffer, Free|Loading|Ready}`.
-- Capacity: configurable, e.g. **8–32 GiB**.
-- API: `Prefetch`, `WaitReady`, `Touch`, eviction on miss.
-- Inference weights are read-only (no writeback).
-
-### 3.5 I/O pipeline
-
-1. Router selects top‑k experts.  
-2. Async prefetch: NVMe / page cache → pinned staging → H2D on a **side stream**.  
-3. Overlap: prefetch layer *L+1* while layer *L* runs attention / all-reduce.  
-4. `WaitReady` then MoE GEMM.  
-5. Watchdog on `WaitReady`: fail the request with a clear error rather than
-   leaving a TP peer blocked in a collective.
-
-Double-buffer staging; do not serialize H2D on the same stream as compute
-without events.
-
-### 3.6 Cache policy
-
-| Policy | Choice |
-| --- | --- |
-| Replacement | LRU (or decaying LFU) |
-| Pin set | Shared expert + current batch’s 6 experts |
-| Prefetch | Router top-k before GEMM; optional next-layer lookahead after measurement |
-| Failure | Missing/corrupt blob → request error |
+- LRU slots for active experts (6×40 layers); router top-k prefetch.  
+- Side H2D stream; `WaitReady` **watchdog** (never hang TP on disk).  
+- Optional **storage TP:** each rank holds/streams only its FF slice of each
+  expert (quant-block aligned), same all-reduce as Flash-Next.
 
 ---
 
-## 4. TP2 / RDMA integration
+## 5. Single-host and TP2 (both required)
 
-Reuse Flash-Next TP2: world size **1 or 2**, mirrored rank 1, verbs all-reduce
-with **3×48 MiB** windows, same binary/sha on both hosts, component cache off
-under TP.
+### 5.1 Single-host (first delivery)
 
-### 4.1 Compute TP (keep Qwen’s rule)
+| Mode | Behavior |
+| --- | --- |
+| **VQ / Baekpica-like** | Base resident; **Engram on NVMe**; one `gufo` process |
+| **Large plain GGUF** | Resident dense + **expert stream** if needed |
 
-Every rank runs the **same** selected experts on a **partition of the FF
-intermediate**; MoE **all-reduce** sums partials. Ranks must not choose
-different expert sets (desyncs collectives and streaming).
+No verbs, no mirror — same quality gates as other single-host models.
 
-### 4.2 Storage TP (recommended)
+### 5.2 TP2 (always in scope)
 
-| Mode | Each rank streams | Notes |
-| --- | --- | --- |
-| Mirror | Full expert | Wastes NVMe and hot RAM |
-| **FF shard (recommended)** | **Local `[ff_begin:ff_count]` only** | Same all-reduce shape as Flash-Next |
-| Expert-ID shard | Disjoint experts | Requires **all-to-all** of activations — **out of scope** (not in verbs stack) |
+Reuse [Flash-Next TP2](../qwen3.8-flash-next/TP2.md):
 
-Do **not** shard expert IDs across ranks until an all-to-all transport exists.
+| Piece | Rule |
+| --- | --- |
+| World size | **1 or 2** |
+| Compute TP | Every rank, **same** experts, **FF intermediate shard** + **all-reduce** |
+| Storage | Prefer **stream local FF slice** (½ NVMe, ½ hot cache) |
+| Not in v1 | Expert-**ID** partition (needs all-to-all) |
+| Transport | Verbs **3×48 MiB** windows; re-derive max prefill for V4.1 hidden size |
+| Mirror | Rank 1 = `TpExecutor`; **same binary/sha** both hosts |
+| Disk wait | Never block a collective forever (timeout → request error) |
 
-### 4.3 Steady-state schedule
+**Schedule:** dense/attention ∥ prefetch experts (or Engram) → MoE/GEMM →
+all-reduce.
 
-```
-dense/attention (resident)  ∥  prefetch experts L+1
-MoE GEMM on ready slots (L)
-verbs all-reduce partial
-residual combine
-```
-
-Expert loads are **not** all-reduce payloads; only FF partials use the RDMA
-windows. Prefill batch size still must fit `MaxPartialBytes` (re-derive for
-V4.1 hidden size).
-
-### 4.4 Control plane
-
-- Extend mirrored instructions as needed; expert IDs can be derived from
-  identical routers on both ranks or shipped in the same control message.
-- Device expert cache is **ephemeral**: snapshots do **not** include slots;
-  restore starts cold.
-- Disk **KV** continuation cache remains separate from NVMe **weight** streaming.
-
-### 4.5 Failure modes
+### 5.3 Failure modes
 
 | Symptom | Likely cause |
 | --- | --- |
-| `verbs all-reduce timed out` | Peer stuck in `WaitReady` (disk) or rank desync |
-| Empty completion | Rank0-only path / mirror bug (same class as historical TP2 bugs) |
-| tok/s collapse when cold | Cache too small or no prefetch |
-| OOM | T0 + KV over budget |
+| `verbs all-reduce timed out` | Peer stuck in disk `WaitReady`, or desync |
+| Empty completion | Mirror/rank0-only bug (historical TP2 class) |
+| Slow cold start | No Engram/expert prefetch |
+| Silent bad text | Engram vs weight **revision mismatch** |
 
 ---
 
-## 5. Phases
+## 6. Phases
 
-| Phase | Deliverable |
-| --- | --- |
-| **0** | Measure NVMe on both hosts; pin V4.1 GGUF revision, quant, tensor map |
-| **1** | Expert/page store + device cache + standalone bench |
-| **2** | Single-host V4.1 text path: resident dense + streamed experts |
-| **3** | TP FF shard + stream local slices; verbs + mirrored serve |
-| **4** | Engram pages; optional vision; optional DSpark |
-| **5** | Qualification: cold/warm, sessions ≥ 5, generation text, tags |
+| Phase | Deliverable | GPU |
+| --- | --- | --- |
+| **0** | Pin artifact (prefer **Baekpica/YoungAi 1017 VQ**); NVMe + layout audit; Engram checksum plan | disk only |
+| **1** | **Single-host Engram streaming** + minimal V4.1 text decode (VQ path) | idle machine |
+| **2** | Qualify single-host (quality, tok/s, 1M KV budget) | yes |
+| **3** | **TP2**: FF shard + mirrored serve; Engram on **both** NVMe (or shared read-only) | two hosts |
+| **4** | Expert streaming (v2) if a larger GGUF is needed; optional vision/DSpark | yes |
+| **5** | Docs, launchers `tools/tp2/` variants, tags | — |
 
-**Non-goals (early phases):** more than two ranks, expert-ID all-to-all,
-training/fine-tuning, V4 Pro–class models.
+**Always ship:** single-host path **and** TP2 path before calling V4.1
+“supported” in the index.
 
----
-
-## 6. Verification (when implementing)
-
-1. Expert fetch correctness vs file checksums.  
-2. Cold start (empty page cache) still completes.  
-3. Warm steady-state hit rate and tok/s.  
-4. Greedy text vs offline reference on the same quant.  
-5. TP2: matching binary shas; generation text; prompt > 1024 tokens; ≥ 5
-   requests at `--sessions 4`; no verbs timeout.  
-6. Simulated NVMe failure → clean error, peer not hung.
+**Non-goals early:** >2 ranks, expert-ID all-to-all, training, V4 Pro.
 
 ---
 
-## 7. Implementation map (future)
+## 7. Verification
+
+1. Engram fetch correctness; **SHA** match to 1017 shards.  
+2. Cold NVMe start still completes.  
+3. Warm tok/s and hit rate.  
+4. Greedy sample vs reference (same quant).  
+5. TP2: matching shas; generation text; prompt > 1024 tokens; ≥5 requests
+   at `--sessions 4`; no verbs timeout.  
+6. Wrong Engram dir → **detect and refuse** (not silent load).
+
+---
+
+## 8. Implementation map (future)
 
 | Area | Location |
 | --- | --- |
 | New model package | `src/models/deepseek_v41_flash/` |
-| Expert/page store | model-local `stream/` or shared `src/core/` |
+| Engram / expert store | `stream/` under that package (or `src/core/`) |
 | TP partition pattern | `src/models/qwen38_flash_next/distributed/tp_partition.*` |
-| Verbs / windows | `.../kernels/rocm/verbs.cpp` |
-| Mirrored serve | `src/cli/serve/tp_{executor,control}.*` |
-| V4 Flash (unchanged) | `src/models/deepseek_v4_flash/` |
+| Verbs / mirror | `verbs.cpp`, `src/cli/serve/tp_{executor,control}.*` |
+| Unchanged | `src/models/deepseek_v4_flash/` (V4 Flash) |
 
-This folder (`docs/models/deepseek-v41-flash/`) holds the plan until a
-runtime and `README.md` model card exist.
+Optional: evaluate **ds4-dfm-rs / YoungAi** behavior as a reference for
+Engram I/O, not as a dependency.
 
 ---
 
-## 8. Summary
+## 9. Summary
 
-1. V4.1 Flash does **not** fit two 128 GiB hosts as a **resident** model.  
-2. **NVMe streaming** of routed experts (and Engram), with dense resident, is
-   the capacity plan.  
-3. **TP2:** keep compute TP (same experts, FF shard + all-reduce); add storage
-   TP (stream only the local FF slice). Avoid expert-ID partitioning.  
-4. Reuse verbs all-reduce and mirrored serve; add an expert store, LRU cache,
-   and a WaitReady watchdog.  
-5. Start with NVMe measurements and a single-host streaming path before any
-   two-host work.
+1. Official FP8 and large plain GGUFs **do not fit** two Strix Halos
+   resident; **streaming is mandatory** for those.  
+2. **YoungAi/Baekpica 1017 VQ (~114 GB base + Engram on SSD)** is the
+   surveyed artifact that **fits one host for weights** and already streams
+   Engram — **primary v1 target**.  
+3. Deliver **single-host** first, then **TP2** with FF-shard all-reduce +
+   optional expert storage TP; keep **streaming** for Engram (v1) and
+   experts (v2).  
+4. Start at **Phase 0** (pin artifact, measure NVMe) when the machine is
+   free; no GPU work until then.
