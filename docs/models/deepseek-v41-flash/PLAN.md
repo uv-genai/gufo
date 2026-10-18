@@ -105,11 +105,24 @@ The **working** engine for the VQ / 1017 artifact is **not** stock llama.cpp:
 | APIs | OpenAI + Anthropic + Responses |
 | Warm path | Sidecar + Engram held open (warm TTFT ~15 ms vs ~190 ms cold prelude) |
 
-**Gufo strategy:** treat **ds4-dfm-rs as the behavioral oracle and I/O design
-reference** for Phase 0–2 (Engram store, VQ decode, resident base). Port
-**semantics** into `src/models/deepseek_v41_flash/` (HIP); do **not** depend
-on the Rust binary. **TP2 / RDMA remains gufo-only** (ds4-dfm-rs is
-single-GPU CUDA).
+**Gufo strategy — reference only, never a dependency:**
+
+> **`ds4-dfm-rs` will never be a gufo runtime dependency.**
+
+It is a **study/oracle** target only. Gufo does not ship, link, subprocess, or
+require it to build or serve.
+
+| | |
+| --- | --- |
+| **Use ds4-dfm-rs for** | Behavioral oracle · Engram I/O contract (`--engram-dir`, `io_uring` prefetch) · VQ tensor/layout · serving shape · gates and recorded numbers |
+| **Do not use it for** | Running on Strix Halo · production serving · ROCm/gfx1151 execution · a build or package dependency |
+| **What gufo does instead** | Re-implement VQ decode + Engram store in **HIP/gfx1151** under `src/models/deepseek_v41_flash/`, plus **our TP2/RDMA** |
+
+V4.1 there is **serial CUDA** (DGX Spark reference; other NVIDIA GPUs need
+their own qualification). The tree also has inherited Metal/CPU paths; none
+is ROCm. **TP2 / RDMA remains gufo-only** (single-GPU CUDA there).
+
+Port **semantics** into gufo (HIP); do **not** depend on the Rust binary.
 
 Secondary engines: [YoungAi](https://github.com/fodelf/YoungAi) (VQ recipe +
 `ds4-server`); [antirez/ds4](https://github.com/antirez/ds4) (V4 ancestor,
