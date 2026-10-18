@@ -16,6 +16,14 @@ the AMD Strix Halo hardware: Ryzen AI MAX+ 395 systems with Radeon 8060S
 > fix; the forked work is the two-host path (InfiniBand, RoCE v2, or
 > USB4/Thunderbolt) and its launchers and benchmarks.
 >
+> **TP2/RDMA origin:** the two-host design and implementation come from
+> **[neuhaus/gufo](https://github.com/neuhaus/gufo)**. This tree continues
+> that work (upstream merges, launchers, benchmarks) and carries **fork fixes**
+> on top of it — including **mirrored TP2 draft counts**, **strided SSM off
+> TP2’s half width**, **draft-subset single-host only**, and **n-gram
+> `embeddings_ready`** so ranks do not wait twice after a graph pre-wait
+> (see [TP2.md](docs/models/qwen3.8-flash-next/TP2.md) and project history).
+>
 > - **TP2**: Qwen3.8 Flash-Next (Q4 or full Q8) across two machines
 > - **Link**: two Thunderbolt 4 / USB4 cables, write-striping both rails
 >   (~37 Gb/s measured), or InfiniBand / RoCE v2
@@ -261,7 +269,8 @@ checks. See [testing](docs/TESTING.md) and [benchmarking](docs/BENCHMARKS.md).
 ## License
 
 Gufo's original code is [MIT licensed](LICENSE). This fork adds RDMA/TP2 work
-under the same license. Adapted code and dependencies
+under the same license, building on the TP2/RDMA implementation from
+[neuhaus/gufo](https://github.com/neuhaus/gufo). Adapted code and dependencies
 retain their own notices in [NOTICE](NOTICE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 and `licenses/`, installed under `share/licenses/gufo`. Model weights are not
 bundled and retain their publishers' terms.
@@ -270,6 +279,8 @@ bundled and retain their publishers' terms.
 
 The initial design is informed by the following open source projects:
 
+- [neuhaus/gufo](https://github.com/neuhaus/gufo) for the **TP2/RDMA two-host**
+  implementation this fork extends (plus fixes listed under *Why this fork*).
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) for compact model serving, GGUF, and CPU/GPU correctness paths.
 - [LaurentZuijdwijk/llama.cpp](https://github.com/LaurentZuijdwijk/llama.cpp), [Nathanw1014/strix-halo-llamacpp](https://github.com/Nathanw1014/strix-halo-llamacpp), and [gaetan-puleo/llama-cpp-strix-halo](https://github.com/gaetan-puleo/llama-cpp-strix-halo) for Strix Halo optimization inspiration.
 - [vLLM](https://github.com/vllm-project/vllm) for continuous batching and paged request scheduling.
