@@ -14,7 +14,8 @@ Status: **planned, not implemented.** Gufo today runs **DeepSeek V4 Flash**
 
 Related: [V4 Flash](../deepseek-v4-flash/README.md) ·
 [Flash-Next TP2](../qwen3.8-flash-next/TP2.md) ·
-[Models index](../README.md)
+[Models index](../README.md) ·
+**Reference engine: [ds4-dfm-rs](https://github.com/Baekpica/ds4-dfm-rs)**
 
 ---
 
@@ -80,6 +81,40 @@ productize first.
   silently.  
 - **Not vanilla llama.cpp** — needs YoungAi tools or `ds4-dfm-rs`.
 
+### 3.2 Primary reference implementation: ds4-dfm-rs
+
+The **working** engine for the VQ / 1017 artifact is **not** stock llama.cpp:
+
+| | |
+| --- | --- |
+| **Repository** | **[github.com/Baekpica/ds4-dfm-rs](https://github.com/Baekpica/ds4-dfm-rs)** |
+| **Model guide** | [`docs/deepseek41-flash.md`](https://github.com/Baekpica/ds4-dfm-rs/blob/main/docs/deepseek41-flash.md) |
+| **Port plan / inventory** | `docs/deepseek41-port-plan.md` · `docs/deepseek41-port-inventory.md` |
+| **Lineage** | Rust port of YoungAi/ds4 (JLFN PR #80; vision PR #83) |
+| **Validated host** | NVIDIA **DGX Spark** (CUDA / GB10) — **not** ROCm/gfx1151 yet |
+
+**Already implemented there (study; do not re-derive):**
+
+| Piece | How (from their guide) |
+| --- | --- |
+| VQ expert decode | `ffn_exps_vq.blob` DQVL v3; 12/13-bit indices; `cuda/ds41_vq_*.cuh` |
+| **Engram streaming** | Shards via `--engram-dir`; **`io_uring`** reads (`crates/ds4-core/src/uring.rs`) + cross-block prefetch |
+| Resident base | ~113.5 GB GGUF; `--mem-budget-mb 110000` on 128 GB |
+| MTP / DSpark | Embedded three-tower drafter; `--mtp-mode off\|auto\|on` |
+| Vision | Optional `--vision-gguf` |
+| APIs | OpenAI + Anthropic + Responses |
+| Warm path | Sidecar + Engram held open (warm TTFT ~15 ms vs ~190 ms cold prelude) |
+
+**Gufo strategy:** treat **ds4-dfm-rs as the behavioral oracle and I/O design
+reference** for Phase 0–2 (Engram store, VQ decode, resident base). Port
+**semantics** into `src/models/deepseek_v41_flash/` (HIP); do **not** depend
+on the Rust binary. **TP2 / RDMA remains gufo-only** (ds4-dfm-rs is
+single-GPU CUDA).
+
+Secondary engines: [YoungAi](https://github.com/fodelf/YoungAi) (VQ recipe +
+`ds4-server`); [antirez/ds4](https://github.com/antirez/ds4) (V4 ancestor,
+not V4.1-complete).
+
 ---
 
 ## 4. Streaming design (start here)
@@ -104,11 +139,13 @@ designed on DGX Spark).
 | **A. Engram-only (v1)** | Engram n-gram tables from disk; base resident | **Start here** — matches Baekpica/YoungAi; simplest |
 | **B. Expert streaming (v2)** | Routed experts ± Engram; dense resident | When base quant is still too big (plain Q2/IQ2) or TP needs more headroom |
 
-### 4.3 Engram streaming (v1 — proven pattern)
+### 4.3 Engram streaming (v1 — proven on ds4-dfm-rs)
 
-- Tables on **local NVMe**; row/page reads into pinned staging → GPU.  
+- Tables on **local NVMe** (`--engram-dir`); match **ds4-dfm-rs**
+  `io_uring` round reads + cross-block prefetch (`uring.rs`).  
 - Double-buffer; prefetch next lookup while compute runs.  
-- Wrong Engram revision vs weights = silent quality bug — **checksum** both.  
+- Wrong Engram revision vs weights = silent quality bug — **checksum** both
+  (their guide records SHA-256 for 1017 shards).  
 - Snapshot/session state does **not** include the whole table.
 
 ### 4.4 Expert cache (v2)
@@ -163,12 +200,13 @@ all-reduce.
 
 | Phase | Deliverable | GPU |
 | --- | --- | --- |
-| **0** | Pin artifact (prefer **Baekpica/YoungAi 1017 VQ**); NVMe + layout audit; Engram checksum plan | disk only |
-| **1** | **Single-host Engram streaming** + minimal V4.1 text decode (VQ path) | idle machine |
-| **2** | Qualify single-host (quality, tok/s, 1M KV budget) | yes |
-| **3** | **TP2**: FF shard + mirrored serve; Engram on **both** NVMe (or shared read-only) | two hosts |
-| **4** | Expert streaming (v2) if a larger GGUF is needed; optional vision/DSpark | yes |
-| **5** | Docs, launchers `tools/tp2/` variants, tags | — |
+| **0** | Read **[ds4-dfm-rs V4.1 guide](https://github.com/Baekpica/ds4-dfm-rs/blob/main/docs/deepseek41-flash.md)** + port plan; pin **Baekpica/YoungAi 1017 VQ**; NVMe + Engram layout/SHA audit | disk only |
+| **1** | Engram store modeled on ds4-dfm-rs **`uring.rs` / `--engram-dir`** (I/O contract → HIP/ROCm) | idle machine |
+| **2** | Single-host V4.1 text path: **resident base + Engram stream**, VQ decode; follow their tensor/serving contract | yes |
+| **3** | Qualify vs ds4-dfm-rs Spark behavior / gates (not bit-exact across vendors) | yes |
+| **4** | **TP2**: FF shard + mirrored serve; Engram on **both** NVMe; verbs all-reduce | two hosts |
+| **5** | Expert streaming (v2) if a larger GGUF is needed; optional vision/DSpark | yes |
+| **6** | Docs, `tools/tp2/` launchers, tags | — |
 
 **Always ship:** single-host path **and** TP2 path before calling V4.1
 “supported” in the index.
@@ -194,13 +232,16 @@ all-reduce.
 | Area | Location |
 | --- | --- |
 | New model package | `src/models/deepseek_v41_flash/` |
-| Engram / expert store | `stream/` under that package (or `src/core/`) |
+| Engram / expert store | `stream/` — I/O contract from ds4-dfm-rs `crates/ds4-core/src/uring.rs` |
+| VQ decode | Port semantics from ds4-dfm-rs `cuda/ds41_vq_*.cuh` → HIP (no Rust link) |
 | TP partition pattern | `src/models/qwen38_flash_next/distributed/tp_partition.*` |
 | Verbs / mirror | `verbs.cpp`, `src/cli/serve/tp_{executor,control}.*` |
 | Unchanged | `src/models/deepseek_v4_flash/` (V4 Flash) |
+| **Reference engine** | **https://github.com/Baekpica/ds4-dfm-rs** |
+| Recipe / weights | YoungAi `vq8sh14-q4k-mtpnative` · Baekpica 1017 VQ-GGUF |
 
-Optional: evaluate **ds4-dfm-rs / YoungAi** behavior as a reference for
-Engram I/O, not as a dependency.
+ds4-dfm-rs is a **required Phase 0 read**, not an optional side note: it is
+the only full working V4.1 Flash stack published for the VQ artifact.
 
 ---
 
@@ -208,11 +249,13 @@ Engram I/O, not as a dependency.
 
 1. Official FP8 and large plain GGUFs **do not fit** two Strix Halos
    resident; **streaming is mandatory** for those.  
-2. **YoungAi/Baekpica 1017 VQ (~114 GB base + Engram on SSD)** is the
-   surveyed artifact that **fits one host for weights** and already streams
-   Engram — **primary v1 target**.  
-3. Deliver **single-host** first, then **TP2** with FF-shard all-reduce +
-   optional expert storage TP; keep **streaming** for Engram (v1) and
-   experts (v2).  
-4. Start at **Phase 0** (pin artifact, measure NVMe) when the machine is
-   free; no GPU work until then.
+2. **YoungAi/Baekpica 1017 VQ (~114 GB base + Engram on SSD)** fits **one**
+   host for weights and already streams Engram — **primary v1 target**.  
+3. **Working reference implementation:**
+   **[Baekpica/ds4-dfm-rs](https://github.com/Baekpica/ds4-dfm-rs)** —
+   full VQ + Engram `io_uring` + MTP + vision on DGX Spark. Gufo studies this
+   and re-implements in HIP; **TP2 remains gufo-only**.  
+4. Deliver **single-host** first, then **TP2** (FF-shard all-reduce +
+   optional expert storage TP); Engram stream (v1), expert stream (v2).  
+5. Start at **Phase 0** (read ds4-dfm-rs, pin artifact, measure NVMe) when
+   the machine is free; no GPU work until then.
