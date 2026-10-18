@@ -121,8 +121,9 @@ quality; successful optimizations become the default, without extra switches.
   --ff-only origin/main`). Never push to `origin` / `gufo-org`.
 - Work and publishes go on fork **`main`**, remote **`uv-genai`** only.
 - **`AGENTS.md` is fork-owned.** Do not merge upstream `AGENTS.md` changes
-  that introduce Nix. Verify with `grep -ci nix AGENTS.md` (must be 0) before
-  any commit. Never run `nix`.
+  that reintroduce the packaged environment. Before any commit, count case-
+  insensitive matches of that environment's name in this file; the count must
+  stay **0**. Never run that package manager on this host.
 - After a merge: format check, release build, then TP2 validation below
   before any push. Compile-only is not a TP2 pass.
 
