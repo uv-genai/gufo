@@ -114,6 +114,18 @@ quality; successful optimizations become the default, without extra switches.
 - Prefer `jj` when available (`jj version`); otherwise use Git.
 - Follow the user's remote workflow and preserve unrelated work.
 
+## Remotes and merges
+
+- Upstream is **`origin`** → `gufo-org/gufo`. Track it on local branch
+  **`gufo-org`** (`git fetch origin && git switch gufo-org && git merge
+  --ff-only origin/main`). Never push to `origin` / `gufo-org`.
+- Work and publishes go on fork **`main`**, remote **`uv-genai`** only.
+- **`AGENTS.md` is fork-owned.** Do not merge upstream `AGENTS.md` changes
+  that introduce Nix. Verify with `grep -ci nix AGENTS.md` (must be 0) before
+  any commit. Never run `nix`.
+- After a merge: format check, release build, then TP2 validation below
+  before any push. Compile-only is not a TP2 pass.
+
 ## TP2 (two-host Flash-Next)
 
 Launchers live in [tools/tp2/](tools/tp2/); ship the same `build/release/gufo`
@@ -122,3 +134,24 @@ within 30 s. Verify TP2 with **generation text**, not HTTP 200: a rank-0-only
 restore or a residual that never settles returns an empty completion with no
 error. Session reuse is the usual desync point; see
 [TP2.md](docs/models/qwen3.8-flash-next/TP2.md).
+
+Hard rules that keep the verbs collective sequence aligned:
+
+- **One `gufo` per GPU host.** Never start a second model load while a TP2
+  rank is up. Ask before any GPU launch.
+- **Both ranks must run the same binary** (same git revision and sha256).
+  A mismatched pair desyncs collectives and hangs in `verbs all-reduce`.
+- **`TpMirroredRunner::UsesComponentCache()` stays false.** Component-cache
+  restore is rank-0 only; TP2 uses mirrored `CreateState` / `Snapshot` /
+  `RestoreOrFork`.
+- **MTP draft-subset is single-host only** (`TpWorldSize()==1`). The small-head
+  path skips the split-argmax all-reduce; ranks that disagree hang.
+- **Prompt lookup** (#613) copies context into MTP chains on the host. Snapshots
+  carry lookup state (payload v18). After session reuse or any upstream merge
+  that touches `engine.cpp` decode, requalify with ≥5 requests at
+  `--sessions 4` and a repeated-prefix / agent-style prompt.
+- `defer_residual_` only when `tp_world_size()==1`. Forced draft counts come
+  from rank 0 (`request.drafts` / `batch_drafts`).
+- Watch live concurrency on rank 0: `GET /metrics`
+  (`llamacpp:requests_processing`, `requests_deferred`) and `GET /slots`.
+  Port is the HTTP port in `tools/tp2/rank0-*.sh`, not llama-swap's 8080.

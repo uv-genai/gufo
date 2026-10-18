@@ -181,6 +181,23 @@ only, so TP2 uses the mirrored snapshot cache (`UsesComponentCache` is false
 on `TpMirroredRunner`) and `PrefillThrough` runs `Prefill`. Otherwise the
 first session reuse diverges `operation_id`s and a later all-reduce hangs.
 
+Two post-v0.16/v0.17 rules keep MTP collectives aligned:
+
+- **Draft-subset is single-host only.** The small head scores a local table
+  and skips the split-argmax all-reduce; the full-head greedy path performs
+  that all-reduce. `PrepareDecode` therefore requires `TpWorldSize()==1`
+  before setting `draft_subset`. Do not re-enable it under TP without a
+  mirrored decision.
+- **Prompt lookup** (#613) copies committed context into the draft chain on
+  the host (no collectives for the copy itself, but it can skip later
+  `MtpForward` cycles). Session snapshots carry `PromptLookup::State`
+  (payload version 18). Both ranks recompute the same match from the same
+  tokens and restored lookup state; a divergence in tokens or lookup state
+  changes how many neural cycles each rank runs and hangs. After any merge
+  that touches decode or snapshots, requalify with generation text, a prompt
+  above 1024 tokens, at least five requests at `--sessions 4`, and a
+  repeated-prefix or agent-style prompt.
+
 **Disk cache.** Each rank keeps its own half of a snapshot on its own disk.
 Rank 0's continuation disk store decides what is saved, restored and evicted,
 as on one host. Its file holds rank 0's half behind a header that names a

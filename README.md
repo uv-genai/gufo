@@ -11,9 +11,10 @@ the AMD Strix Halo hardware: Ryzen AI MAX+ 395 systems with Radeon 8060S
 > [!IMPORTANT]
 > **This repository is a fork** of
 > [gufo-org/gufo](https://github.com/gufo-org/gufo) that adds **RDMA tensor
-> parallelism (TP2)** for two Strix Halo hosts. It tracks upstream `main` and
-> keeps every one-host feature and fix; the forked work is the two-host path
-> (InfiniBand, RoCE v2, or USB4/Thunderbolt) and its launchers and benchmarks.
+> parallelism (TP2)** for two Strix Halo hosts. It tracks upstream `main`
+> (through **v0.17.0**, merge `ed40fb3e`) and keeps every one-host feature and
+> fix; the forked work is the two-host path (InfiniBand, RoCE v2, or
+> USB4/Thunderbolt) and its launchers and benchmarks.
 >
 > - **TP2**: Qwen3.8 Flash-Next (Q4 or full Q8) across two machines
 > - **Link**: two Thunderbolt 4 / USB4 cables, write-striping both rails
@@ -21,17 +22,19 @@ the AMD Strix Halo hardware: Ryzen AI MAX+ 395 systems with Radeon 8060S
 > - **Launchers**: [tools/tp2/](tools/tp2/) · setup guide [TP2-SETUP.md](TP2-SETUP.md)
 > - **Design and limits**: [TP2.md](docs/models/qwen3.8-flash-next/TP2.md)
 >
-> See the [changelog](CHANGELOG.md) and
-> [GitHub Releases](https://github.com/gufo-org/gufo/releases) for upstream
-> release history.
+> See the [changelog](CHANGELOG.md) for history. Upstream releases:
+> [gufo-org/gufo](https://github.com/gufo-org/gufo/releases). This fork publishes
+> from [uv-genai/gufo](https://github.com/uv-genai/gufo) (`main` only).
 
 ## Why this fork
 
 On one host, Flash-Next decode and prefill are already excellent. **TP2 is
 faster than one host at every concurrency we measured**, and it holds contexts
 and the full Q8 model that do not fit a single 128 GiB APU. After merging
-upstream v0.15.0 (PR #571 wide prefill kernels), a matched binary on this
-fork’s two-host pair reports (Q4 MTP, `pp2048 / tg128`, 2026-10-14):
+upstream through v0.17.0, one-host Flash-Next reports **1,787.54 tok/s AR
+prefill** and up to **116.94 tok/s tg** (see [Benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md)).
+The matched TP2 series below is from the v0.15.0-era binary (Q4 MTP,
+`pp2048 / tg128`, 2026-10-14) and is not yet requalified on v0.17.0:
 
 | Depth (tokens) | 1-host pp | **TP2 pp** | 1-host tg | **TP2 tg** |
 | ---: | ---: | ---: | ---: | ---: |
