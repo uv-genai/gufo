@@ -19,6 +19,7 @@
 #include "src/cache/ledger.hpp"
 #include "src/cli/serve/continuation_cache.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
+#include "src/cli/serve/text_publication_wait.hpp"
 #include "src/core/sampling.hpp"
 
 namespace gufo::server {
@@ -184,6 +185,9 @@ struct TextDecodeStep {
   std::size_t draft_rounds{0};
   std::size_t draft_tokens{0};
   std::size_t draft_accepted_tokens{0};
+  /// Of draft_tokens: proposals copied from the context (prompt lookup).
+  std::size_t lookup_tokens{0};
+  std::size_t lookup_accepted_tokens{0};
   bool stop{false};
   /// Execution actually used for this request, including model-owned subgroup
   /// dispatch. A runner's advertised maximum is not evidence of batching.
@@ -626,8 +630,9 @@ public:
       const TextPromptContext* context) const;
   /// A disk job is still writing a prefix of prompt much deeper than any
   /// restorable checkpoint; admission may wait for it instead of prefilling.
-  [[nodiscard]] bool PublicationPending(std::span<const TextRunnerToken> prompt,
-                                        const TextPromptContext* context) const;
+  [[nodiscard]] std::optional<TextPendingPublication> PendingPublication(
+      std::span<const TextRunnerToken> prompt, const TextPromptContext* context,
+      std::uint64_t checkpoint_id = 0) const;
 
 private:
   struct Impl;

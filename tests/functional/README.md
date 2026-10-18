@@ -3,6 +3,47 @@
 The runner starts an isolated local server and checks real responses with the
 OpenAI SDK. Use production binaries and local weights; no models are downloaded.
 
+Flash-Next prompt lookup has a focused MTP runner. It requires actual accepted
+copies, compares isolated and C2/C4/C6/C8 requests under greedy and the model's
+default sampling, mixes greedy copies with new text at C8, and checks stops
+followed by full replay:
+
+```sh
+nix develop -c python3 tests/functional/prompt_lookup.py \
+  --output /tmp/prompt-lookup -- \
+  /path/to/production/gufo serve llm --model /path/to/model.gguf \
+  --speculative mtp --mtp-model /path/to/mtp.gguf
+```
+
+The runner owns eight sessions and the loopback listener. It retains individual
+request timings and server logs, and stays outside hosted CI and `--suite all`.
+The native Flash-Next session test additionally checks full logits, RNG and
+snapshot restoration into previously used sessions.
+Pass `--mmproj /path/to/mmproj.gguf` with the server command to add image-backed
+greedy and sampled copies. These cases require accepted lookup tokens before
+client cancellation, confirm the server observed cancellation, and replay the
+same output from the cached image prompt without prefill.
+
+`prompt_lookup_workflows.py` checks extraction, generated URI tests and edits
+after a long source archive against an already running Flash-Next MTP server:
+
+```sh
+nix develop -c python3 tests/functional/prompt_lookup_workflows.py \
+  --base-url http://127.0.0.1:8080 --model MODEL \
+  --output /tmp/lookup-workflows --depth 32768 --seed 31
+```
+
+Select `--case extract`, `--case uri-tests` or `--case agent-edit` for focused
+runs; set the server's context above the requested depth plus 2,048 tokens.
+Extraction must return the exact records. Generated Python tests run
+against correct code and must detect three deliberate defects. Edits must
+preserve every unrelated byte, including literal protocol tags. The edit checks
+cached continuation and switching thinking mode, which changes the prefix and
+requires prefill. Use `--archive /tmp/lookup-workflows/archive.txt` to retain
+the same source input when comparing revisions. These are public substitutes
+for PR #613's private cases; they do not reproduce the author's exact prompts.
+Run the existing Pi `edit` and `creation` cases for real tool execution, too.
+
 Flash-Next startup identity checks use a separate runner with an initially empty
 artifact-hash cache, as on a fresh container. RAM-only serving must skip full-file
 fingerprints and still reuse its prompt. Disk serving must fingerprint the model
@@ -197,6 +238,7 @@ RAM, disk and restart settings once their contracts pass.
 | `tool-untyped` | Open/typed tools, refs and finite values: framing, arguments, streaming, turns, limits, stops/retry and sampled peers |
 | `tool-mixed` | JSON-only neighbors, annotated refs, extra keys, URI and nullable arguments across Chat/Responses; images, stops/retry and sampled peers; a union neighbor keeps native calls, so a replayed reasoning/call turn is reused in full |
 | `tool-native-schemas` | opencode's tool set beside each schema family that used to force a JSON envelope (pattern, oneOf, allOf, not, open objects), auto and required, strict: native calls, no prompt instruction, typed arguments and full reuse of the generated call; Chat/Responses |
+| `tool-choice-cache` | Required/auto/omitted transitions preserve the complete generated call, unchanged-choice controls, prompt-token equality and zero-prefill retries |
 | `tool-native-types` | Focused subset: enum/const/inferred string types, literal delimiters and exact continuation reuse after new literal tool markers; Chat/Responses, text/images |
 | `tool-schema-edges` | Wildcard JSON types, conditional fields, impossible schemas, nested metadata and required-call timing; both APIs, cache, stops and sampled peers |
 | `state-edges` | Actual AR/draft execution, tiny thinking budgets, zero-argument tools, schema changes, stops (including inside quoted calls), image retry and failed-request recovery |
@@ -212,6 +254,7 @@ RAM, disk and restart settings once their contracts pass.
 | `cache-edits` | Reuse earlier work after editing the latest message, shortening an older tool result, or editing an earlier user message and dropping later turns; compare with uncached responses |
 | `cache-growth` | Keep cache reuse advancing over several turns when the client omits reasoning; check reasoning replay and thinking-off controls, including Messages thinking blocks, and compare with uncached responses |
 | `cache-depth` | Histories beyond 16K, concurrent branches from rewritten replies, a side conversation, resume, unchanged retries and exact uncached controls; use context 32768 and also check sessions 1 |
+| `cache-stalls` | Flash-Next AR/MTP: sequential coding/planning prompts with 6.4K/25.6K/55.6K/56K padding and three repeats each, thinking on and tg128. Checks prefix reuse and exact fully cached replay; retains each request's PP/TG and maximum-gap timing gate. Public equivalents of #632, whose prompts were not attached. Use sessions 2/context 262144 to match its capacity; minimum context 65536. Explicit selection only, outside `all` |
 | `cache-rotation` | Check cache RAM limits and keep history across conversations and small side requests; compare answers with uncached controls |
 | `cache-shared-prefix` | New conversations under one system prompt, one after another, with long and short tasks: from the third on they restore the whole shared prefix; compare answers with uncached controls |
 | `cache-bridge` | A chat bridge sends each user message with metadata its history copy drops, under a full RAM budget with small unrelated requests between turns: from the third turn on, reuse reaches the user turn two back; compare answers with uncached controls. Not in `all` |
@@ -350,13 +393,16 @@ Cache checks use real assistant replies and run cold controls after the warm
 history, so the controls cannot hide a missed checkpoint. `cache-edits` checks
 latest-message edits, shortened tool results and rewinds. `cache-growth` checks
 omitted, preserved and explicitly discarded reasoning, plus thinking off.
-Unchanged retries in `cache-growth`, `cache-depth`, reasoning-separator,
+Unchanged retries in `cache-growth`, `cache-depth`, `long-context`, reasoning-separator,
 tool-history, schema edges, state edges, progress and metrics must prefill nothing,
 unless the runner's server log shows that memory pressure refused the retry
 copy; the retry may then prefill only the assistant opening after the stable
 boundary. In agent histories the mutable suffix includes the final user turn;
 `tool-history` bounds it with an independent count-tokens request rather than
 extra slack. Generic capture failures do not qualify for this exception.
+Run `nix develop -c python3 tests/functional/test_long_context.py` to check
+that only a capacity refusal in the preceding request's log window permits
+the framing suffix; lost context, changed output and unrelated refusals fail.
 Component disk-spacing checks correlate drained publication logs with the
 checkpoint IDs captured by their own requests, excluding delayed writes from
 earlier suites even when their token counts match.
@@ -454,6 +500,28 @@ short-peer/deep-history pattern reported in #542; the system-only oversized
 fixture cannot establish that behavior.
 Known cache-work failures exit nonzero and retain controls/evidence; they are
 not skipped, marked as expected passes, or fixed in this test-only card.
+
+Publication-wait regression #617 uses the same process-local fault library,
+filtered to hold a manifest after its payload is written. It checks both an
+expired recomputation budget and publication before that budget expires:
+
+```sh
+nix develop -c python3 tests/functional/publication_wait.py \
+  --output /tmp/publication-wait --fault-library build/cpu-test/libcache_disk_faults.so -- \
+  /path/to/production/gufo serve llm --model /path/to/flash-next.gguf \
+  --mtp-model /path/to/mtp.gguf --speculative mtp --sessions 1 --context 65536
+```
+
+The runner uses a fresh 8 GiB disk tier and a 1 GiB RAM budget unless explicitly
+set, requires an actual over-RAM publication and disk restore, and retains all
+HTTP requests/responses and timings. It removes its own cache after each case.
+Use `--case bound --expect cap` only for a matched pre-fix main timing control;
+candidate correctness uses the default `bounded` expectation. The bound case
+schedules release after 130 seconds and releases earlier if the waiter finishes;
+the child-only helper has a longer safety timeout. The publication case waits
+for the scheduler's actual park before starting its 250 ms release timer, then
+checks the matching request/checkpoint release before its deadline and a disk
+restore. These checks stay outside hosted CI and the routine API suites.
 
 Unchanged retries must reproduce the complete output with zero prefill. After a
 restart, disk restores may re-prefill less than one 2048-token disk step;

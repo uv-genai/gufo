@@ -107,8 +107,6 @@ tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request,
                                                   std::uint32_t max_context) {
   auto options = tokenization::ResolveQwenChatOptions(request.reasoning,
                                                       request.add_vision_id);
-  options.require_tool_call =
-      request.tool_choice == ChatRequest::ToolChoice::kRequired;
   // gufo #285: the rendered prompt may be as long as the context can hold.
   options.max_output_bytes =
       tokenization::RenderedPromptBoundBytes(max_context);
@@ -293,6 +291,38 @@ std::shared_ptr<const TextPromptContext> DecodeQwenImageContext(
   context->cache_identity = prompt->cache_identity;
   context->prompt = std::move(prompt);
   return context;
+}
+
+// Hash the sidecar and upload its weights while the model loads, before the
+// runner claims state capacity and the RAM cache is sized. Otherwise the first
+// image request hashes the whole sidecar in its queue time and uploads the
+// weights in its prefill, after admission and the cache were sized without
+// them.
+void PrepareVision(
+    const std::shared_ptr<models::qwen::vision::Encoder>& encoder) {
+  if (!encoder)
+    return;
+  const auto started = Clock::now();
+  (void)encoder->identity();
+  const auto hashed = Clock::now();
+  try {
+    encoder->Upload();
+  } catch (const std::exception& e) {
+    throw std::runtime_error(
+        std::string("could not upload the Qwen vision sidecar: ") + e.what());
+  }
+  const auto uploaded = Clock::now();
+  std::size_t heap_free = 0, heap_total = 0;
+  (void)hipMemGetInfo(&heap_free, &heap_total);
+  using Milliseconds = std::chrono::duration<double, std::milli>;
+  Logger::Info("loader",
+               "event=vision_prepared resident_bytes=" +
+                   std::to_string(encoder->ResidentBytes()) + " identity_ms=" +
+                   std::to_string(Milliseconds(hashed - started).count()) +
+                   " upload_ms=" +
+                   std::to_string(Milliseconds(uploaded - hashed).count()) +
+                   " device_heap_free_bytes=" + std::to_string(heap_free) +
+                   " " + Logger::MemoryStatus());
 }
 
 constexpr std::string_view kDeepSeekStateAbi =
@@ -1961,8 +1991,6 @@ public:
     options.tools_present =
         !request.tools.empty() &&
         request.tool_choice != ChatRequest::ToolChoice::kNone;
-    options.require_tool_call =
-        request.tool_choice == ChatRequest::ToolChoice::kRequired;
     auto tokens =
         DeepSeekRunnerTokens(model_->EncodeChat(messages, tools, options));
     if (tokens.empty()) {
@@ -2761,6 +2789,12 @@ public:
       // registration onto that request's capture or decode path.
       backing->pool->GrowAhead(2);
       backing->pool->WaitForGrowth();
+      Logger::Info(
+          "cache",
+          "schema=component-cache-v1 event=backing_prepared committed_bytes=" +
+              std::to_string(backing->pool->CommittedBytes()) +
+              " long_term_pinned_bytes=" +
+              std::to_string(backing->pool->LongTermPinnedBytes()));
     };
     result->prepare_prefill = [backing] { backing->pool->GrowAhead(2); };
     result->can_capture = [backing](auto payloads) {
@@ -2789,6 +2823,8 @@ public:
             "schema=component-cache-v1 event=backing_grown committed_bytes=" +
                 std::to_string(backing->pool->CommittedBytes()) + " segments=" +
                 std::to_string(backing->pool->PageCommitAllocations()) +
+                " long_term_pinned_bytes=" +
+                std::to_string(backing->pool->LongTermPinnedBytes()) +
                 " acquire_ms=" +
                 std::to_string(std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() - started)
@@ -3212,6 +3248,9 @@ public:
     step.draft_rounds = stats_after.cycles - stats_before.cycles;
     step.draft_tokens = stats_after.drafted - stats_before.drafted;
     step.draft_accepted_tokens = stats_after.accepted - stats_before.accepted;
+    step.lookup_tokens = stats_after.lookup - stats_before.lookup;
+    step.lookup_accepted_tokens =
+        stats_after.lookup_accepted - stats_before.lookup_accepted;
     return step;
   }
 
@@ -3330,6 +3369,11 @@ public:
       step.draft_rounds = stats.cycles - before[i].cycles;
       step.draft_tokens = stats.drafted - before[i].drafted;
       step.draft_accepted_tokens = stats.accepted - before[i].accepted;
+      // A request whose peers dropped out runs a single-session step,
+      // which can use prompt lookup.
+      step.lookup_tokens = stats.lookup - before[i].lookup;
+      step.lookup_accepted_tokens =
+          stats.lookup_accepted - before[i].lookup_accepted;
     }
     return steps;
   }
@@ -4156,6 +4200,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
       speculative_options.enable_adaptive_draft_length = false;
     }
 
+    PrepareVision(model->VisionEncoder());
     auto new_state = std::make_shared<Impl::State>();
     new_state->sampling_defaults.model =
         sampling::TextPreset(model->GetConfig());
@@ -4346,6 +4391,7 @@ bool InferenceBackend::load(
   const bool has_mtp = model->HasMtp();
   const bool has_vision = model->VisionEncoder() != nullptr;
   try {
+    PrepareVision(model->VisionEncoder());
     auto new_state = std::make_shared<Impl::State>();
     new_state->sampling_defaults.model = sampling::TextModelPreset::kQwen38;
     new_state->sampling_defaults.supplied = {};
