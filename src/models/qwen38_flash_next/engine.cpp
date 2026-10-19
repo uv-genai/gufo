@@ -1056,7 +1056,10 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // Both execution paths use the same request-local copy rule. Scheduling
   // a peer must not change a sampled request's proposals or RNG sequence.
   // A request's first speculative step copies nothing (see PromptLookup).
-  pending->lookup_cap = lookup_.Step(base) ? cap : 0;
+  // Copies can replace neural MtpForward cycles (collectives). Ranks that
+  // disagree on a copy desync verbs; keep lookup single-host only.
+  const bool lookup_ok = model_->TpWorldSize() == 1;
+  pending->lookup_cap = lookup_ok && lookup_.Step(base) ? cap : 0;
   if (pending->lookup_cap != 0) {
     lookup_.Extend(tokens_, sampled);
   }
