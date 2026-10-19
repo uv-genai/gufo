@@ -126,6 +126,9 @@ quality; successful optimizations become the default, without extra switches.
   stay **0**. Never run that package manager on this host.
 - After a merge: format check, release build, then TP2 validation below
   before any push. Compile-only is not a TP2 pass.
+- Before merging upstream, read [docs/MERGE-CHECKLIST.md](docs/MERGE-CHECKLIST.md)
+  and scan the diff for TP2 hazards (below). Prefer a hard
+  `TpWorldSize()==1` gate over hoping ranks agree.
 
 ## TP2 (two-host Flash-Next)
 
@@ -136,7 +139,16 @@ restore or a residual that never settles returns an empty completion with no
 error. Session reuse is the usual desync point; see
 [TP2.md](docs/models/qwen3.8-flash-next/TP2.md).
 
-Hard rules that keep the verbs collective sequence aligned:
+### Collective invariant
+
+Both ranks must issue **the same** verbs collectives: **order, count, and
+byte size**. Rank 0 mirrors calls and draft **counts**, not every decode
+micro-decision. Any path that skips or adds an all-reduce on one rank poisons
+the QP (`verbs all-reduce timed out`, `identity or size mismatch`, or RDMA
+completion status errors). Size mismatches often show as row counts of
+hidden (e.g. 10240 vs 122880 = 1 vs 12 rows × 2560 F32).
+
+### Hard rules
 
 - **One `gufo` per GPU host.** Never start a second model load while a TP2
   rank is up. Ask before any GPU launch.
@@ -147,12 +159,32 @@ Hard rules that keep the verbs collective sequence aligned:
   `RestoreOrFork`.
 - **MTP draft-subset is single-host only** (`TpWorldSize()==1`). The small-head
   path skips the split-argmax all-reduce; ranks that disagree hang.
-- **Prompt lookup** (#613) copies context into MTP chains on the host. Snapshots
-  carry lookup state (payload v18). After session reuse or any upstream merge
-  that touches `engine.cpp` decode, requalify with ≥5 requests at
-  `--sessions 4` and a repeated-prefix / agent-style prompt.
+- **Prompt lookup copies are single-host only** (`TpWorldSize()==1`). Lookup
+  can skip neural `MtpForward` cycles; under TP both ranks always run the
+  neural draft path with the mirrored count. Snapshots still carry lookup
+  state (payload v18).
 - `defer_residual_` only when `tp_world_size()==1`. Forced draft counts come
   from rank 0 (`request.drafts` / `batch_drafts`).
 - Watch live concurrency on rank 0: `GET /metrics`
   (`llamacpp:requests_processing`, `requests_deferred`) and `GET /slots`.
   Port is the HTTP port in `tools/tp2/rank0-*.sh`, not llama-swap's 8080.
+
+### TP2 hazards in upstream merges
+
+If a merge or feature changes any of the following, treat it as a **TP2
+hazard** until gated or mirrored:
+
+| Hazard | Why it breaks verbs | Policy |
+| --- | --- | --- |
+| Draft subset / small head | Skips split-argmax all-reduce | `TpWorldSize()==1` only |
+| Prompt lookup / n-gram copy | Skips neural `MtpForward` | `TpWorldSize()==1` only |
+| New speculative/MTP modes | Different cycle width per rank | Mirror count from rank 0 **and** path shape |
+| Component-cache / slot restore | Rank-0-only restore | Keep `UsesComponentCache` false |
+| Prefill checkpoint / in-pass | Extra collectives on one rank | `in_pass_checkpoint` / `PrefillThrough` rules in TP2.md |
+| Attention/MoE “fast paths” | Different row counts or skipped AR | Same geometry both ranks; no host-only skip |
+| Serve batching / plan | Different `batch_drafts` or member widths | Ship plan from rank 0 |
+| Snapshot payload version | Rank state drift after reuse | Bump version; both ranks same binary |
+
+**After any merge that touches** `engine.cpp`, `executor.*`,
+`inference_backend.cpp`, `component_text_cache.*`, or MTP/cache: run the
+TP2 smoke in [MERGE-CHECKLIST.md](docs/MERGE-CHECKLIST.md) before push.

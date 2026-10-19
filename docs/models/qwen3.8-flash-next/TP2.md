@@ -187,18 +187,23 @@ only, so TP2 uses the mirrored snapshot cache (`UsesComponentCache` is false
 on `TpMirroredRunner`) and `PrefillThrough` runs `Prefill`. Otherwise the
 first session reuse diverges `operation_id`s and a later all-reduce hangs.
 
-Two post-v0.16/v0.17 rules keep MTP collectives aligned:
+Post-v0.16/v0.17 **collective-shape** rules (see also
+[MERGE-CHECKLIST.md](../../../MERGE-CHECKLIST.md)):
 
+- **Invariant:** both ranks issue the **same** all-reduces (order, count,
+  bytes). Rank 0 mirrors calls and draft **counts**, not every decode
+  micro-decision. Size mismatches appear as different row counts of hidden
+  (e.g. 10240 vs 122880 bytes at hidden 2560).
 - **Draft-subset is single-host only.** The small head scores a local table
   and skips the split-argmax all-reduce; the full-head greedy path performs
-  that all-reduce. `PrepareDecode` therefore requires `TpWorldSize()==1`
-  before setting `draft_subset`. Do not re-enable it under TP without a
-  mirrored decision.
-- **Prompt lookup** (#613) copies committed context into the draft chain and
-  can **skip** neural `MtpForward` cycles (collectives). Copies are
-  **single-host only** (`TpWorldSize()==1`); under TP both ranks always run
-  the neural draft path with the mirrored draft count so verbs stay aligned.
-  Session snapshots still carry `PromptLookup::State` (payload version 18).
+  that all-reduce. `PrepareDecode` requires `TpWorldSize()==1` before setting
+  `draft_subset`.
+- **Prompt lookup copies are single-host only** (`TpWorldSize()==1`). Lookup
+  can skip neural `MtpForward` cycles; under TP both ranks always run the
+  neural draft path with the mirrored count. Snapshots still carry
+  `PromptLookup::State` (payload version 18).
+- Any **new** upstream path that skips or adds a collective is a hazard until
+  gated the same way. Prefer a hard single-host gate over hoping ranks agree.
 
 **Disk cache.** Each rank keeps its own half of a snapshot on its own disk.
 Rank 0's continuation disk store decides what is saved, restored and evicted,
