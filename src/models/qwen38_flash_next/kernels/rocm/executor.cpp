@@ -1845,7 +1845,9 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
       }
     }
   };
-  if (WidePrefill(n_tokens)) {
+  // TP2 only validated the fused wide-tile map for large prefill chunks;
+  // short prefills keep the per-row tile map.
+  if (n_tokens >= 1024 && routed_tile_rows_ == kRoutedTileRowsWide) {
     // Prefill batches: 64-token tiles for the down projection, then 128-token
     // tiles for the paired gate/up projections.
     append(64);
@@ -2390,7 +2392,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   if (!l.ssm_in.empty()) {
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
     // boundary rows remain available for the rolling history update.
-    if (!projections_ready && !speculative && WidePrefill(n_tokens) &&
+    // TP2 half-width rows are only qualified at n >= 1024 (pre-#690).
+    if (!projections_ready && !speculative && n_tokens >= 1024 &&
         n_tokens <= options_.max_batch && DenseF16Route(l.ssm_in, n_tokens)) {
       PrepareHalfInput(x, n_tokens, l.ssm_in.cols);
       convolved = DenseF16SsmGemm(
@@ -2499,8 +2502,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       IndexerCapacity(c, options_.max_batch, max_context);
   bool prepared = false;
   if (!l.attn_qkv.empty()) {
+    // TP2 half-width heads keep the n >= 1024 fused-projection threshold.
     const bool fused_projection =
-        !projections_ready && WidePrefill(n_tokens) &&
+        !projections_ready && n_tokens >= 1024 &&
         n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
         l.attn_qkv.rows == 2 * (heads.attn + heads.attn_kv) * 256 &&
         l.attn_qkv.cols == 2560 && heads.attn == 12 * heads.attn_kv &&
@@ -3409,9 +3413,11 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     }
     // The last target layer's query outputs have no later cache consumer.
     // Preserve all K/V/indexer rows and the final query's original tile.
-    const bool last_attention = WidePrefill(n) && !session.mtp_enabled_ &&
-                                il + 1 == c.num_layers && n_logits == 1 &&
-                                checkpoint == nullptr;
+    // last_only skips earlier queries' scores; TP2 only qualifies that for
+    // wide prefill chunks, not short chat prompts.
+    const bool last_attention = prefill_phase && !session.mtp_enabled_ &&
+                                il + 1 == c.num_layers && n >= 1024 &&
+                                n_logits == 1 && checkpoint == nullptr;
     if (!MixerPart(session, il, batch, normed, true, error_msg, checkpoint,
                    last_attention)) {
       return false;

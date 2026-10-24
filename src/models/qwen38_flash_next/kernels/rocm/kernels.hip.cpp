@@ -7080,10 +7080,13 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       std::uint32_t kv_heads, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope) {
-  if (n_tokens == 0 || weights == nullptr || input == nullptr ||
-      q_gamma == nullptr || k_gamma == nullptr || query == nullptr ||
-      gate == nullptr || keys == nullptr || values == nullptr ||
-      position == nullptr || heads == 0 || kv_heads == 0)
+  // Full 24/2 heads take short wide-prefill batches (#690); a TP rank's
+  // half head count keeps the n >= 1024 threshold.
+  if ((n_tokens < 1024 && !(heads == 24 && kv_heads == 2)) ||
+      weights == nullptr || input == nullptr || q_gamma == nullptr ||
+      k_gamma == nullptr || query == nullptr || gate == nullptr ||
+      keys == nullptr || values == nullptr || position == nullptr ||
+      heads == 0 || kv_heads == 0)
     return false;
   const AttentionProjectionOutput output{q_gamma, k_gamma, query,    gate,
                                          keys,    values,  position, theta,
@@ -7244,10 +7247,11 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                      std::uint32_t channels, std::uint32_t kernel,
                      hipStream_t stream, std::uint32_t checkpoint_tokens) {
-  // Every prefill pass wider than a vector batch may take this route.
-  // TP ranks keep the half-width geometry (m % 512, channels % 32).
+  // Small wide-prefill batches are qualified for the full 16384-wide SSM
+  // projection only; a TP rank's half-width rows keep n >= 1024.
   if (n_tokens == 0 || k != 2560 || m % 512 != 0 || channels % 32 != 0 ||
-      channels == 0 || channels >= m || kernel != kSsmConvTaps) {
+      channels == 0 || channels >= m || kernel != kSsmConvTaps ||
+      (m != 16384 && n_tokens < 1024)) {
     return false;
   }
   // Row-tile pairs per token tile in launch order (-0.9 %).
