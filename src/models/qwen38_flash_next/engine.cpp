@@ -56,7 +56,7 @@ struct SessionSnapshotHeader {
   std::uint32_t image_identity_bytes;
   std::uint32_t policy_concurrency;
   std::uint32_t reserved{0};
-  PromptLookup::State lookup;
+  speculative::PromptLookup<>::State lookup;
 };
 static_assert(std::is_trivially_copyable_v<SessionSnapshotHeader>);
 
@@ -595,7 +595,7 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
     AssignError(error_msg, "session snapshot draft policy is invalid");
     return false;
   }
-  if (!PromptLookup::Valid(header.lookup, header.token_count)) {
+  if (!speculative::PromptLookup<>::Valid(header.lookup, header.token_count)) {
     AssignError(error_msg, "session snapshot prompt-lookup state is invalid");
     return false;
   }
@@ -975,11 +975,11 @@ bool Session::AppendLookup(PendingDecode& pending, bool stop_at_eos,
   if (stop_at_eos && model_->IsStopToken(pending.chain.back())) {
     return false;
   }
-  const auto match =
-      lookup_.Find(tokens_, pending.chain,
-                   pending.sampled ? PromptLookup::kSampledMinMatch
-                                   : PromptLookup::kMinMatch,
-                   require_resume);
+  const auto match = lookup_.Find(
+      tokens_, pending.chain,
+      pending.sampled ? speculative::PromptLookup<>::kSampledMinMatch
+                      : speculative::PromptLookup<>::kMinMatch,
+      require_resume);
   if (match.length == 0) {
     return false;
   }
@@ -1047,13 +1047,9 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const bool allow_subset =
       MtpDraftSubsetAllowed(sampler.config().uses_random_sampling(), unmodified,
                             concurrency, batch_drafts.has_value());
-  // Unplanned greedy cycles are priced at the requests decoding now. Sampled
-  // ones keep the configured concurrency so a seeded request replays the same
-  // widths, and a planned batch keeps the row its plan used.
-  pending->policy_concurrency =
-      sampler.config().uses_random_sampling() || batch_drafts.has_value()
-          ? 0
-          : occupancy;
+  pending->policy_concurrency = MtpPolicyConcurrency(
+      sampler.config().uses_random_sampling(), sampler.config().seed >= 0,
+      batch_drafts.has_value(), occupancy);
   // A forced draft count (a TP2 rank 0's mirrored choice) overrides the
   // session's own acceptance-history policy, so both ranks run cycles of the
   // same width even when their histories have drifted apart.
@@ -1110,9 +1106,10 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   // Both execution paths use the same request-local copy rule. Scheduling
   // a peer must not change a sampled request's proposals or RNG sequence.
-  // A request's first speculative step copies nothing (see PromptLookup).
-  // Copies can replace neural MtpForward cycles (collectives). Ranks that
-  // disagree on a copy desync verbs; keep lookup single-host only.
+  // A request's first speculative step copies nothing (see
+  // speculative::PromptLookup<>). Copies can replace neural MtpForward
+  // cycles (collectives). Ranks that disagree on a copy desync verbs; keep
+  // lookup single-host only.
   const bool lookup_ok = model_->TpWorldSize() == 1;
   pending->lookup_cap = lookup_ok && lookup_.Step(base) ? cap : 0;
   if (pending->lookup_cap != 0) {
@@ -1401,7 +1398,7 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
   std::array<BatchOutcome, 8> outcomes{};
   std::array<std::uint64_t, 8> epochs{};
   std::array<sampling::SamplerState::DrawState, 8> draws{};
-  std::array<PromptLookup::State, 8> lookup_states{};
+  std::array<speculative::PromptLookup<>::State, 8> lookup_states{};
   std::vector<Request> active;
   active.reserve(requests.size());
   Model* model = nullptr;
