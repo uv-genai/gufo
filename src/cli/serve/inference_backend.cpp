@@ -3581,6 +3581,8 @@ struct InferenceBackend::Impl {
     ReasoningOptions reasoning_defaults;
     /// TP2: how many requests may be open at once, running or waiting.
     std::size_t tp_max_requests{0};
+    std::string model_path;
+    std::string build_info;
   };
 
   /// One TP2 request on rank 0, from the command that opens it on rank 1 to
@@ -4699,6 +4701,41 @@ InferenceBackend::InitialOutputState InferenceBackend::initial_output_state(
 #else
   (void)request;
   return InitialOutputState::kAuto;
+#endif
+}
+
+std::string InferenceBackend::model_path() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr ? state->model_path : std::string{};
+#else
+  return {};
+#endif
+}
+
+std::string InferenceBackend::build_info() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr ? state->build_info : std::string{};
+#else
+  return {};
+#endif
+}
+
+void InferenceBackend::set_served_artifact(const std::string& model_path,
+                                           const std::string& build_info) {
+#if defined(ENGINE_ENABLE_HIP)
+  const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+  if (impl_->state == nullptr) {
+    return;
+  }
+  auto updated = std::make_shared<Impl::State>(*impl_->state);
+  updated->model_path = model_path;
+  updated->build_info = build_info;
+  impl_->state = std::move(updated);
+#else
+  (void)model_path;
+  (void)build_info;
 #endif
 }
 

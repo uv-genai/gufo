@@ -12,7 +12,7 @@ the AMD Strix Halo hardware: Ryzen AI MAX+ 395 systems with Radeon 8060S
 > **This repository is a fork** of
 > [gufo-org/gufo](https://github.com/gufo-org/gufo) that adds **RDMA tensor
 > parallelism (TP2)** for two Strix Halo hosts. It tracks upstream `main`
-> (through **v0.18.0**) and keeps every one-host feature and
+> (through **v0.19.0**) and keeps every one-host feature and
 > fix; the forked work is the two-host path (InfiniBand, RoCE v2, or
 > USB4/Thunderbolt) and its launchers and benchmarks.
 >
@@ -39,10 +39,10 @@ the AMD Strix Halo hardware: Ryzen AI MAX+ 395 systems with Radeon 8060S
 On one host, Flash-Next decode and prefill are already excellent. **TP2 is
 faster than one host at every concurrency we measured**, and it holds contexts
 and the full Q8 model that do not fit a single 128 GiB APU. After merging
-upstream through v0.18.0, one-host Flash-Next reports **1,801.01 tok/s AR
+upstream through v0.19.0, one-host Flash-Next reports **1,801.01 tok/s AR
 prefill** and up to **116.93 tok/s tg** (see [Benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md)).
 The matched TP2 series below is from the v0.15.0-era binary (Q4 MTP,
-`pp2048 / tg128`, 2026-10-14) and is not yet requalified on v0.18.0:
+`pp2048 / tg128`, 2026-10-14) and is not yet requalified on v0.19.0:
 
 | Depth (tokens) | 1-host pp | **TP2 pp** | 1-host tg | **TP2 tg** |
 | ---: | ---: | ---: | ---: | ---: |
@@ -75,7 +75,7 @@ All model documentation lives under [docs/models](docs/models/README.md):
 
 | Model | Inference modes | Hugging Face weights | Benchmarks | Quality |
 | --- | --- | --- | --- | --- |
-| [Qwen3.8 27B](docs/models/qwen3.8-27b/README.md) | Q4/Q8, images, AR, DFlash2 | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_XL.gguf) / [Q8_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q8_K_XL.gguf) · [DFlash2 Q4_K_M](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/blob/2d9571f8ce46e151f61c6499c99dee6079e1d610/Qwen3.8-27B-DFlash2-Q4_K_M.gguf) | Q4: **656.33 tok/s pp**; up to **71.31 tok/s tg** single user and **128.41 aggregated tok/s** on 8 concurrent requests with DFlash2 · [Benchmarks](docs/models/qwen3.8-27b/BENCHMARKS.md) | [Quality](docs/models/qwen3.8-27b/QUALITY.md) |
+| [Qwen3.8 27B](docs/models/qwen3.8-27b/README.md) | Q4/Q8, images, AR, DFlash2 | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_XL.gguf) / [Q8_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q8_K_XL.gguf) · [DFlash2 Q4_K_M](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/blob/2d9571f8ce46e151f61c6499c99dee6079e1d610/Qwen3.8-27B-DFlash2-Q4_K_M.gguf) | Q4: **648.89 tok/s pp**; up to **71.55 tok/s tg** single user and **128.42 aggregated tok/s** on 8 concurrent requests with DFlash2 · [Benchmarks](docs/models/qwen3.8-27b/BENCHMARKS.md) | [Quality](docs/models/qwen3.8-27b/QUALITY.md) |
 | [Qwen3.8 Flash-Next](docs/models/qwen3.8-flash-next/README.md) | Q4/Q8, images, AR, MTP, **TP2** | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/38bb39ee97821de2c9009abb7e93950eec396e66/UD-Q4_K_XL) · [MTP Q8_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf) | One host: **1,801.01 tok/s pp** (AR); up to **116.93 tok/s tg** and **245.81 aggregated tok/s** · **TP2** up to **1,860 tok/s pp** and **79 tok/s tg**, **181 tok/s** sum at 6 users · [Benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md) · [TP2 series](docs/models/qwen3.8-flash-next/2026-10-14-tp2-depth-series.md) | [Quality](docs/models/qwen3.8-flash-next/QUALITY.md) |
 | [DeepSeek V4 Flash](docs/models/deepseek-v4-flash/README.md) | AR, DSpark | [antirez Flash 0731 IQ2XXS](https://huggingface.co/antirez/deepseek-v4-gguf/blob/1cd7b564460821938add0475a60b942c409295e0/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf) · [DSpark](https://huggingface.co/antirez/deepseek-v4-gguf/blob/e7f04037032990db0346398d249baf9fb9df1ccc/DeepSeek-V4-Flash-DSpark-support-0731.gguf) | **484.62 tok/s pp**; up to **26.62 tok/s tg** single user and **54.74 aggregated tok/s** on 8 concurrent requests with DSpark · [Benchmarks](docs/models/deepseek-v4-flash/BENCHMARKS.md) | [Quality](docs/models/deepseek-v4-flash/QUALITY.md) |
 | [Qwen3-ASR 1.7B](docs/models/qwen3-asr/README.md) | Speech recognition | [BF16](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/tree/7278e1e70fe206f11671096ffdd38061171dd6e5) | **15.27× realtime** · [Benchmarks](docs/models/qwen3-asr/BENCHMARKS.md) | [Quality](docs/models/qwen3-asr/QUALITY.md) |
@@ -211,6 +211,9 @@ Reasoning tokens count toward that response limit.
   system turn, so Gufo moves them there. The request that introduces one is
   prefilled again; later requests reuse the cache. See the
   [API contract](docs/SERVER.md).
+- **Qwen with Claude Code:** not supported. Claude Code adds a system message
+  to `messages` on every turn, so Gufo moves a new one to the leading system
+  turn each time and every request prefills the whole history again (#522).
 
 ## Build from source
 
