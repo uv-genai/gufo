@@ -196,11 +196,13 @@ public:
   /// choice, mirrored so both ranks run cycles of the same width).
   /// A greedy step prices its drafts as one of `occupancy` decoding requests,
   /// as DecodeBatch does for an unplanned cohort of that width.
-  [[nodiscard]] bool DecodeStep(
-      std::size_t max_tokens, sampling::SamplerState& sampler,
-      DecodeResult* result, std::string* error_msg = nullptr,
-      bool stop_at_eos = true, std::optional<std::uint32_t> forced_drafts = {},
-      std::uint32_t occupancy = 1);
+  [[nodiscard]] bool DecodeStep(std::size_t max_tokens,
+                                sampling::SamplerState& sampler,
+                                DecodeResult* result,
+                                std::string* error_msg = nullptr,
+                                bool stop_at_eos = true,
+                                std::optional<std::uint32_t> forced_drafts = {},
+                                std::uint32_t occupancy = 1);
   /// The draft count DecodeStep would choose for this budget: from the
   /// session's acceptance history when the step would speculate at all, else
   /// none (the step then uses its ordinary width). A TP2 peer's rank 0 chooses
