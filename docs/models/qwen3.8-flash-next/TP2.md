@@ -187,7 +187,7 @@ only, so TP2 uses the mirrored snapshot cache (`UsesComponentCache` is false
 on `TpMirroredRunner`) and `PrefillThrough` runs `Prefill`. Otherwise the
 first session reuse diverges `operation_id`s and a later all-reduce hangs.
 
-Post-v0.16/v0.17 **collective-shape** rules (see also
+Collective-shape rules kept through the v0.16→v0.23 requalify series (see
 [MERGE-CHECKLIST.md](../../../MERGE-CHECKLIST.md)):
 
 - **Invariant:** both ranks issue the **same** all-reduces (order, count,
@@ -197,11 +197,12 @@ Post-v0.16/v0.17 **collective-shape** rules (see also
 - **Draft-subset is single-host only.** The small head scores a local table
   and skips the split-argmax all-reduce; the full-head greedy path performs
   that all-reduce. `PrepareDecode` requires `TpWorldSize()==1` before setting
-  `draft_subset`.
-- **Prompt lookup copies are single-host only** (`TpWorldSize()==1`). Lookup
-  can skip neural `MtpForward` cycles; under TP both ranks always run the
-  neural draft path with the mirrored count. Snapshots still carry
-  `PromptLookup::State` (payload version 18).
+  `draft_subset` (`subset_ok`).
+- **Prompt lookup copies are single-host only** (`lookup_ok` /
+  `TpWorldSize()==1`). Lookup can skip neural `MtpForward` cycles; under TP
+  both ranks always run the neural draft path with the mirrored count.
+  Snapshots still carry lookup state as
+  `speculative::PromptLookup<>::State` (payload version 18).
 - Any **new** upstream path that skips or adds a collective is a hazard until
   gated the same way. Prefer a hard single-host gate over hoping ranks agree.
 

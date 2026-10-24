@@ -166,10 +166,11 @@ hidden (e.g. 10240 vs 122880 = 1 vs 12 rows × 2560 F32).
   `RestoreOrFork`.
 - **MTP draft-subset is single-host only** (`TpWorldSize()==1`). The small-head
   path skips the split-argmax all-reduce; ranks that disagree hang.
-- **Prompt lookup copies are single-host only** (`TpWorldSize()==1`). Lookup
-  can skip neural `MtpForward` cycles; under TP both ranks always run the
-  neural draft path with the mirrored count. Snapshots still carry lookup
-  state (payload v18).
+- **Prompt lookup copies are single-host only** (`lookup_ok` /
+  `TpWorldSize()==1`). Lookup can skip neural `MtpForward` cycles; under TP
+  both ranks always run the neural draft path with the mirrored count.
+  Snapshots still carry lookup state as `speculative::PromptLookup<>::State`
+  (payload v18).
 - `defer_residual_` only when `tp_world_size()==1`. Forced draft counts come
   from rank 0 (`request.drafts` / `batch_drafts`).
 - Watch live concurrency on rank 0: `GET /metrics`

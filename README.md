@@ -42,7 +42,9 @@ and the full Q8 model that do not fit a single 128 GiB APU. After merging
 upstream through v0.23.0, one-host Flash-Next reports **1,801.01 tok/s AR
 prefill** and up to **116.93 tok/s tg** (see [Benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md)).
 The matched TP2 series below is from the v0.15.0-era binary (Q4 MTP,
-`pp2048 / tg128`, 2026-10-14) and is not yet requalified on v0.23.0:
+`pp2048 / tg128`, 2026-10-14). TP2 **runtime** was requalified on
+`tp2-rdma-merge-v0.23.0-2026-10-24` (smoke + user llama-swap); the table
+numbers below have **not** been re-benchmarked on v0.23.0:
 
 | Depth (tokens) | 1-host pp | **TP2 pp** | 1-host tg | **TP2 tg** |
 | ---: | ---: | ---: | ---: | ---: |

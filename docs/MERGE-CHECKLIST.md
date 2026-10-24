@@ -17,8 +17,12 @@ See also: [TP2.md](models/qwen3.8-flash-next/TP2.md) · [AGENTS.md](../AGENTS.md
   - `.../kernels/rocm/executor.*`, `kernels.hip.cpp`, `verbs.cpp`
   - `src/cli/serve/{inference_backend,component_text_cache,text_model_runner,text_generation_scheduler}.*`
   - MTP / draft / cache / checkpoint / prompt-lookup headers
+    (`src/core/speculative/prompt_lookup.hpp`, `draft_vocab.hpp`,
+    `mtp_policy.hpp`)
 - [ ] For each such commit, ask: **does it change how many GPU collectives a
   decode/prefill cycle runs?** If yes → TP2 hazard (table below).
+- [ ] Prefer **one upstream release per session**: merge → format/build →
+  TP2 smoke → user llama-swap validation → tag/push, then the next tag.
 
 ## 2. TP2 hazard policy (non-negotiable)
 
@@ -43,6 +47,7 @@ same tokens. When a feature must work under TP, **mirror the full decision**
 | `n-gram table read failed` | Graph pre-wait + `MixerPart` double WaitPle | `TrunkBatch.embeddings_ready` |
 | `identity or size mismatch` 10240 vs N×hidden | Rank skipped split-argmax or lookup cycle | Draft-subset and lookup single-host only |
 | Rapid restart loop, RDMA status 5 | Often after peer desync / bad QP | Fix desync first; then check link |
+| Short NL prompts claim “scrambled text” / empty content | Wide-prefill fused paths (SSM/attention/routed tiles/`last_only`) ran for `n>8` but TP2 half-width only qualifies `n≥1024` | Keep TP2 fused thresholds at `n≥1024` (see `bb383a36`) |
 
 ## 3. After merge (code)
 
@@ -65,10 +70,13 @@ same tokens. When a feature must work under TP, **mirror the full decision**
       **not** port 8080 for raw gufo metrics)
 - [ ] `/ready` OK
 - [ ] **Generation text**, prompt **>1024 tokens**
+- [ ] One **short natural-language** prompt (e.g. sample eBPF code) with
+      content assertions — empty body / “scrambled text” is a prefill bug
 - [ ] **≥5 requests** at `--sessions 4` (session reuse)
 - [ ] One **repeated-prefix / agent-style** prompt (lookup / copy paths)
 - [ ] `GET /metrics` on gufo HTTP: `requests_processing` / `deferred` move;
       no `tp_pair_lost` / size mismatch / `status 5` in the server log
+- [ ] User **llama-swap** run (their Q8-tp2 path) before tagging
 - [ ] Only then: push `uv-genai`, replace any `-untested` tag
 
 ## 5. What “green” is not
