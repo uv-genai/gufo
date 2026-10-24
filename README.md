@@ -12,7 +12,7 @@ the AMD Strix Halo hardware: Ryzen AI MAX+ 395 systems with Radeon 8060S
 > **This repository is a fork** of
 > [gufo-org/gufo](https://github.com/gufo-org/gufo) that adds **RDMA tensor
 > parallelism (TP2)** for two Strix Halo hosts. It tracks upstream `main`
-> (through **v0.22.0**) and keeps every one-host feature and
+> (through **v0.23.0**) and keeps every one-host feature and
 > fix; the forked work is the two-host path (InfiniBand, RoCE v2, or
 > USB4/Thunderbolt) and its launchers and benchmarks.
 >
@@ -39,10 +39,10 @@ the AMD Strix Halo hardware: Ryzen AI MAX+ 395 systems with Radeon 8060S
 On one host, Flash-Next decode and prefill are already excellent. **TP2 is
 faster than one host at every concurrency we measured**, and it holds contexts
 and the full Q8 model that do not fit a single 128 GiB APU. After merging
-upstream through v0.22.0, one-host Flash-Next reports **1,801.01 tok/s AR
+upstream through v0.23.0, one-host Flash-Next reports **1,801.01 tok/s AR
 prefill** and up to **116.93 tok/s tg** (see [Benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md)).
 The matched TP2 series below is from the v0.15.0-era binary (Q4 MTP,
-`pp2048 / tg128`, 2026-10-14) and is not yet requalified on v0.22.0:
+`pp2048 / tg128`, 2026-10-14) and is not yet requalified on v0.23.0:
 
 | Depth (tokens) | 1-host pp | **TP2 pp** | 1-host tg | **TP2 tg** |
 | ---: | ---: | ---: | ---: | ---: |
@@ -79,6 +79,7 @@ All model documentation lives under [docs/models](docs/models/README.md):
 | [Qwen3.8 Flash-Next](docs/models/qwen3.8-flash-next/README.md) | Q4/Q8, images, AR, MTP, **TP2** | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/38bb39ee97821de2c9009abb7e93950eec396e66/UD-Q4_K_XL) · [MTP Q8_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf) | One host: **1,801.01 tok/s pp** (AR); up to **116.93 tok/s tg** and **245.81 aggregated tok/s** · **TP2** up to **1,860 tok/s pp** and **79 tok/s tg**, **181 tok/s** sum at 6 users · [Benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md) · [TP2 series](docs/models/qwen3.8-flash-next/2026-10-14-tp2-depth-series.md) | [Quality](docs/models/qwen3.8-flash-next/QUALITY.md) |
 | [DeepSeek V4 Flash](docs/models/deepseek-v4-flash/README.md) | AR, DSpark | [antirez Flash 0731 IQ2XXS](https://huggingface.co/antirez/deepseek-v4-gguf/blob/1cd7b564460821938add0475a60b942c409295e0/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf) · [DSpark](https://huggingface.co/antirez/deepseek-v4-gguf/blob/e7f04037032990db0346398d249baf9fb9df1ccc/DeepSeek-V4-Flash-DSpark-support-0731.gguf) | **484.62 tok/s pp**; up to **26.62 tok/s tg** single user and **54.74 aggregated tok/s** on 8 concurrent requests with DSpark · [Benchmarks](docs/models/deepseek-v4-flash/BENCHMARKS.md) | [Quality](docs/models/deepseek-v4-flash/QUALITY.md) |
 | [Qwen3-ASR 1.7B](docs/models/qwen3-asr/README.md) | Speech recognition | [BF16](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/tree/7278e1e70fe206f11671096ffdd38061171dd6e5) | **15.27× realtime** · [Benchmarks](docs/models/qwen3-asr/BENCHMARKS.md) | [Quality](docs/models/qwen3-asr/QUALITY.md) |
+| [EmbeddingGemma 2](docs/models/embeddinggemma-2/README.md) | Text embeddings | [BF16](https://huggingface.co/google/embeddinggemma-2/tree/914f7f89142e33e77833254d9c9b90c3cef7303b) | Up to **23.9k tokens/s** over HTTP; **20.5 ms** for a 404-token request · [Benchmarks](docs/models/embeddinggemma-2/BENCHMARKS.md) | [Quality](docs/models/embeddinggemma-2/QUALITY.md) |
 | [Qwen3-TTS 1.7B](docs/models/qwen3-tts/README.md) | Speech synthesis and voice cloning | BF16 [CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) / [VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) / [Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Up to **2.54× realtime**; **201 ms** to first audio (CustomVoice) · [Benchmarks](docs/models/qwen3-tts/BENCHMARKS.md) | [Quality](docs/models/qwen3-tts/QUALITY.md) |
 | [Qwen-Image-2.1](docs/models/qwen-image-2.1/README.md) | BF16 image generation and editing | [Complete pipeline](https://huggingface.co/Qwen/Qwen-Image-2.1/tree/b3179ad355be050328e483a9dfdd9e60cd62adfa) | In progress · [Benchmarks](docs/models/qwen-image-2.1/BENCHMARKS.md) | [Quality](docs/models/qwen-image-2.1/QUALITY.md) |
 | [MiniMax H3](docs/models/minimax-h3/README.md) | BF16 text to video/audio | [FL2VA pipeline](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA) | In progress · [Benchmarks](docs/models/minimax-h3/BENCHMARKS.md) | [Quality](docs/models/minimax-h3/QUALITY.md) |
