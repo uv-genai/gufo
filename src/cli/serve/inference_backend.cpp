@@ -231,12 +231,14 @@ std::vector<std::uint8_t> EncodeQwenImageContext(
     grid(value);
   u32(prompt.images.size());
   for (const auto& value : prompt.images) {
+    if (value.pixels == nullptr)
+      throw std::invalid_argument("Qwen prompt context missing pixels");
     grid(value.grid);
-    u32(value.pixels.width);
-    u32(value.pixels.height);
-    u32(value.pixels.pixels.size());
-    out.insert(out.end(), value.pixels.pixels.begin(),
-               value.pixels.pixels.end());
+    u32(value.pixels->width);
+    u32(value.pixels->height);
+    u32(value.pixels->pixels.size());
+    out.insert(out.end(), value.pixels->pixels.begin(),
+               value.pixels->pixels.end());
   }
   return out;
 }
@@ -290,13 +292,15 @@ std::shared_ptr<const TextPromptContext> DecodeQwenImageContext(
   prompt->images.resize(image_count);
   for (auto& value : prompt->images) {
     value.grid = grid();
-    value.pixels.width = u32();
-    value.pixels.height = u32();
+    auto image = std::make_shared<core::Image>();
+    image->width = u32();
+    image->height = u32();
     const auto size = u32();
-    if (std::uint64_t{value.pixels.width} * value.pixels.height * 3 != size)
+    if (std::uint64_t{image->width} * image->height * 3 != size)
       throw std::invalid_argument("Qwen prompt context pixels are invalid");
     const auto pixels = span(size);
-    value.pixels.pixels.assign(pixels.begin(), pixels.end());
+    image->pixels.assign(pixels.begin(), pixels.end());
+    value.pixels = std::move(image);
   }
   if (offset != bytes.size())
     throw std::invalid_argument("Qwen prompt context has trailing bytes");
