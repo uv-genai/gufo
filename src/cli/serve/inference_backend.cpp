@@ -2999,6 +2999,8 @@ public:
     sampling::SamplerState working_sampler = sampler;
     QwenFlashNextSession::DecodeResult decoded;
     std::string error;
+    const auto budget =
+        std::min<std::size_t>(max_tokens, std::uint64_t{max_draft_tokens_} + 1);
     // Use the same request policy as SelectNext and the batched MTP path.
     // The engine stops before committing EOS or work beyond it.
     if (!qfn.session().DecodeStep(budget, working_sampler, &decoded, &error,
