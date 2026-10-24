@@ -7,6 +7,7 @@
 //              --tp-bootstrap-host HOST --tp-bootstrap-port PORT
 //              --tp-operation-id N (same on both ranks)
 //              [--tp-rdma-device NAME] (required with several devices)
+//           [--batch T] [--context N] [--yarn-factor F] [--dump logits.bin]
 // Independent predictor oracle: --mtp-model MTP.gguf --mtp-audit
 // MTP cost calibration: --mtp-model MTP.gguf --cost-audit C (0 = all)
 //                      [--depth N] (default: 0, 4096, 32768)
@@ -38,6 +39,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/distributed/tp_partition.hpp"
+#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
@@ -57,7 +59,8 @@ void AuditMtp(q::rocm::Executor& executor, const q::rocm::DeviceModel& device,
 void AuditMtpCosts(q::rocm::Executor& executor,
                    const gufo::tokenization::QwenTokenizer& tokenizer,
                    std::span<const std::uint32_t> depths,
-                   std::uint32_t concurrency);
+                   std::span<const std::uint32_t> concurrencies,
+                   bool sampled_head);
 
 namespace {
 
@@ -299,7 +302,8 @@ int main(int argc, char** argv) {
   bool mtp_audit = false;
   bool reference = false;
   bool cost_audit = false;
-  std::uint32_t cost_concurrency = 0;
+  bool sampled_head = false;
+  std::vector<std::uint32_t> cost_concurrencies;
   std::optional<std::uint32_t> cost_depth;
   std::uint32_t batch = 512;
   std::uint32_t context = 4096;
@@ -314,6 +318,7 @@ int main(int argc, char** argv) {
 #ifndef GUFO_ENABLE_TP2_RDMA
   (void)tp_operation_id;
 #endif
+  float yarn_factor = 1.0F;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     auto next = [&]() -> std::string {
@@ -325,17 +330,29 @@ int main(int argc, char** argv) {
       mtp_path = next();
     } else if (arg == "--mtp-audit") {
       mtp_audit = true;
+    } else if (arg == "--sampled-head") {
+      sampled_head = true;
     } else if (arg == "--cost-audit") {
       cost_audit = true;
       const auto value = next();
-      const auto [end, ec] = std::from_chars(
-          value.data(), value.data() + value.size(), cost_concurrency);
-      if (ec != std::errc{} || end != value.data() + value.size() ||
-          (cost_concurrency != 0 && cost_concurrency != 1 &&
-           cost_concurrency != 2 && cost_concurrency != 4 &&
-           cost_concurrency != 6 && cost_concurrency != 8)) {
-        std::fprintf(stderr, "--cost-audit requires C=0/1/2/4/6/8 (0 = all)\n");
-        return 2;
+      if (value != "0") {
+        const char* begin = value.data();
+        const char* finish = begin + value.size();
+        do {
+          std::uint32_t concurrency = 0;
+          const auto [end, ec] = std::from_chars(begin, finish, concurrency);
+          if (ec != std::errc{} || (end != finish && *end != ',') ||
+              (concurrency != 1 && concurrency != 2 && concurrency != 4 &&
+               concurrency != 6 && concurrency != 8) ||
+              (end != finish && end + 1 == finish)) {
+            std::fprintf(stderr,
+                         "--cost-audit requires 0 (all) or a list of "
+                         "1,2,4,6,8\n");
+            return 2;
+          }
+          cost_concurrencies.push_back(concurrency);
+          begin = end == finish ? finish : end + 1;
+        } while (begin != finish);
       }
     } else if (arg == "--depth") {
       const auto value = next();
@@ -422,6 +439,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s requires a positive integer\n", arg.c_str());
         return 2;
       }
+    } else if (arg == "--yarn-factor") {
+      const auto value = next();
+      const auto [end, ec] = std::from_chars(
+          value.data(), value.data() + value.size(), yarn_factor);
+      if (ec != std::errc{} || end != value.data() + value.size() ||
+          !(yarn_factor >= 1.0F)) {
+        std::fprintf(stderr, "--yarn-factor requires a number >= 1\n");
+        return 2;
+      }
     } else if (arg == "--dump") {
       dump_path = next();
     } else if (arg == "--kld-base") {
@@ -453,8 +479,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--cost-audit cannot be combined with other probes\n");
     return 2;
   }
-  if (cost_depth && !cost_audit) {
-    std::fprintf(stderr, "--depth requires --cost-audit\n");
+  if ((cost_depth || sampled_head) && !cost_audit) {
+    std::fprintf(stderr, "--depth and --sampled-head require --cost-audit\n");
     return 2;
   }
   if (tp_world_size != 1 && tp_world_size != 2) {
@@ -494,6 +520,17 @@ int main(int argc, char** argv) {
   if (!tokenizer) {
     std::fprintf(stderr, "tokenizer failed: %s\n", error.c_str());
     return 1;
+  }
+  if (yarn_factor != 1.0F) {
+    const q::RopeScaling scaling{
+        .factor = yarn_factor,
+        .original_context = weights->config.context_length};
+    if (!q::ValidateRopeScaling(scaling, weights->config.context_length,
+                                &error)) {
+      std::fprintf(stderr, "invalid YaRN factor: %s\n", error.c_str());
+      return 2;
+    }
+    weights->config.rope_scaling = scaling;
   }
   const auto& c = weights->config;
   if (cost_depth &&
@@ -585,194 +622,209 @@ int main(int argc, char** argv) {
     std::printf("TP2 rank=%u world=%u expert_share=%u resident_bytes=%zu\n",
                 tp_rank, tp_world_size, partition->ff_count,
                 device->resident_bytes());
-  }
-  q::rocm::Executor::Options options;
-  options.device_index = static_cast<int>(tp_device);
-  options.max_batch = batch;
-  options.max_logit_rows = std::min<std::uint32_t>(batch, 64);
-  if (mtp_audit || cost_audit)
-    options.max_speculative = 8;
-  if (communicator) {
-    options.all_reduce = q::rocm::Executor::TwoRankAllReduce(
-        communicator, device->config().hidden_size);
-    options.reduce_status =
-        q::rocm::Executor::TwoRankReduceStatus(communicator);
-    options.split_reduce = q::rocm::Executor::TwoRankSplitReduce(
-        communicator, device->config().hidden_size);
-  }
-
-  if (cost_audit) {
-    options.max_batch = 2048;
-    options.max_logit_rows = 8;
-  }
-  auto executor =
-      q::rocm::Executor::Create(*device, ngram.get(), options, &error);
-  if (!executor) {
-    std::fprintf(stderr, "executor failed: %s\n", error.c_str());
-    return 1;
-  }
-  if (cost_audit) {
-    try {
-      const std::array<std::uint32_t, 3> depths{0, 4096, 32768};
-      std::span<const std::uint32_t> selected_depths = depths;
-      if (cost_depth)
-        selected_depths = std::span(&*cost_depth, 1);
-      AuditMtpCosts(*executor, *tokenizer, selected_depths, cost_concurrency);
-      return 0;
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "cost audit failed: %s\n", e.what());
-      return 1;
-    }
-  }
-  if (mtp_audit) {
-    try {
-      AuditMtp(*executor, *device, *weights, *mtp_weights, *tokenizer,
-               model_path);
-      return 0;
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "MTP oracle failed: %s\n", e.what());
-      return 1;
-    }
-  }
-  if (!kld_base.empty()) {
-    return EvaluateKld(*executor, c.vocab_size, kld_base, kld_save,
-                       options.max_logit_rows, tp_rank == 0);
-  }
-  auto session = executor->CreateSession(
-      gufo::core::SessionMode::kAutoregressive, context, &error);
-  if (!session) {
-    std::fprintf(stderr, "session failed: %s\n", error.c_str());
-    return 1;
-  }
-
-  std::vector<std::int32_t> tokens;
-  for (auto id : tokenizer->Encode(prompt)) {
-    tokens.push_back(static_cast<std::int32_t>(id));
-  }
-  if (tokens.empty() || tokens.size() > context) {
-    std::fprintf(stderr, "prompt must contain 1..%u tokens\n", context);
-    return 2;
-  }
-  std::vector<std::int32_t> continuation;
-  if (decode) {
-    const auto ids = tokenizer->Encode(decode_text);
-    continuation.assign(ids.begin(), ids.end());
-    if (continuation.empty() || continuation.size() > context - tokens.size()) {
-      std::fprintf(stderr, "complete continuation must fit in the context\n");
-      return 2;
-    }
-  }
-  std::printf("prompt tokens (%zu)\n", tokens.size());
-  std::ofstream dump;
-  if (!dump_path.empty()) {
-    dump.open(dump_path, std::ios::binary);
-    if (!dump) {
-      std::fprintf(stderr, "cannot open logit dump %s\n", dump_path.c_str());
-      return 1;
-    }
-  }
-
-  std::vector<float> gpu_logits;
-  std::size_t logit_rows = 0;
-  // Chunks as the engine feeds them: under TP two batches run as a pair,
-  // whose logits come from the second batch.
-  const std::size_t step = executor->PrefillChunk();
-  for (std::size_t off = 0; off < tokens.size(); off += step) {
-    const std::size_t n = std::min<std::size_t>(step, tokens.size() - off);
-    const auto rows = static_cast<std::uint32_t>(std::min<std::size_t>(
-        n - executor->PairLead(static_cast<std::uint32_t>(n)),
-        options.max_logit_rows));
-    std::vector<float> out(static_cast<std::size_t>(rows) * c.vocab_size);
-    // Name the following chunk as Session::Feed does, so its n-gram read
-    // overlaps this one.
-    const std::size_t next =
-        std::min<std::size_t>(batch, tokens.size() - off - n);
-    if (!executor->Forward(
-            *session, std::span<const std::int32_t>(tokens.data() + off, n),
-            rows, out.data(), q::rocm::Executor::ForwardMode::kPrefill, &error,
-            nullptr,
-            std::span<const std::int32_t>(tokens.data() + off + n, next))) {
-      std::fprintf(stderr, "prefill failed: %s\n", error.c_str());
-      return 1;
-    }
-    const bool last = off + n == tokens.size();
-    if (last) {
-      gpu_logits = std::move(out);
-      logit_rows = rows;
-    }
-  }
-  if (decode) {
-    // Matched-token decode: feed a fixed continuation one token at a time
-    // through the decode path and dump each step's logits.
-    std::vector<float> row(c.vocab_size);
-    std::size_t steps = 0;
-    for (const auto t : continuation) {
-      if (!executor->Forward(*session, std::span<const std::int32_t>(&t, 1), 1,
-                             row.data(),
-                             q::rocm::Executor::ForwardMode::kDecode, &error)) {
-        std::fprintf(stderr, "decode failed: %s\n", error.c_str());
+    if (sampled_head) {
+      std::vector<std::int32_t> specials;
+      for (std::uint32_t id = q::kMtpDraftVocab; id < c.vocab_size; ++id)
+        if (tokenizer->IsSpecialToken(id))
+          specials.push_back(id);
+      if (!device->SetDraftVocab(q::kMtpDraftVocab, std::move(specials),
+                                 &error)) {
+        std::fprintf(stderr, "draft vocabulary failed: %s\n", error.c_str());
         return 1;
       }
-      if (dump.is_open())
-        dump.write(reinterpret_cast<const char*>(row.data()),
-                   static_cast<std::streamsize>(row.size() * sizeof(float)));
-      ++steps;
+    }
+    q::rocm::Executor::Options options;
+    options.device_index = static_cast<int>(tp_device);
+    options.max_batch = batch;
+    options.max_context = context;
+    options.max_logit_rows = std::min<std::uint32_t>(batch, 64);
+    if (mtp_audit || cost_audit)
+      options.max_speculative = 8;
+    if (communicator) {
+      options.all_reduce = q::rocm::Executor::TwoRankAllReduce(
+          communicator, device->config().hidden_size);
+      options.reduce_status =
+          q::rocm::Executor::TwoRankReduceStatus(communicator);
+      options.split_reduce = q::rocm::Executor::TwoRankSplitReduce(
+          communicator, device->config().hidden_size);
+    }
+
+    if (cost_audit) {
+      options.max_batch = 2048;
+      options.max_logit_rows = 8;
+    }
+    auto executor =
+        q::rocm::Executor::Create(*device, ngram.get(), options, &error);
+    if (!executor) {
+      std::fprintf(stderr, "executor failed: %s\n", error.c_str());
+      return 1;
+    }
+    if (cost_audit) {
+      try {
+        const std::array<std::uint32_t, 3> depths{0, 4096, 32768};
+        std::span<const std::uint32_t> selected_depths = depths;
+        if (cost_depth)
+          selected_depths = std::span(&*cost_depth, 1);
+        AuditMtpCosts(*executor, *tokenizer, selected_depths,
+                      cost_concurrencies, sampled_head);
+        return 0;
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "cost audit failed: %s\n", e.what());
+        return 1;
+      }
+    }
+    if (mtp_audit) {
+      try {
+        AuditMtp(*executor, *device, *weights, *mtp_weights, *tokenizer,
+                 model_path);
+        return 0;
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "MTP oracle failed: %s\n", e.what());
+        return 1;
+      }
+    }
+    if (!kld_base.empty()) {
+      return EvaluateKld(*executor, c.vocab_size, kld_base, kld_save,
+                         options.max_logit_rows, tp_rank == 0);
+    }
+    auto session = executor->CreateSession(
+        gufo::core::SessionMode::kAutoregressive, context, &error);
+    if (!session) {
+      std::fprintf(stderr, "session failed: %s\n", error.c_str());
+      return 1;
+    }
+
+    std::vector<std::int32_t> tokens;
+    for (auto id : tokenizer->Encode(prompt)) {
+      tokens.push_back(static_cast<std::int32_t>(id));
+    }
+    if (tokens.empty() || tokens.size() > context) {
+      std::fprintf(stderr, "prompt must contain 1..%u tokens\n", context);
+      return 2;
+    }
+    std::vector<std::int32_t> continuation;
+    if (decode) {
+      const auto ids = tokenizer->Encode(decode_text);
+      continuation.assign(ids.begin(), ids.end());
+      if (continuation.empty() ||
+          continuation.size() > context - tokens.size()) {
+        std::fprintf(stderr, "complete continuation must fit in the context\n");
+        return 2;
+      }
+    }
+    std::printf("prompt tokens (%zu)\n", tokens.size());
+    std::ofstream dump;
+    if (!dump_path.empty()) {
+      dump.open(dump_path, std::ios::binary);
+      if (!dump) {
+        std::fprintf(stderr, "cannot open logit dump %s\n", dump_path.c_str());
+        return 1;
+      }
+    }
+
+    std::vector<float> gpu_logits;
+    std::size_t logit_rows = 0;
+    // Chunks as the engine feeds them: under TP two batches run as a pair,
+    // whose logits come from the second batch.
+    const std::size_t step = executor->PrefillChunk();
+    for (std::size_t off = 0; off < tokens.size(); off += step) {
+      const std::size_t n = std::min<std::size_t>(step, tokens.size() - off);
+      const auto rows = static_cast<std::uint32_t>(std::min<std::size_t>(
+          n - executor->PairLead(static_cast<std::uint32_t>(n)),
+          options.max_logit_rows));
+      std::vector<float> out(static_cast<std::size_t>(rows) * c.vocab_size);
+      // Name the following chunk as Session::Feed does, so its n-gram read
+      // overlaps this one.
+      const std::size_t next =
+          std::min<std::size_t>(batch, tokens.size() - off - n);
+      if (!executor->Forward(
+              *session, std::span<const std::int32_t>(tokens.data() + off, n),
+              rows, out.data(), q::rocm::Executor::ForwardMode::kPrefill,
+              &error, nullptr,
+              std::span<const std::int32_t>(tokens.data() + off + n, next))) {
+        std::fprintf(stderr, "prefill failed: %s\n", error.c_str());
+        return 1;
+      }
+      const bool last = off + n == tokens.size();
+      if (last) {
+        gpu_logits = std::move(out);
+        logit_rows = rows;
+      }
+    }
+    if (decode) {
+      // Matched-token decode: feed a fixed continuation one token at a time
+      // through the decode path and dump each step's logits.
+      std::vector<float> row(c.vocab_size);
+      std::size_t steps = 0;
+      for (const auto t : continuation) {
+        if (!executor->Forward(
+                *session, std::span<const std::int32_t>(&t, 1), 1, row.data(),
+                q::rocm::Executor::ForwardMode::kDecode, &error)) {
+          std::fprintf(stderr, "decode failed: %s\n", error.c_str());
+          return 1;
+        }
+        if (dump.is_open())
+          dump.write(reinterpret_cast<const char*>(row.data()),
+                     static_cast<std::streamsize>(row.size() * sizeof(float)));
+        ++steps;
+      }
+      if (dump.is_open()) {
+        dump.close();
+        if (!dump) {
+          std::fprintf(stderr, "cannot write logit dump %s\n",
+                       dump_path.c_str());
+          return 1;
+        }
+      }
+      if (!decode_ids_path.empty()) {
+        std::ofstream ids(decode_ids_path, std::ios::binary);
+        ids.write(reinterpret_cast<const char*>(continuation.data()),
+                  static_cast<std::streamsize>(continuation.size() *
+                                               sizeof(continuation[0])));
+        ids.close();
+        if (!ids) {
+          std::fprintf(stderr, "cannot write token IDs %s\n",
+                       decode_ids_path.c_str());
+          return 1;
+        }
+      }
+      std::printf("decode steps %zu after %zu prompt tokens\n", steps,
+                  tokens.size());
+      return 0;
     }
     if (dump.is_open()) {
-      dump.close();
+      dump.write(
+          reinterpret_cast<const char*>(gpu_logits.data()),
+          static_cast<std::streamsize>(gpu_logits.size() * sizeof(float)));
+      dump.flush();
       if (!dump) {
         std::fprintf(stderr, "cannot write logit dump %s\n", dump_path.c_str());
         return 1;
       }
     }
-    if (!decode_ids_path.empty()) {
-      std::ofstream ids(decode_ids_path, std::ios::binary);
-      ids.write(reinterpret_cast<const char*>(continuation.data()),
-                static_cast<std::streamsize>(continuation.size() *
-                                             sizeof(continuation[0])));
-      ids.close();
-      if (!ids) {
-        std::fprintf(stderr, "cannot write token IDs %s\n",
-                     decode_ids_path.c_str());
-        return 1;
+
+    if (reference) {
+      q::ReferenceModel ref(*weights, ngram.get(),
+                            static_cast<std::uint32_t>(tokens.size()));
+      std::vector<float> ref_logits(c.vocab_size);
+      const std::size_t first = tokens.size() - logit_rows;
+      for (std::size_t i = 0; i < tokens.size(); ++i) {
+        if (!ref.Step(tokens[i], ref_logits, {}, &error)) {
+          std::fprintf(stderr, "reference failed: %s\n", error.c_str());
+          return 1;
+        }
+        if (i < first) {
+          continue;
+        }
+        const Stats st = Compare(ref_logits.data(),
+                                 gpu_logits.data() + (i - first) * c.vocab_size,
+                                 c.vocab_size);
+        std::printf("pos %3zu ref %6u gpu %6u %s  KL %.5f  max|d| %.3f\n", i,
+                    st.argmax_a, st.argmax_b,
+                    st.argmax_a == st.argmax_b ? "OK  " : "DIFF", st.kl,
+                    st.max_abs);
       }
     }
-    std::printf("decode steps %zu after %zu prompt tokens\n", steps,
-                tokens.size());
+
     return 0;
   }
-  if (dump.is_open()) {
-    dump.write(reinterpret_cast<const char*>(gpu_logits.data()),
-               static_cast<std::streamsize>(gpu_logits.size() * sizeof(float)));
-    dump.flush();
-    if (!dump) {
-      std::fprintf(stderr, "cannot write logit dump %s\n", dump_path.c_str());
-      return 1;
-    }
-  }
-
-  if (reference) {
-    q::ReferenceModel ref(*weights, ngram.get(),
-                          static_cast<std::uint32_t>(tokens.size()));
-    std::vector<float> ref_logits(c.vocab_size);
-    const std::size_t first = tokens.size() - logit_rows;
-    for (std::size_t i = 0; i < tokens.size(); ++i) {
-      if (!ref.Step(tokens[i], ref_logits, {}, &error)) {
-        std::fprintf(stderr, "reference failed: %s\n", error.c_str());
-        return 1;
-      }
-      if (i < first) {
-        continue;
-      }
-      const Stats st =
-          Compare(ref_logits.data(),
-                  gpu_logits.data() + (i - first) * c.vocab_size, c.vocab_size);
-      std::printf("pos %3zu ref %6u gpu %6u %s  KL %.5f  max|d| %.3f\n", i,
-                  st.argmax_a, st.argmax_b,
-                  st.argmax_a == st.argmax_b ? "OK  " : "DIFF", st.kl,
-                  st.max_abs);
-    }
-  }
-
-  return 0;
-}

@@ -18,6 +18,11 @@ add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(tp_partition gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(rdma_gid gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_sampling gufo_core "cpu")
+add_qwen38_flash_next_test(rope_scaling gufo_qwen38_flash_next "cpu")
+# The HF-oracle/off-bit-identity checks link the scalar model oracle, so
+# (like ngram) this stays out of cmake/Checks.cmake's hosted check-pr set.
+add_qwen38_flash_next_test(rope_scaling_oracle
+  gufo_qwen38_flash_next_reference "cpu")
 add_qwen38_flash_next_test(draft_vocab gufo_core "cpu")
 add_qwen38_flash_next_test(prompt_lookup gufo_core "cpu")
 
@@ -29,9 +34,12 @@ set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2"
 if (ENGINE_ENABLE_HIP)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
       attention_ops moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops
-      select_ops snapshot_copy)
+      select_ops snapshot_copy verification_sampling)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()
+  # The rope phase and RMS checks compare against the scalar CPU oracle.
+  target_link_libraries(qwen38_flash_next_attention_ops_test PRIVATE
+    gufo_qwen38_flash_next_reference)
 
   add_executable(qwen38_flash_next_session_test EXCLUDE_FROM_ALL session_test.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp

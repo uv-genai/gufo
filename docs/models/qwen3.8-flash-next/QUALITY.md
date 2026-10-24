@@ -1,5 +1,118 @@
 # Qwen3.8 Flash-Next quality
 
+## Exact sampled decode, October 21, 2026
+
+The candidate retains target weights and forward arithmetic. Its compact
+verification union contains the best 64 finite unpenalized logits and every
+penalized token. An omitted token therefore cannot enter a post-penalty top-k
+of at most 64. Existing FP64 penalty/filter/normalization and rejection
+correction operate on the original F32 values and vocabulary IDs. Negative
+penalties and repeat penalties below one are included in this proof.
+Grammar activation, forced reasoning closure, unbounded/larger top-k and
+excessive penalty history keep the full-row path.
+
+The independent GPU/CPU candidate oracle covers real vocabulary size 248,320,
+ragged sizes, 1–7 rows, ties/signed zero, nonfinite inputs and promoted penalty
+tokens. Target probability bits, accepted/rejected tokens, residual correction
+and RNG agree with full-row sampling. Shared core sampling and existing MTP
+sampling tests pass. The independent predictor audit checks KV-only/full
+catch-up at 1/8/9/32/33 rows, full-width normalization, attention and recursive
+carry. Native C2/4/6/8 checks retain exact full logits, sampled RNG, failure and
+cancellation isolation, mixed head eligibility and used-session restores.
+
+Native sampling and cache suites pass default thinking/nonthinking, greedy,
+unbounded sampling, EOS, short budgets, RAM and serialized replay. HTTP tests
+pass bounded/unbounded top-k and min-keep boundaries, actual concurrent
+drafting, stops, cancellation, images and exact warm replay. The selected API
+suites pass structured output, reasoning budgets, sampling defaults, tools,
+long context and cache/disk restart. Public extraction, executable URI tests
+(including three rejected mutants) and 32K source-edit tool calls pass with
+thinking on/off and literal protocol tags. A real Pi 0.87.0 continued session
+passes editing, code creation and literal-tag fixtures: 12 HTTP requests,
+10 successful tool calls, and actual executed assertions.
+
+The stronger sampled-copy bypass changes proposal policy only after a
+previous copy establishes its source and a full 24-token match remains.
+Target rejection is still mandatory. The matched captures above retain
+identical wording, but a proposal-policy change does not promise identical
+seeded text across versions for every prompt. The target sampling distribution
+and deterministic replay within a version are the contracts.
+
+An image cancellation/resume timing flag reproduced twice: TTFT
+3.62–3.78 → 9.45–9.46 ms. Admission profiling isolates 5.61 ms in image
+context setup, where a first image descriptor invalidates captured text
+graphs. Image-capable Flash-Next slots now prepare an empty stable descriptor
+before any graph capture. The affected request measures 3.71 ms TTFT and
+1462.23 ms decode, versus main's 3.78 ms and 1494.80 ms. The complete lookup
+history retains every output and expected prefill/cache count; no PP/decode
+or token-gap flag remains in that pair.
+
+Initial comparisons use main `da5d5a2b`. Final production binaries compare
+main `0c03748a` with candidate `1d3b8c68`, after rebasing onto the merged
+small-prefill changes. They use the same Nix toolchain; builds and inference
+never overlap. All observations,
+including failed prototypes and harness-only failures, remain in
+`/tmp/gufo-flash-decode-20261021` on the test host and
+`/Users/fbozzo/projects/flash-decode-20261021` on the editing host. The benchmark
+artifact's source field identifies its harness tree; the retained binary
+paths and hashes identify each measured implementation. No llama.cpp values
+or reference accuracy claims are changed.
+
+Initial comparisons retain 938 lookup phase measurements (six queue/TTFT
+flags), 80 workflow measurements (one 3.24 ms snapshot flag), and 242
+concurrent benchmark measurements. The latter flags include the variable
+mixed-C2 controller, unordered peer preparation/queue latencies and one
+5.76 ms seven-token prefill difference. Outputs and prompt/cache work agree.
+Timing uses the unchanged 5% and 3 ms gate per request/phase. Faster requests
+never offset slower ones; remaining variable observations are not timing
+passes. The two workflow pairs leave 78 of 80 phases passing, two snapshot
+observations inconclusive and no confirmed failure. The initial image-resume
+failure and its fix are retained separately.
+
+The raw C4 queue comparison also flags the same body twice, but its recorded
+admission rank changes from second on main to fourth on the candidate. Both
+arms reach the first token at about 10–11 ms. This is unmatched scheduling
+work, not evidence of slower inference; its queue timing stays unqualified.
+Other variable C6/C8 queue and first-token observations remain unqualified.
+Focused repeats, admission counters and every comparison are retained with
+the raw reports.
+
+Final native candidate checks pass again: independent target-candidate and
+predictor oracles, batch isolation, sampling, and RAM/serialized cache replay.
+The image-descriptor operator test compares captured fused attention against
+an independent null-descriptor reference near 128K, including guard bytes,
+idempotent preparation and empty-layout restore. The six selected API suites
+pass again, including image/thinking/tool cancellation and disk restart. The
+final real Pi conversation passes 13 requests and ten successful tool calls;
+the generated files and actual Node/Python assertions were inspected.
+
+The current-main default-sampled screen retains identical outputs and expected
+cache work, with all 276 per-request/phase measurements passing. Its two
+simultaneous requests are identified by their submission cohort, since network
+arrival order can swap within a cohort; bodies, outputs, measured values and
+the order between cohorts are unchanged. The original label-based comparison
+is retained separately.
+
+All six final canonical AR/MTP depth spots retain completion hashes and
+prompt/cache/draft counts. Prefill rates differ by at most 0.21%. The raw
+concurrent comparison retains 342 phase measurements including single-user
+prefix preparation. Identical C8 peers exchange request indices and admission
+roles: matching their recorded cache work and `resident_at_admission`, without
+sorting by timings, removes the apparent preparation and queue slowdowns.
+The separate admission comparison has 288 measurements, with only greedy C2
+decode/duration flags remaining. Its first cold seven-token tails improve
+from about 108.6/105.7 to 95.4/92.5 ms for mixed/repetitive input.
+
+Greedy C2 remains unqualified: the final pair is 62.17 → 55.30 tok/s, while
+the focused reverse-order control is 53.30 → 55.29. Main proposes 93 versus
+39 drafts per response across its runs; the candidate proposes 56 in both.
+Every completion still matches isolated AR. These different adaptive paths
+do not establish a branch speedup or an attributable slowdown. The raw flags,
+earlier controls and all retained observations remain available; no global
+timing pass is claimed.
+
+## Earlier qualification
+
 **Component-cache admission, October 20:** production code `195f9374` avoids
 repeated slot ranking, full checkpoint lookup results for presence checks and
 a second cold reset. Focused cache/runner/index/RAM-and-disk CPU tests pass;
@@ -602,6 +715,49 @@ Both use the same converted GGUF weights. Against FP32, Gufo and Transformers
 BF16 differ by **7.83% / 8.10%**, respectively. This is numerical drift, not an
 image-answer score; **llama.cpp was not tested**. Optimizations retain native
 embedding bytes but do not resolve this gap. [Evidence](artifacts/vision-parity.json).
+
+## Extended context (YaRN)
+
+**With YaRN off, the extension is a no-op: full-model logits and served
+continuations are byte-identical to the pre-change build.** Unsloth
+UD-Q4_K_XL target, shared Q8_0 MTP; September 26–29, 2026. YaRN-off identity
+and the `--context` path were rechecked on the final build on September 29.
+
+| Check | Result |
+| --- | --- |
+| YaRN off vs. pre-change build | Full-model logit dumps byte-identical on both prefill paths (fused F16 GEMM and PrepareAttention), 1,321-token prompt; 16/16 served continuations byte-identical |
+| Prefill/decode, YaRN off | Prefill within 2% of the pre-change build at 8k/32k/131k (two runs each); decode and MTP acceptance unchanged at 29k (132/211 drafts both) |
+| Needle retrieval, YaRN on | 12/12 via both `/v1/chat/completions` and raw `/v1/completions`: factor 1.5625 at capacity 409,600 (126,820 / 297,246 / 389,499 prompt tokens); factor 2.5 at capacity 409,600 (297,247 / 389,500, chat) and at capacity 655,360 (297,246 / 585,454) |
+| Cache identity, YaRN on | A 29,646-token session cached under factor 1.5625 is not restored after restarting under factor 2.5 (full prefill; stored as a separate entry); it is restored after restarting under 1.5625 (0.8 s from disk, no prefill) |
+
+Needle retrieval passed at every tested factor/capacity pair. A
+369,989-token long read named the final scene correctly and quoted the
+excerpt's last words verbatim; one image placed after 297,964 text tokens
+in the same request (factor 2.5) was described correctly.
+
+Logit agreement between YaRN on and off is close on a shared 1,927-token
+prompt (dense attention for every implementation, since it is under the
+2,048-token indexer budget): top-1 flips and KL divergence against the CPU
+oracle and llama.cpp are similar with YaRN on or off (top-1 flips 21–29 of
+1,927 positions; KL p50 ~4e-5; KL p90 ~0.01). At depth (the last 64
+positions of long prompts), gufo versus llama.cpp agreement is 61/64 top-1
+both at 248,487 tokens with YaRN off (KL median 0.011) and at 297,484
+tokens with YaRN 1.5625 (KL median 0.008); the divergence there is gufo's
+sparse attention versus llama.cpp's dense attention, present with YaRN off
+too.
+
+Idle GTT grows with capacity under YaRN (about 27.5 KiB per context token,
+MTP resident): 88.5 GiB at capacity 262,144, 92.4 GiB at 409,600, 98.8 GiB
+at 655,360. Prefill of the part of a prompt beyond 262,144 visible tokens
+runs on the per-token attention kernel at about 350–375 tokens/s; a
+585,454-token prompt averaged 493 tokens/s overall, with decode at 36
+tokens/s.
+
+Gaps: short-text quality with YaRN on is not measured (Qwen's model card
+warns static YaRN can hurt short texts); there is no Transformers reference
+beyond the native context, so agreement above uses llama.cpp and the CPU
+oracle; and the fused WMMA kernel is not used for chunks whose visible
+context exceeds 262,144 tokens.
 
 ## Reproduce
 

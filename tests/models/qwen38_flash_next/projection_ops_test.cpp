@@ -12,8 +12,10 @@
 #include <string>
 #include <vector>
 
+#include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
+#include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
 namespace {
@@ -210,10 +212,11 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
 }
 
 /// `heads` query heads over `kv_heads` KV heads: the model's 24 over two, or
-/// a TP rank's 12 over one.
-void CheckAttentionProjection(const void* weights, const __half* input,
-                              const float* projected, std::uint32_t batch,
-                              std::uint32_t heads, std::uint32_t kv_heads) {
+/// a TP rank's 12 over one. Optional static YaRN qualification.
+void CheckAttentionProjection(
+    const void* weights, const __half* input, const float* projected,
+    std::uint32_t batch, std::uint32_t heads, std::uint32_t kv_heads,
+    const gufo::models::qwen38_flash_next::YarnRope& yarn = {}) {
   constexpr std::uint32_t start = 131069;
   const std::uint32_t rows = 2 * (heads + kv_heads) * 256;
   const std::size_t query_bytes = (std::size_t(batch) * heads * 256 + 16) * 4;
@@ -256,12 +259,19 @@ void CheckAttentionProjection(const void* weights, const __half* input,
                            static_cast<float*>(expected[1]) + 8,
                            static_cast<__half*>(expected[2]) + 8,
                            static_cast<__half*>(expected[3]) + 8, batch, heads,
-                           kv_heads, 256, 64, position, 1e7F, 1e-6F, nullptr))
+                           kv_heads, 256, 64, position, 1e7F, 1e-6F, nullptr,
+                           nullptr, false, yarn))
     throw std::runtime_error("attention preparation rejected the model shape");
   hipStream_t stream = nullptr;
   hipGraph_t graph = nullptr;
   hipGraphExec_t replay = nullptr;
   CheckHip(hipStreamCreate(&stream), "attention stream");
+  gufo::models::qwen::vision::DeviceInput vision;
+  vision.PrepareRope(stream);
+  const auto* descriptor = vision.rope();
+  vision.PrepareRope(stream);
+  if (descriptor == nullptr || vision.rope() != descriptor)
+    throw std::runtime_error("prepared image descriptor is not stable");
   CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
            "attention capture");
   if (!q::AttentionF16Gemm(weights, input, device_gamma, device_gamma + 256,
@@ -269,12 +279,16 @@ void CheckAttentionProjection(const void* weights, const __half* input,
                            static_cast<float*>(actual[1]) + 8,
                            static_cast<__half*>(actual[2]) + 8,
                            static_cast<__half*>(actual[3]) + 8, batch, heads,
-                           kv_heads, position, 1e7F, 1e-6F, stream))
+                           kv_heads, position, 1e7F, 1e-6F, stream,
+                           vision.rope(), yarn))
     throw std::runtime_error("attention fusion rejected the model shape");
   CheckHip(hipStreamEndCapture(stream, &graph), "attention capture end");
   CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
            "attention graph");
   for (unsigned repetition = 0; repetition < 2; ++repetition) {
+    vision.RestoreLayout({}, stream);
+    if (vision.rope() != descriptor)
+      throw std::runtime_error("text restore replaced the image descriptor");
     for (unsigned i = 0; i < 4; ++i)
       CheckHip(hipMemsetAsync(actual[i], 0xA5,
                               i < 2 ? query_bytes : cache_bytes, stream),
@@ -303,6 +317,8 @@ void CheckAttentionProjection(const void* weights, const __half* input,
   CheckHip(hipGraphExecDestroy(replay), "attention graph free");
   CheckHip(hipGraphDestroy(graph), "attention graph definition free");
   CheckHip(hipStreamDestroy(stream), "attention stream free");
+  std::cout << "fused attention projection yarn=" << yarn.enabled
+            << ": exact against PrepareAttention, including replay\n";
 }
 
 void CheckHcDownProjection(const void* w, const void* tiled,
@@ -666,6 +682,10 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
     CheckAttentionProjection(d_w, d_x_half, d_f16,
                              static_cast<std::uint32_t>(batch),
                              m == 13312 ? 24 : 12, m == 13312 ? 2 : 1);
+    CheckAttentionProjection(
+        d_w, d_x_half, d_f16, static_cast<std::uint32_t>(batch), 24, 2,
+        gufo::models::qwen38_flash_next::MakeYarnRope(
+            {.factor = 2.5F, .original_context = 262144}, 64, 1e7F));
   }
   (void)hipFree(d_w);
   (void)hipFree(d_x);

@@ -7,6 +7,7 @@ add_library(gufo_qwen38_flash_next STATIC
   config.cpp
   continuation_layout.cpp
   ngram.cpp
+  rope_scaling.cpp
   weights.cpp
   distributed/rdma_gid.cpp
   distributed/tp_partition.cpp)

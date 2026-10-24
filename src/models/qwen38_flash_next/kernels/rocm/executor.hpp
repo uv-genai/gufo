@@ -132,6 +132,7 @@ public:
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt,
                        std::shared_ptr<qwen::vision::Encoder> encoder,
                        hipStream_t stream);
+  void PrepareVision(hipStream_t stream);
   void RestoreVisionLayout(const qwen::vision::RopeLayout& layout,
                            hipStream_t stream);
   [[nodiscard]] const qwen::vision::RopeLayout& VisionLayout() const noexcept {
@@ -268,11 +269,14 @@ public:
     /// Called once the stream has drained after sums were queued: false with
     /// the first failure among them. Required with all_reduce under TP.
     std::function<bool(std::string*)> reduce_status;
-    /// Diagnostic observer called with every MoE input and, under TP, every
+    /// Diagnostic observer called with every MoE input, and under TP, every
     /// reduced MoE output, in forward order: a device buffer of rows x hidden
     /// floats pending on the given stream. Null in production; probes set it
     /// to compare ranks layer by layer.
     std::function<void(const float*, std::size_t, hipStream_t)> moe_observer;
+    /// Largest session context. Zero selects the native context; values
+    /// above it require YaRN (Config::MaxContextLength()).
+    std::uint32_t max_context{0};
   };
 
   /// The two-rank all-reduce over `communicator` for rows of `hidden` floats,
@@ -367,7 +371,7 @@ public:
     std::int32_t* token{nullptr};
     MtpCandidateLogits* candidates{nullptr};
     MtpTrace* trace{nullptr};  ///< final-row diagnostic; disables graph capture
-    /// Prefill needs only persistent KV. A subsequent full forward with
+    /// Prefill and headless steps need only persistent KV. A full forward with
     /// known trunk hidden rows is required before heads/recursive proposals.
     bool kv_only{false};
     /// Draft through the small head (the output() prefix plus the
@@ -382,6 +386,7 @@ public:
     Session* session;
     std::span<const std::int32_t> tokens;
     std::int32_t hidden_row;
+    bool kv_only{false};
   };
   /// Copies output() rows `ids` into the session's draft table from slot
   /// `first` on. Enqueued on stream(); never during graph capture.
@@ -411,6 +416,14 @@ public:
   /// Greedy verification keeps full logit rows on the GPU, including penalties.
   [[nodiscard]] bool GreedyMtpPredictions(
       std::span<ArgmaxCandidate> predictions,
+      const sampling::SamplerState& sampler,
+      std::span<const std::int32_t> drafts, std::string* error_msg) const;
+  [[nodiscard]] static bool CanCompactMtpVerification(
+      const sampling::SamplerState& sampler);
+  /// Candidate spans remain valid until this executor next verifies a
+  /// request. One transfer serves all rows; no full CPU rows are reconstructed.
+  [[nodiscard]] bool SampledMtpCandidates(
+      std::span<std::span<const sampling::LogitCandidate>> rows,
       const sampling::SamplerState& sampler,
       std::span<const std::int32_t> drafts, std::string* error_msg) const;
 
@@ -820,6 +833,12 @@ private:
   /// Shared transient storage, grown only for penalty-aware verification.
   mutable sampling::TokenPenalty* verification_penalties_{nullptr};
   mutable std::size_t verification_penalty_capacity_{0};
+  static constexpr std::size_t kCompactPenaltyLimit = 4096;
+  std::uint32_t* verification_ids_{nullptr};
+  std::uint32_t* verification_scratch_ids_{nullptr};
+  sampling::LogitCandidate* verification_candidates_{nullptr};
+  sampling::LogitCandidate* verification_candidates_host_{nullptr};
+  mutable std::vector<sampling::TokenPenalty> verification_penalty_host_;
   /// Allocated only when concurrent decoding is first requested.
   mutable float* batch_logits_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};
@@ -834,6 +853,11 @@ private:
     return selected_logits_ != nullptr ? selected_logits_ : s_.logits;
   }
   std::uint32_t mask_words_{0};
+  /// Session capacity the sparse-mask rows and score scratch are sized for:
+  /// max(native context, Options::max_context).
+  std::uint32_t context_capacity_{0};
+  /// YaRN constants every rope launch receives (disabled: original path).
+  YarnRope yarn_{};
   /// Bounded score scratch, shared by sequential selector chunks.
   std::size_t select_score_floats_{0};
   std::vector<void*> allocations_;

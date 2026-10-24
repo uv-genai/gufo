@@ -24,6 +24,7 @@ set(gufo_pr_targets
   qwen_tokenizer_test qwen_chat_template_test
   qwen27b_continuation_layout_test
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
+  qwen38_flash_next_rope_scaling_test
   qwen38_flash_next_continuation_layout_test
   qwen38_flash_next_tp_partition_test qwen38_flash_next_rdma_gid_test
   ds4_sampling_test ds4_chat_template_test ds4_cli_test
@@ -34,12 +35,13 @@ set(gufo_pr_targets
 set(gufo_pr_tests ${gufo_pr_targets})
 list(REMOVE_ITEM gufo_pr_tests
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
+  qwen38_flash_next_rope_scaling_test
   qwen38_flash_next_continuation_layout_test
   qwen38_flash_next_tp_partition_test qwen38_flash_next_rdma_gid_test
   ds4_sampling_test ds4_chat_template_test ds4_cli_test)
 list(APPEND gufo_pr_tests
   "qwen38_flash_next\\.config" "qwen38_flash_next\\.mtp_sampling"
-  "qwen38_flash_next\\.continuation_layout"
+  "qwen38_flash_next\\.rope_scaling" "qwen38_flash_next\\.continuation_layout"
   "qwen38_flash_next\\.tp_partition" "qwen38_flash_next\\.rdma_gid"
   "ds4\\.sampling" "ds4\\.template" "ds4\\.cli"
   gufo_version gufo_help serve_cli_test eval_http_test functional_runner_test
