@@ -201,7 +201,7 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
   }
   // A rejected geometry must not touch any pointer.
   if (q::DenseF16SsmGemm(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                         1023, m, k, channels, 4, nullptr) ||
+                         0, m, k, channels, 4, nullptr) ||
       q::DenseF16SsmGemm(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                          batch, m, k, channels, 3, nullptr)) {
     throw std::runtime_error("SSM projection accepted an unsupported shape");
@@ -653,7 +653,7 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
             << worst_f16_vs_mmq << ", worst |W8A8 - F64| " << worst_vs_ref
             << ", worst |F16 - F64| " << worst_f16 << " (reference scale "
             << ref_scale << ")\n";
-  if ((m == 16384 || m == 8192) && k == 2560 && batch >= 1024) {
+  if ((m == 16384 || m == 8192) && k == 2560 && batch > 8) {
     CheckSsmProjection(d_w, d_x_half, d_f16, f16,
                        static_cast<std::uint32_t>(batch), m == 16384 ? 16 : 8,
                        m == 16384 ? 48 : 24);
@@ -662,7 +662,7 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
     CheckHcDownProjection(d_w, d_tiled, d_w8,
                           static_cast<std::uint32_t>(batch));
   }
-  if ((m == 13312 || m == 6656) && k == 2560 && batch >= 1024) {
+  if ((m == 13312 || m == 6656) && k == 2560 && batch > 8) {
     CheckAttentionProjection(d_w, d_x_half, d_f16,
                              static_cast<std::uint32_t>(batch),
                              m == 13312 ? 24 : 12, m == 13312 ? 2 : 1);
@@ -946,6 +946,10 @@ int main() {
     CheckSmallProjection(q::WeightType::kF32, 513, 2560);
     CheckSmallProjection(q::WeightType::kF32, 96, 2560);
     CheckSmallProjection(q::WeightType::kBF16, 129, 2560);
+    CheckSmallProjection(q::WeightType::kF16, 513, 2560);
+    CheckSmallProjection(q::WeightType::kF16, 96, 2560);
+    CheckSmallProjection(q::WeightType::kBF16, 128, 2560);
+    CheckSmallProjection(q::WeightType::kBF16, 512, 2560);
     CheckSmallProjection(q::WeightType::kF16, 7, 131);
     CheckDecodeGrouping(64, 2560);
     CheckDecodeGrouping(320, 10240);
@@ -974,6 +978,13 @@ int main() {
     ok = Run(2049, 13312, 2560, 0x13312256U, 2) < 1e-2 && ok;
     // A TP rank's attention heads: 12 query heads over one KV head.
     ok = Run(2049, 6656, 2560, 0x6656256U, 2) < 1e-2 && ok;
+    // Every prefill pass wider than a vector batch fuses these projections:
+    // one partial 32-token tile, a ragged 128-token tile and a mid-size pass.
+    for (const std::size_t batch : {9U, 33U, 470U}) {
+      const auto seed = static_cast<std::uint32_t>(batch);
+      ok = Run(batch, 16384, 2560, 0x16384000U + seed, 2) < 1e-2 && ok;
+      ok = Run(batch, 13312, 2560, 0x13312000U + seed, 2) < 1e-2 && ok;
+    }
     // HC up: the grouped grid, including the last partial token tile.
     ok = Run(2049, 10240, 320, 0x8A8A320U, 2) < 1e-2 && ok;
     // HC down fusion: its first supported batch and a partial final tile.
