@@ -7227,14 +7227,23 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
   // activation tile's read; the group must divide the tile count.
   const std::uint32_t tiles = 2 * (heads + kv_heads);
   if (yarn.enabled != 0) {
-    if (tiles % 4 != 0)
-      return false;
-    hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 1, 8, 1, 4, false, false,
-                                           true, false, false, false, true>),
-                       dim3((n_tokens + 127) / 128, tiles), dim3(kThreads), 0,
-                       stream, weights, input, nullptr, n_tokens, tiles * 256,
-                       2560, nullptr, nullptr, nullptr, nullptr, nullptr,
-                       output);
+    // Same group-4 / group-2 split as the un-scaled path: a TP rank's 26
+    // tiles use two row groups so yarn and half-width heads compose.
+    if (tiles % 4 == 0) {
+      hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 1, 8, 1, 4, false, false,
+                                             true, false, false, false, true>),
+                         dim3((n_tokens + 127) / 128, tiles), dim3(kThreads), 0,
+                         stream, weights, input, nullptr, n_tokens, tiles * 256,
+                         2560, nullptr, nullptr, nullptr, nullptr, nullptr,
+                         output);
+    } else {
+      hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 1, 8, 1, 2, false, false,
+                                             true, false, false, false, true>),
+                         dim3((n_tokens + 127) / 128, tiles), dim3(kThreads), 0,
+                         stream, weights, input, nullptr, n_tokens, tiles * 256,
+                         2560, nullptr, nullptr, nullptr, nullptr, nullptr,
+                         output);
+    }
     return true;
   }
   if (tiles % 4 == 0) {
@@ -7250,7 +7259,6 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
         input, nullptr, n_tokens, tiles * 256, 2560, nullptr, nullptr, nullptr,
         nullptr, nullptr, output);
   }
-  return true;
   return true;
 }
 
