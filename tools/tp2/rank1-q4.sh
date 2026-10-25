@@ -24,4 +24,6 @@ exec "$GUFO" serve llm \
   --tp-control-port 18516 \
   --tp-control-token 92ffa404804d336980d95f224d6bd678 \
   --tp-rdma-device "$RDEV" \
-  --sessions "${SESSIONS:-4}"
+  --sessions "${SESSIONS:-2}" \
+  --context "${CONTEXT:-524288}" \
+  --enable-yarn
