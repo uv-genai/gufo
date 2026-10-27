@@ -15,6 +15,9 @@ std::vector<float> DequantizeTensor(const TensorRef& t) {
   const std::uint64_t n = t.ElementCount();
   if (n == 0)
     return {};
+  // Defensive: cap element count to prevent huge allocations.
+  if (n > 100000000)
+    return {};
   std::vector<float> out(n);
 
   if (t.type == core::GgmlType::kF32) {
@@ -92,62 +95,94 @@ std::shared_ptr<CpuEngine> CpuEngine::Create(const Config& config,
   const std::uint32_t n_layers = config.num_layers;
   engine->layer_cache_.resize(n_layers);
 
+  // Defensive: check if weights have layers.
+  if (weights.layers.empty()) {
+    if (error_msg)
+      *error_msg = "weights.layers is empty";
+    return engine;  // Return with empty cache.
+  }
+
+  // Defensive: check tensor data pointers before dequantizing.
+  auto safe_dequant = [](const TensorRef& t) -> std::vector<float> {
+    if (t.empty() || t.data == nullptr)
+      return {};
+    return DequantizeTensor(t);
+  };
+
   for (std::uint32_t i = 0; i < n_layers && i < weights.layers.size(); ++i) {
     const auto& L = weights.layers[i];
     auto& cache = engine->layer_cache_[i];
 
+    // Skip empty layers (defensive).
+    if (L.attn_norm.empty() && L.ffn_norm.empty()) {
+      continue;
+    }
+
     if (config.IsFullAttention(i)) {
       // MLA layer.
-      cache.mla.q_a = DequantizeTensor(L.mla.q_a);
-      cache.mla.q_a_norm = DequantizeTensor(L.mla.q_a_norm);
-      cache.mla.q_b = DequantizeTensor(L.mla.q_b);
-      cache.mla.kv_a_mqa = DequantizeTensor(L.mla.kv_a_mqa);
-      cache.mla.kv_a_norm = DequantizeTensor(L.mla.kv_a_norm);
-      cache.mla.k_b = DequantizeTensor(L.mla.k_b);
-      cache.mla.v_b = DequantizeTensor(L.mla.v_b);
-      cache.mla.output = DequantizeTensor(L.mla.output);
+      cache.mla.q_a = safe_dequant(L.mla.q_a);
+      cache.mla.q_a_norm = safe_dequant(L.mla.q_a_norm);
+      cache.mla.q_b = safe_dequant(L.mla.q_b);
+      cache.mla.kv_a_mqa = safe_dequant(L.mla.kv_a_mqa);
+      cache.mla.kv_a_norm = safe_dequant(L.mla.kv_a_norm);
+      cache.mla.k_b = safe_dequant(L.mla.k_b);
+      cache.mla.v_b = safe_dequant(L.mla.v_b);
+      cache.mla.output = safe_dequant(L.mla.output);
     } else {
       // KDA layer.
-      cache.kda = ToKdaF32(L);
+      cache.kda.w_q = safe_dequant(L.mla.q_a);
+      cache.kda.w_k = safe_dequant(L.mla.k_b);
+      cache.kda.w_v = safe_dequant(L.mla.v_b);
+      cache.kda.w_out = safe_dequant(L.mla.output);
+      cache.kda.f_a = safe_dequant(L.kda.f_a);
+      cache.kda.f_b = safe_dequant(L.kda.f_b);
+      cache.kda.dt_bias = safe_dequant(L.kda.dt_bias);
+      cache.kda.ssm_a = safe_dequant(L.kda.a);
+      cache.kda.ssm_beta = safe_dequant(L.kda.beta);
+      cache.kda.g_a = safe_dequant(L.kda.g_a);
+      cache.kda.g_b = safe_dequant(L.kda.g_b);
+      cache.kda.ssm_norm = safe_dequant(L.kda.norm);
     }
 
     // mHC (all layers except MTP).
     if (!config.IsMtpLayer(i)) {
-      cache.mhc_attn = ToMhcF32(L.hc);
-      cache.mhc_ffn = ToMhcF32(L.hc);  // Same weights for both halves.
+      cache.mhc_attn.fn = safe_dequant(L.hc.attn_fn);
+      cache.mhc_attn.scale = safe_dequant(L.hc.attn_scale);
+      cache.mhc_attn.base = safe_dequant(L.hc.attn_base);
+      cache.mhc_ffn = cache.mhc_attn;  // Same weights for both halves.
     }
 
     // FFN.
     if (config.IsDenseFfn(i)) {
       // Dense FFN.
-      cache.moe.gate_shexp = DequantizeTensor(L.dense.gate);
-      cache.moe.up_shexp = DequantizeTensor(L.dense.up);
-      cache.moe.down_shexp = DequantizeTensor(L.dense.down);
+      cache.moe.gate_shexp = safe_dequant(L.dense.gate);
+      cache.moe.up_shexp = safe_dequant(L.dense.up);
+      cache.moe.down_shexp = safe_dequant(L.dense.down);
     } else {
       // MoE.
-      cache.moe.gate_inp = DequantizeTensor(L.moe.gate_inp);
-      cache.moe.exp_probs_b = DequantizeTensor(L.moe.exp_probs_b);
-      cache.moe.gate_exps = DequantizeTensor(L.moe.gate_exps);
-      cache.moe.up_exps = DequantizeTensor(L.moe.up_exps);
-      cache.moe.down_exps = DequantizeTensor(L.moe.down_exps);
-      cache.moe.gate_shexp = DequantizeTensor(L.moe.gate_shexp);
-      cache.moe.up_shexp = DequantizeTensor(L.moe.up_shexp);
-      cache.moe.down_shexp = DequantizeTensor(L.moe.down_shexp);
+      cache.moe.gate_inp = safe_dequant(L.moe.gate_inp);
+      cache.moe.exp_probs_b = safe_dequant(L.moe.exp_probs_b);
+      cache.moe.gate_exps = safe_dequant(L.moe.gate_exps);
+      cache.moe.up_exps = safe_dequant(L.moe.up_exps);
+      cache.moe.down_exps = safe_dequant(L.moe.down_exps);
+      cache.moe.gate_shexp = safe_dequant(L.moe.gate_shexp);
+      cache.moe.up_shexp = safe_dequant(L.moe.up_shexp);
+      cache.moe.down_shexp = safe_dequant(L.moe.down_shexp);
     }
   }
 
   // Embeddings.
-  engine->token_embd_ = DequantizeTensor(weights.token_embd);
-  engine->output_head_ = DequantizeTensor(weights.output);
-  engine->output_norm_ = DequantizeTensor(weights.output_norm);
+  engine->token_embd_ = safe_dequant(weights.token_embd);
+  engine->output_head_ = safe_dequant(weights.output);
+  engine->output_norm_ = safe_dequant(weights.output_norm);
 
   // MTP.
   if (config.nextn_layers > 0 && !weights.layers.empty()) {
     const auto& mtp = weights.layers[weights.layers.size() - 1].mtp_weights;
-    engine->mtp_.enorm = DequantizeTensor(mtp.enorm);
-    engine->mtp_.hnorm = DequantizeTensor(mtp.hnorm);
-    engine->mtp_.eh_proj = DequantizeTensor(mtp.eh_proj);
-    engine->mtp_.shared_head_norm = DequantizeTensor(mtp.shared_head_norm);
+    engine->mtp_.enorm = safe_dequant(mtp.enorm);
+    engine->mtp_.hnorm = safe_dequant(mtp.hnorm);
+    engine->mtp_.eh_proj = safe_dequant(mtp.eh_proj);
+    engine->mtp_.shared_head_norm = safe_dequant(mtp.shared_head_norm);
     engine->mtp_.output_head = engine->output_head_;  // Shared.
   }
 

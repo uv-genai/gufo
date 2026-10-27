@@ -47,6 +47,7 @@
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/glm5_next/chat_template.hpp"
+#include "src/models/glm5_next/cpu_engine.hpp"
 #include "src/models/glm5_next/engine.hpp"
 #include "src/models/qwen/continuation_adapter.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
@@ -3351,7 +3352,26 @@ public:
                  std::uint32_t max_context)
       : model_(std::move(model)),
         tokenizer_(std::move(tokenizer)),
-        max_context_(max_context) {}
+        max_context_(max_context) {
+    Logger::Info("glm5", "event=runner_constructor_done");
+  }
+
+  // Lazy CpuEngine creation.
+  [[nodiscard]] std::shared_ptr<models::glm5_next::CpuEngine> GetCpuEngine()
+      const {
+    if (!cpu_engine_) {
+      Logger::Info("glm5", "event=lazy_cpu_engine_create");
+      try {
+        cpu_engine_ = models::glm5_next::CpuEngine::Create(
+            model_->GetConfig(), model_->GetWeights());
+        Logger::Info("glm5", "event=lazy_cpu_engine_done");
+      } catch (const std::exception& e) {
+        Logger::Warn("glm5",
+                     std::string("CpuEngine create failed: ") + e.what());
+      }
+    }
+    return cpu_engine_;
+  }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
@@ -3468,20 +3488,26 @@ public:
   [[nodiscard]] TextPrefillStep Prefill(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t max_input_tokens) const override {
-    (void)state;
-    (void)prompt;
-    (void)offset;
-    (void)max_input_tokens;
-    // TODO: Wire GPU inference path.
-    return TextPrefillStep{.consumed_tokens = 0, .decode_ready = true};
+    auto& s = dynamic_cast<Glm5TextRunnerState&>(state);
+    std::vector<std::uint32_t> tokens(prompt.begin(), prompt.end());
+    s.set_tokens(tokens);
+    s.set_position(prompt.size());
+    // TODO: Wire CpuEngine/GPU inference. For now, accept prefill.
+    return TextPrefillStep{.consumed_tokens = prompt.size(),
+                           .decode_ready = true};
   }
 
   [[nodiscard]] TextDecodeSelection SelectNext(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
-    (void)state;
+    auto& s = dynamic_cast<Glm5TextRunnerState&>(state);
+    // TODO: Wire CpuEngine/GPU inference. For now, return a placeholder token.
     (void)sampler;
-    // TODO: Wire GPU inference path.
-    return TextDecodeSelection{.stop = true, .token = 0};
+    const std::uint32_t token = 154820;  // EOS token ID.
+    const std::vector<tokenization::TokenId> ids = {
+        static_cast<tokenization::TokenId>(token)};
+    const std::string piece =
+        tokenizer_ ? tokenizer_->Decode(ids) : std::string{};
+    return TextDecodeSelection{.stop = false, .token = token, .piece = piece};
   }
 
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
@@ -3499,6 +3525,7 @@ private:
   std::shared_ptr<models::glm5_next::Model> model_;
   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::uint32_t max_context_;
+  mutable std::shared_ptr<models::glm5_next::CpuEngine> cpu_engine_;
 };
 
 }  // namespace
