@@ -19,3 +19,13 @@ add_glm5_next_test(moe_oracle gufo_glm5_next "cpu")
 add_glm5_next_test(mla_oracle gufo_glm5_next "cpu")
 add_glm5_next_test(mtp_oracle gufo_glm5_next "cpu")
 add_glm5_next_test(cpu_engine gufo_glm5_next "cpu")
+
+if(ENGINE_ENABLE_HIP)
+  set(target glm5_next_kda_gpu_test)
+  add_executable(${target} kda_gpu_test.cpp)
+  target_link_libraries(${target} PRIVATE gufo_glm5_next_kernels gufo_glm5_next)
+  add_test(NAME glm5_next.kda_gpu COMMAND ${target})
+  set_tests_properties(glm5_next.kda_gpu PROPERTIES
+    LABELS "glm5_next;hip;gpu;gfx1151")
+  add_dependencies(glm5_next_tests ${target})
+endif()
