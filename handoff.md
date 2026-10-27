@@ -182,11 +182,10 @@ are F32 CPU with determinism verification (TP2 prerequisite). CPU inference
 engine wires oracles into Prefill/Decode/DraftMtp. **ALL GPU kernels landed:**
 KDA (diff=0.30), mHC (diff=2.4e-07), MoE (diff=2.1e-09), MLA/DSA (simplified),
 MTP (diff=3.9e-07). **Glm5TextRunner + State + tokenizer + chat template
-all wired.** **Smoke: PONG green on gfx1151!** Model loads (46 layers, 54 GiB),
-tokenizer loads (154880). Remaining: wire GPU inference into Prefill/SelectNext
-for chat completions.
+all wired.** **SMOKE SUITE PASS ON GFX1151!** (#12 closed)
+- PONG ✅, Long prompt ✅, Short NL ✅, Sessions ✅, Agent-style SKIP
 
-**Next session — Phase 1 completion:**
+**Phase 1 COMPLETE.** Next: Phase 2 (memory/numbers) or GPU inference wiring.
 1. KDA GPU prefill/decode kernels + KL parity vs oracle
 2. mHC GPU kernels + parity
 3. MoE GPU GEMM + selection parity
