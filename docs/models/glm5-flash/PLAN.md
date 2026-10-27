@@ -50,7 +50,7 @@ Maya is a **single-architecture engine** for large MoE “Flash” hybrids (orig
 - **Decode:** fused one-token HIP fast path (`glm_fast_*`); prefill chunked MMQ/hipBLASLt.
 - **MTP:** NextN drafts + verify window with **KDA state rollback** on reject.
 - **AMD:** `MAYA_ENABLE_HIP`, targets include **gfx1151**; custom HIP expert decode kernels; **complete-pool** mode when all experts fit (Skips disk/PCIe — deterministic).
-- **Measured Strix Halo (128 GB):** ~210 tok/s prefill (3–4K prompts), **~17.8 tok/s decode** with experts in GPU pool. Gorgon Halo 192 GB + MTP: ~28–30 tok/s answers.
+- **Measured Strix Halo (128 GB):** Maya docs ~210 tok/s prefill (3–4K prompts), **~17.8 tok/s decode** with experts in GPU pool. **User measurement (2026-10-27):** Maya installed on **`strix-halo-1.local`** (`/home/ugo/software/project-maya`, GLM Maya-S IQ2_XXS pack under `/home/ugo/software/Maya-data`), **~23 tok/s generation** on that host — the realistic baseline for a single APU with this engine. Gorgon Halo 192 GB + MTP: ~28–30 tok/s answers.
 - **Multi-GPU:** **layer split only** (64 KB host hop per boundary). **No tensor parallel.**
 
 ### 2.3 What Maya is *not* (for our purposes)
@@ -219,7 +219,7 @@ Invariant (from `TP2.md`): **same verbs all-reduces: order, count, bytes** on bo
 | | Maya single host | gufo `glm5_next` 1-host | gufo TP2 |
 | --- | --- | --- | --- |
 | Exists today | **yes** | no | no |
-| Strix Halo numbers | ~18 tg / ~210 pp (Maya-S) | unknown | unknown |
+| Strix Halo numbers | **~23 tg** user-measured (Maya-S, 2026-10-27); docs ~17.8 | unknown | unknown |
 | 2×128 GB | layer split only | n/a | **column-split TP2** |
 | Long context | 1M + streaming | plan 1M | **best memory story** |
 | Deterministic collectives | no | n/a | **yes (goal)** |
@@ -245,6 +245,7 @@ Invariant (from `TP2.md`): **same verbs all-reduces: order, count, bytes** on bo
 ## 9. References
 
 - Project Maya: https://github.com/mw00/project-maya · GLM quants: HF `peasantsmith/GLM-5.3-Flash-Maya-GGUF`
+- **Local install (user):** `/home/ugo/software/project-maya` on **strix-halo-1.local** (models under `/home/ugo/software/Maya-data/models/…`) — measured **~23 tok/s** gen on GLM Maya-S (2026-10-27). **Ops note:** Maya shares the APU with gufo rank0; stop it before any TP2 load (one GPU workload per host).
 - Maya docs: `docs/GLM5-FLASH.md` (gap study), `docs/AMD_MAYA.md`, `docs/AMD_EXPERT_KERNELS.md`, `docs/QUANT-PLAN.md`, `docs/GLM-KDA-GRAPHS.md`
 - Upstream model card: https://huggingface.co/zai-org/GLM-5.3-Flash
 - gufo: `docs/models/qwen3.8-flash-next/TP2.md`, `docs/MERGE-CHECKLIST.md`, `src/models/qwen38_flash_next/distributed/tp_partition.hpp`
