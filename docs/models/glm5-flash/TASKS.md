@@ -42,9 +42,9 @@ After re-reading PLAN.md against Maya’s GLM5-FLASH study and gufo TP2:
 
 | ID | Issue | Task | Depends | Done when |
 | --- | --- | --- | --- | --- |
-| T1.1 | [#5](https://github.com/uv-genai/gufo/issues/5) | `src/models/glm5_next/` skeleton: config, GGUF load, CMake, backend stub | T0.1 | Load reaches “model created”; geometry unit tests |
-| T1.2 | [#6](https://github.com/uv-genai/gufo/issues/6) | Tokenizer + chat template (`[gMASK]<sop>`, glm5 BPE) | T1.1 | Token-id + prompt golden tests |
-| T1.3 | [#7](https://github.com/uv-genai/gufo/issues/7) | **KDA** mixer prefill/decode + F32 oracle + parity | T1.1 | KL p99 gate; state determinism |
+| T1.1 | [#5](https://github.com/uv-genai/gufo/issues/5) | `src/models/glm5_next/` skeleton: config, GGUF load, CMake, backend stub | T0.1 | Load reaches “model created”; geometry unit tests | **Done** |
+| T1.2 | [#6](https://github.com/uv-genai/gufo/issues/6) | Tokenizer + chat template (`[gMASK]<sop>`, glm5 BPE) | T1.1 | Token-id + prompt golden tests | **Done** |
+| T1.3 | [#7](https://github.com/uv-genai/gufo/issues/7) | **KDA** mixer prefill/decode + F32 oracle + parity | T1.1 | KL p99 gate; state determinism | **Oracle done** (GPU pending) |
 | T1.4 | [#8](https://github.com/uv-genai/gufo/issues/8) | **mHC** Sinkhorn(20)/token + oracle | T1.1 | Parity + deterministic reruns |
 | T1.5 | [#9](https://github.com/uv-genai/gufo/issues/9) | Dense 0–2 + MoE sigmoid top-8 + noaux_tc + **selection parity** | T1.1 | Selection goldens; GEMM parity |
 | T1.6 | [#10](https://github.com/uv-genai/gufo/issues/10) | **MLA (expanded-KV)** + **DSA indexer** | T1.1 | Attention + indexer parity |
