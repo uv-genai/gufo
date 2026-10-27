@@ -21,12 +21,20 @@ After re-reading PLAN.md against Maya’s GLM5-FLASH study and gufo TP2:
 
 ## Phase 0 — contracts and decisions
 
-| ID | Issue | Task | Done when |
-| --- | --- | --- | --- |
-| T0.1 | [#3](https://github.com/uv-genai/gufo/issues/3) | GGUF tensor inventory + TP2 column-split alignment | Tensor map doc + split-alignment matrix per quant |
-| T0.2 | [#4](https://github.com/uv-genai/gufo/issues/4) | ADR: KDA split vs replicate; MLA expanded vs absorbed; router mirror; MTP policy | ADR section in this file with chosen options |
+| ID | Issue | Task | Done when | Status |
+| --- | --- | --- | --- | --- |
+| T0.1 | [#3](https://github.com/uv-genai/gufo/issues/3) | GGUF tensor inventory + TP2 column-split alignment | Tensor map doc + split-alignment matrix per quant | **Done** → [WEIGHTS.md](WEIGHTS.md) |
+| T0.2 | [#4](https://github.com/uv-genai/gufo/issues/4) | ADR: KDA split vs replicate; MLA expanded vs absorbed; router mirror; MTP policy | ADR section in this file with chosen options | |
 
 **Gate to Phase 1:** T0.1 + T0.2 complete.
+
+**Key T0.1 findings** (see [WEIGHTS.md](WEIGHTS.md) for full map):
+- **46 blocks** (0–45), not 45 — block 45 hosts NextN MTP, has **no mHC**.
+- **12 DSA layers** (3,7,…,43,**45**), **34 KDA** layers.
+- All quant types in Maya-S v2 pack are **GREEN** for TP2 column-split
+  (256-element blocks; inter=2048 → 1024/rank, dense 12288 → 6144/rank).
+- Per-rank TP2 weights: **~48 GiB** (41 experts split + 6.4 replicated).
+- Architecture metadata key: `glm5-next.*`; chat framing `[gMASK]<sop>`.
 
 ---
 
