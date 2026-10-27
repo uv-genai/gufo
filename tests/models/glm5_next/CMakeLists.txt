@@ -19,6 +19,7 @@ add_glm5_next_test(moe_oracle gufo_glm5_next "cpu")
 add_glm5_next_test(mla_oracle gufo_glm5_next "cpu")
 add_glm5_next_test(mtp_oracle gufo_glm5_next "cpu")
 add_glm5_next_test(cpu_engine gufo_glm5_next "cpu")
+add_glm5_next_test(serve_integration gufo_glm5_next "cpu")
 
 if(ENGINE_ENABLE_HIP)
   foreach(name IN ITEMS kda_gpu mhc_gpu moe_gpu mla_gpu mtp_gpu)
