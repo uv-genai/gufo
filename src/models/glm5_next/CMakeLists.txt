@@ -7,11 +7,13 @@ if(ENGINE_ENABLE_HIP)
     kernels/rocm/kda.cpp
     kernels/rocm/mla.cpp
     kernels/rocm/mhc.cpp
-    kernels/rocm/moe.cpp)
+    kernels/rocm/moe.cpp
+    kernels/rocm/mtp.cpp)
   set_source_files_properties(kernels/rocm/kda.cpp PROPERTIES LANGUAGE HIP)
   set_source_files_properties(kernels/rocm/mla.cpp PROPERTIES LANGUAGE HIP)
   set_source_files_properties(kernels/rocm/mhc.cpp PROPERTIES LANGUAGE HIP)
   set_source_files_properties(kernels/rocm/moe.cpp PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(kernels/rocm/mtp.cpp PROPERTIES LANGUAGE HIP)
   target_link_libraries(gufo_glm5_next_kernels PUBLIC gufo_core hip::host)
   target_include_directories(gufo_glm5_next_kernels PUBLIC
     ${PROJECT_SOURCE_DIR}/src
