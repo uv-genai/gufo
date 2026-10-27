@@ -171,7 +171,9 @@ user-measured **~23 tok/s gen** on Maya-S IQ2_XXS).
 **Phase 1 IN PROGRESS:**
 - **#6** ✅ Tokenizer + chat template. GLM4 pre-tokenizer (digit groups of 3, `ignore_merges`), `[gMASK]<sop>` framing, tools XML. 9 golden tests.
 - **#7** ✅ KDA F32 CPU oracle (`reference.{hpp,cpp}`). Prefill + decode + determinism. 7 tests. GPU kernels pending.
-- **#8–#12** remaining: mHC Sinkhorn oracle, MoE sigmoid top-8, MLA+DSA, NextN MTP, HTTP serve.
+- **#8** ✅ mHC Sinkhorn F32 CPU oracle (`mhc_reference.{hpp,cpp}`). Joint inverse-RMS, Sinkhorn 20 iters. 7 tests.
+- **#9** ✅ MoE sigmoid top-8 noaux_tc oracle (`moe_reference.{hpp,cpp}`). Selection parity. 8 tests.
+- **#10–#12** remaining: MLA+DSA oracle, NextN MTP, HTTP serve.
 
 **Next session — Phase 1 remaining issues in order:**
 1. **[#6](https://github.com/uv-genai/gufo/issues/6)** — Tokenizer + chat template (`[gMASK]<sop>`, glm5 BPE)
