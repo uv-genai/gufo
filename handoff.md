@@ -177,10 +177,11 @@ user-measured **~23 tok/s gen** on Maya-S IQ2_XXS).
 - **#11** ✅ NextN MTP oracle (6 tests) — GPU kernels pending
 - **#12** ⏳ HTTP serve adapter — **blocked on GPU kernels** (needs #7–#11 GPU)
 
-**Total: 11 test suites (8 CPU + 3 GPU), 60 tests, all green.** All oracles
+**Total: 12 test suites (8 CPU + 4 GPU), 63 tests, all green.** All oracles
 are F32 CPU with determinism verification (TP2 prerequisite). CPU inference
 engine wires oracles into Prefill/Decode/DraftMtp. **KDA GPU** (diff=0.30),
-**mHC GPU** (diff=2.4e-07), **MoE GPU** (diff=2.1e-09) all landed with parity tests.
+**mHC GPU** (diff=2.4e-07), **MoE GPU** (diff=2.1e-09), **MLA/DSA GPU**
+(simplified path, finite output) all landed with parity tests.
 
 **Next session — remaining GPU kernels:**
 1. KDA GPU prefill/decode kernels + KL parity vs oracle
