@@ -74,7 +74,11 @@ Published one-host tables stay under
 ### Agent benchmark (DeepSWE 1.1)
 
 TP2 Q8 was scored end-to-end on **DeepSWE 1.1**: **90/113 solved (79.6%)**
-(`gufo-qwen3.8-flash-next-tp2-q8`, 2026-10-26).
+(`gufo-qwen3.8-flash-next-tp2-q8`, 2026-10-26). As of that date this is
+**above every model on the official
+[DeepSWE leaderboard](https://deepswe.datacurve.ai/)** (113-task v1.1,
+Pass@1; the site tops out at **74%** among frontier APIs such as GPT-6,
+Claude Opus 5, and Gemini 3.8).
 [Final report](https://github.com/uv-genai/deepswe-run/blob/main/reports/final-report-2026-10-26.md)
 · [runs](https://github.com/uv-genai/deepswe-run).
 
