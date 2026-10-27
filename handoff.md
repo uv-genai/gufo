@@ -6,7 +6,7 @@ redirect until that copy is removed).
 **When state changes** (merge, tag, push, script/config change, incident): **replace
 or edit this file in full** — do not leave stale tips, shas, or “untested” claims.
 
-Last updated: **2026-10-27** (session: v0.25.0 + DeepSWE README; **GLM-5.3-Flash planning done — issues created, implementation NOT started**).
+Last updated: **2026-10-27** (session: GLM-5.3-Flash **Phase 0 complete + Phase 1 skeleton**; issues #3/#4/#5 closed).
 
 ---
 
@@ -148,7 +148,7 @@ passed (2026-10-27); GPU hosts should be **clear of `gufo`** between runs.
 
 ---
 
-## 8. Active workstream: GLM-5.3-Flash (next session starts implementation)
+## 8. Active workstream: GLM-5.3-Flash (Phase 0 done, Phase 1 started)
 
 **Goal:** GLM-5.3-Flash (`glm5-next`) on **one Strix Halo** and **TP2 two-host**, inspired by
 [mw00/project-maya](https://github.com/mw00/project-maya) (already installed on **strix-halo-1.local**
@@ -158,18 +158,35 @@ user-measured **~23 tok/s gen** on Maya-S IQ2_XXS).
 | Artifact | Location |
 | --- | --- |
 | Design study | `docs/models/glm5-flash/PLAN.md` |
-| Detailed task plan | `docs/models/glm5-flash/TASKS.md` (issue map + ADR stubs) |
+| Detailed task plan | `docs/models/glm5-flash/TASKS.md` (issue map + **ADRs filled**) |
+| **Tensor map** | `docs/models/glm5-flash/WEIGHTS.md` (full inventory + split-alignment) |
 | Tracking issue | **[uv-genai/gufo#2](https://github.com/uv-genai/gufo/issues/2)** |
-| Issue labels | `glm5`, `phase-0`…`phase-4`, `tp2` |
+| Skeleton code | `src/models/glm5_next/` (config, weights, engine, CMake) |
 
-**Next session should start at Phase 0: issues #3 (GGUF inventory) then #4 (ADRs), then #5 skeleton.**
-Work order and gates are in `TASKS.md`. Do **not** jump to kernels before #3/#4 close.
+**Phase 0 COMPLETE (2026-10-27):**
+- **#3** ✅ GGUF tensor map → `WEIGHTS.md`. 46 blocks (not 45!), 12 DSA layers, all quants **GREEN** for TP2 column-split. Per-rank TP2 weights: ~48 GiB.
+- **#4** ✅ ADRs in `TASKS.md`. KDA full replica; expanded-KV MLA first; router piggyback on TP control; fixed MTP width; mHC Sinkhorn per-forward (confirmed vs llama.cpp `272aad8b`).
+- **#5** ✅ `glm5_next` skeleton → `src/models/glm5_next/`. Config/weights/engine + serve dispatch. 6 CPU tests pass. Decode not yet wired.
 
-**GLM highlights (short):** 321B/18B active, 45×4096, KDA + NoPE-MLA/DSA (11 attn), mHC+Sinkhorn,
-288×top-8 MoE (sigmoid), 1M ctx, NextN MTP. TP2 = gufo `TpPartition` column split; **mirror top-8
+**Next session — Phase 1 remaining issues in order:**
+1. **[#6](https://github.com/uv-genai/gufo/issues/6)** — Tokenizer + chat template (`[gMASK]<sop>`, glm5 BPE)
+2. **[#7](https://github.com/uv-genai/gufo/issues/7)** — **KDA** mixer prefill/decode + F32 oracle + parity
+3. **[#8](https://github.com/uv-genai/gufo/issues/8)** — **mHC** Sinkhorn(20)/token + oracle
+4. **[#9](https://github.com/uv-genai/gufo/issues/9)** — Dense 0–2 + MoE sigmoid top-8 + noaux_tc + selection parity
+5. **[#10](https://github.com/uv-genai/gufo/issues/10)** — **MLA (expanded-KV)** + **DSA indexer**
+6. **[#11](https://github.com/uv-genai/gufo/issues/11)** — **NextN MTP** + verify window (KDA rollback)
+7. **[#12](https://github.com/uv-genai/gufo/issues/12)** — HTTP serve adapter + smoke suite
+
+**Key geometry (from real GGUF):** 46 blocks (0–45), hidden 4096, 34 KDA + 12 DSA
+(layers 3,7,…,43,**45**). Block 45 = MLA+DSA + MoE + NextN MTP, **no mHC**.
+288+1 experts top-8 inter 2048 (sigmoid, noaux_tc, ×2.5), mHC 4-stream Sinkhorn-20.
+Quant: IQ2_XXS gate/up, IQ2_S/IQ3_XXS down (varies by layer), Q6_K attention/shared.
+
+**GLM highlights (short):** 321B/18B active, 45×4096, KDA + NoPE-MLA/DSA (12 attn),
+mHC+Sinkhorn, 288×top-8 MoE (sigmoid), 1M ctx, NextN MTP. TP2 = gufo `TpPartition` column split; **mirror top-8
 expert ids from rank 0** (new hazard). No Maya-style offload under TP.
 
-**Local GGUFs for #3:** `/home/ugo/software/Maya-data/models/Maya-S-v2-IQ2_XXS/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-0000{1,2,3}-of-00003.gguf` on strix-halo-1.
+**Local GGUFs:** `/home/ugo/software/Maya-data/models/Maya-S-v2-IQ2_XXS/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-0000{1,2,3}-of-00003.gguf` on strix-halo-1.
 
 ## 9. How this session should use the file
 
