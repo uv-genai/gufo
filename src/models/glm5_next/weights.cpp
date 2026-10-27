@@ -289,28 +289,28 @@ bool LoadWeights(const core::GgufReader& gguf, const Config& config,
       }
     } else {
       // KDA.
-      const std::uint32_t qkv = 2 * nh * kd;  // Q+K per-head dim (8192).
+      const std::uint32_t inner = nh * kd;  // 64*128=8192 per stream.
       if (!Bind(gguf, config, prefix + "ssm_a", nh, 1, 1, &L.kda.a,
                 error_msg) ||
           !Bind(gguf, config, prefix + "ssm_norm.weight", kd, 1, 1, &L.kda.norm,
                 error_msg) ||
           !Bind(gguf, config, prefix + "ssm_conv1d_q.weight",
-                config.kda_conv_kernel, 1, qkv, &L.kda.conv1d_q, error_msg) ||
+                config.kda_conv_kernel, 1, inner, &L.kda.conv1d_q, error_msg) ||
           !Bind(gguf, config, prefix + "ssm_conv1d_k.weight",
-                config.kda_conv_kernel, 1, qkv, &L.kda.conv1d_k, error_msg) ||
+                config.kda_conv_kernel, 1, inner, &L.kda.conv1d_k, error_msg) ||
           !Bind(gguf, config, prefix + "ssm_conv1d_v.weight",
-                config.kda_conv_kernel, 1, qkv, &L.kda.conv1d_v, error_msg) ||
-          !Bind(gguf, config, prefix + "ssm_dt.bias", qkv, 1, 1, &L.kda.dt_bias,
-                error_msg) ||
+                config.kda_conv_kernel, 1, inner, &L.kda.conv1d_v, error_msg) ||
+          !Bind(gguf, config, prefix + "ssm_dt.bias", inner, 1, 1,
+                &L.kda.dt_bias, error_msg) ||
           !Bind(gguf, config, prefix + "ssm_beta.weight", H, nh, 1, &L.kda.beta,
                 error_msg) ||
-          !Bind(gguf, config, prefix + "ssm_f_a.weight", H, 2 * kd, 1,
-                &L.kda.f_a, error_msg) ||
-          !Bind(gguf, config, prefix + "ssm_f_b.weight", 2 * kd, qkv, 1,
+          !Bind(gguf, config, prefix + "ssm_f_a.weight", H, kd, 1, &L.kda.f_a,
+                error_msg) ||
+          !Bind(gguf, config, prefix + "ssm_f_b.weight", kd, inner, 1,
                 &L.kda.f_b, error_msg) ||
-          !Bind(gguf, config, prefix + "ssm_g_a.weight", H, 2 * kd, 1,
-                &L.kda.g_a, error_msg) ||
-          !Bind(gguf, config, prefix + "ssm_g_b.weight", 2 * kd, qkv, 1,
+          !Bind(gguf, config, prefix + "ssm_g_a.weight", H, kd, 1, &L.kda.g_a,
+                error_msg) ||
+          !Bind(gguf, config, prefix + "ssm_g_b.weight", kd, inner, 1,
                 &L.kda.g_b, error_msg)) {
         return false;
       }

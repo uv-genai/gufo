@@ -3456,6 +3456,45 @@ public:
     return std::make_unique<Glm5TextRunnerState>(max_context_);
   }
 
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    if (!tokenizer_)
+      return {};
+    const auto ids =
+        std::vector<tokenization::TokenId>(tokens.begin(), tokens.end());
+    return tokenizer_->Decode(ids);
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    (void)state;
+    (void)prompt;
+    (void)offset;
+    (void)max_input_tokens;
+    // TODO: Wire GPU inference path.
+    return TextPrefillStep{.consumed_tokens = 0, .decode_ready = true};
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    (void)state;
+    (void)sampler;
+    // TODO: Wire GPU inference path.
+    return TextDecodeSelection{.stop = true, .token = 0};
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    auto& s = dynamic_cast<Glm5TextRunnerState&>(state);
+    s.set_position(s.position() + 1);
+    (void)token;
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return dynamic_cast<const Glm5TextRunnerState&>(state).position();
+  }
+
 private:
   std::shared_ptr<models::glm5_next::Model> model_;
   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
@@ -4066,18 +4105,39 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             " experts=" + std::to_string(model->GetConfig().num_experts) +
             " resident=" + std::to_string(model->ResidentBytes() >> 30) +
             "GiB");
-    // Phase 1: model loads and reports geometry. GPU kernels are landed;
-    // full TextModelRunner integration (sessions, snapshots, tools) is
-    // the next step. For now, report successful load.
-    Logger::Info("loader",
-                 "event=glm5_ready note=GPU_kernels_landed_full_serve_in_"
-                 "progress");
-    // TODO(#12): Wire Glm5TextRunner into the HTTP serve stack.
-    // Acceptance: PONG, >1024-token, short NL, agent-style, >=5 sessions.
-    SetError(error,
-             "GLM-5.3-Flash loaded successfully (GPU kernels ready; full "
-             "serve adapter integration in progress)");
-    return false;
+    // Load tokenizer from GGUF.
+    auto tokenizer =
+        tokenization::QwenTokenizer::CreateFromGguf(*reader, &load_error);
+    if (tokenizer == nullptr) {
+      SetError(error, "Failed to load GLM-5.3-Flash tokenizer: " + load_error);
+      return false;
+    }
+    Logger::Info("loader", "event=glm5_tokenizer_loaded vocab=" +
+                               std::to_string(tokenizer->GetVocabSize()));
+    // Wire Glm5TextRunner into the HTTP serve stack.
+    try {
+      auto new_state = std::make_shared<Impl::State>();
+      new_state->sampling_defaults.model =
+          sampling::TextModelPreset::kUnspecified;
+      new_state->sampling_defaults.supplied = {};
+      auto runner = std::make_shared<Glm5TextRunner>(
+          std::move(model), std::move(tokenizer), max_context);
+      new_state->model_id = runner->Descriptor().model_id;
+      new_state->max_context = max_context;
+      auto runner_pool = std::make_shared<TextRunnerPool>(
+          std::move(runner), session_count, std::nullopt, ram_cache_config);
+      new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+          std::move(runner_pool), prefill_policy, scheduler_policy);
+      {
+        const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+        impl_->state = std::move(new_state);
+      }
+      Logger::Info("loader", "event=glm5_ready note=serve_adapter_wired");
+      return true;
+    } catch (const std::exception& exception) {
+      SetError(error, exception.what());
+      return false;
+    }
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {

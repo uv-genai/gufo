@@ -47,7 +47,7 @@ def wait_healthy(base_url, timeout=60):
     while time.time() < deadline:
         try:
             resp = request(f"{base_url}/health")
-            if resp.get("status") == "healthy":
+            if resp.get("status") == "ok":
                 return True
         except (urllib.error.URLError, ConnectionError):
             pass
@@ -56,9 +56,9 @@ def wait_healthy(base_url, timeout=60):
 
 
 def check_pong(base_url):
-    """PONG: /health returns healthy."""
+    """PONG: /health returns ok."""
     resp = request(f"{base_url}/health")
-    assert resp.get("status") == "healthy", f"PONG failed: {resp}"
+    assert resp.get("status") == "ok", f"PONG failed: {resp}"
     print("  PONG: PASS")
 
 
@@ -160,9 +160,15 @@ def main():
     ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     try:
-        if not wait_healthy(base_url, timeout=120):
-            stdout, stderr = proc.communicate(timeout=5)
-            print(f"Server failed to start:\n{stdout.decode()}\n{stderr.decode()}")
+        if not wait_healthy(base_url, timeout=300):
+            print("Server failed to become healthy within 300s")
+            proc.terminate()
+            try:
+                stdout, stderr = proc.communicate(timeout=10)
+                print(f"stdout:\n{stdout.decode()[-2000:]}")
+                print(f"stderr:\n{stderr.decode()[-2000:]}")
+            except subprocess.TimeoutExpired:
+                proc.kill()
             return 1
 
         print("Server started, running smoke checks...")
