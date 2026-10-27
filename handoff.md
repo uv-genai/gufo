@@ -6,7 +6,7 @@ redirect until that copy is removed).
 **When state changes** (merge, tag, push, script/config change, incident): **replace
 or edit this file in full** — do not leave stale tips, shas, or “untested” claims.
 
-Last updated: **2026-10-27** (session: v0.24.0 requalify + tag).
+Last updated: **2026-10-27** (session: v0.25.0 requalify + tag; fork current with upstream latest).
 
 ---
 
@@ -30,8 +30,8 @@ Historical dated handoffs in `~/gufo-merge-handoff/HANDOFF-*.md` are **archive o
 | Branch | **`main`** |
 | Push | **`uv-genai` only** → https://github.com/uv-genai/gufo.git |
 | Upstream | `origin` → gufo-org/gufo; local track **`gufo-org`** — **never push** |
-| Tip | **`106ff0d0`** (`main` == `uv-genai/main` after last push) |
-| Upstream merged through | **v0.24.0** (`0f1bc87a` release); **v0.25.0** fetched not merged |
+| Tip | **`46eeaf28`** (`main` == `uv-genai/main` after last push) |
+| Upstream merged through | **v0.25.0** (`16e8ed47` release — latest at last fetch) |
 
 **Non-negotiables:** `grep -ci nix AGENTS.md` → **0**; never run that package
 manager; Conventional Commits; ask before any GPU launch.
@@ -43,8 +43,8 @@ manager; Conventional Commits; ask before any GPU launch.
 | | |
 | --- | --- |
 | Path | `build/release/gufo` on **both** hosts |
-| sha256 | **`85fa974cbb7669128416b4cdf8119286da905f225144470e0ff1a8ea8cd10661`** |
-| Built from | `106ff0d0` (v0.24.0 + YaRN group-2 fused attention) |
+| sha256 | **`3d6457e93d56f41a6dd0cd2d27eddf7018e31d46a7c9c2368c99875486eac46f`** |
+| Built from | `46eeaf28` (v0.25.0) |
 | Configure | three host flags in `AGENTS.md` (HIP compiler + `-include format`) |
 
 **TP2 serve defaults** (all four `tools/tp2/rank{0,1}-{q4,q8}.sh`):
@@ -121,7 +121,7 @@ Prompt lookup type: **`speculative::PromptLookup<>`** (moved in v0.22), payload 
 6. **User llama-swap** validation (Q8-tp2).
 7. Tag `tp2-rdma-merge-vX.Y.Z-<YYYY-MM-DD>`; push **uv-genai only**.
 
-Dated tags: v0.16.0-2026-10-17 … **v0.24.0-2026-10-27**. Next: v0.25.0.
+Dated tags: v0.16.0-2026-10-17 … **v0.25.0-2026-10-27**. Fork is current with upstream as of last fetch.
 
 ---
 
