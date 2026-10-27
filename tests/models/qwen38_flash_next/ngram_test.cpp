@@ -12,8 +12,8 @@
 #include <system_error>
 #include <vector>
 
-#include "src/core/quant/ggml_dequant.hpp"
 #include "src/core/platform/fs.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 #include "tests/support/temporary_directory.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
