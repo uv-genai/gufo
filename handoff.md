@@ -6,7 +6,7 @@ redirect until that copy is removed).
 **When state changes** (merge, tag, push, script/config change, incident): **replace
 or edit this file in full** — do not leave stale tips, shas, or “untested” claims.
 
-Last updated: **2026-10-27** (session: v0.25.0 tagged; DeepSWE README blurb; standalone Q4 smoke; docs pushed).
+Last updated: **2026-10-27** (session: v0.25.0 + DeepSWE README; **GLM-5.3-Flash planning done — issues created, implementation NOT started**).
 
 ---
 
@@ -30,7 +30,7 @@ Historical dated handoffs in `~/gufo-merge-handoff/HANDOFF-*.md` are **archive o
 | Branch | **`main`** |
 | Push | **`uv-genai` only** → https://github.com/uv-genai/gufo.git |
 | Upstream | `origin` → gufo-org/gufo; local track **`gufo-org`** — **never push** |
-| Tip | **`9ec07407`** (`main` == `uv-genai/main` after last push) |
+| Tip | **`3ec5fe1f`** (`main` == `uv-genai/main` after last push) |
 | Upstream merged through | **v0.25.0** (`16e8ed47` release — latest at last fetch) |
 
 **Non-negotiables:** `grep -ci nix AGENTS.md` → **0**; never run that package
@@ -148,7 +148,30 @@ passed (2026-10-27); GPU hosts should be **clear of `gufo`** between runs.
 
 ---
 
-## 8. How this session should use the file
+## 8. Active workstream: GLM-5.3-Flash (next session starts implementation)
+
+**Goal:** GLM-5.3-Flash (`glm5-next`) on **one Strix Halo** and **TP2 two-host**, inspired by
+[mw00/project-maya](https://github.com/mw00/project-maya) (already installed on **strix-halo-1.local**
+at `/home/ugo/software/project-maya`, models in `/home/ugo/software/Maya-data`,
+user-measured **~23 tok/s gen** on Maya-S IQ2_XXS).
+
+| Artifact | Location |
+| --- | --- |
+| Design study | `docs/models/glm5-flash/PLAN.md` |
+| Detailed task plan | `docs/models/glm5-flash/TASKS.md` (issue map + ADR stubs) |
+| Tracking issue | **[uv-genai/gufo#2](https://github.com/uv-genai/gufo/issues/2)** |
+| Issue labels | `glm5`, `phase-0`…`phase-4`, `tp2` |
+
+**Next session should start at Phase 0: issues #3 (GGUF inventory) then #4 (ADRs), then #5 skeleton.**
+Work order and gates are in `TASKS.md`. Do **not** jump to kernels before #3/#4 close.
+
+**GLM highlights (short):** 321B/18B active, 45×4096, KDA + NoPE-MLA/DSA (11 attn), mHC+Sinkhorn,
+288×top-8 MoE (sigmoid), 1M ctx, NextN MTP. TP2 = gufo `TpPartition` column split; **mirror top-8
+expert ids from rank 0** (new hazard). No Maya-style offload under TP.
+
+**Local GGUFs for #3:** `/home/ugo/software/Maya-data/models/Maya-S-v2-IQ2_XXS/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-0000{1,2,3}-of-00003.gguf` on strix-halo-1.
+
+## 9. How this session should use the file
 
 1. **Start of session:** read this file; do not rely on old `SESSION-PROMPT-*` or
    `HANDOFF-2026-*.md` under `~/gufo-merge-handoff/` unless explicitly asked for
