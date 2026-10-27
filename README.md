@@ -71,6 +71,13 @@ Method, raw logs and Q8 depth series:
 Published one-host tables stay under
 [docs/models](docs/models/README.md).
 
+### Agent benchmark (DeepSWE 1.1)
+
+TP2 Q8 was scored end-to-end on **DeepSWE 1.1**: **90/113 solved (79.6%)**
+(`gufo-qwen3.8-flash-next-tp2-q8`, 2026-10-26).
+[Final report](https://github.com/uv-genai/deepswe-run/blob/main/reports/final-report-2026-10-26.md)
+· [runs](https://github.com/uv-genai/deepswe-run).
+
 ## Models and benchmarks
 
 All model documentation lives under [docs/models](docs/models/README.md):
