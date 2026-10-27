@@ -3286,9 +3286,64 @@ private:
 };
 #endif
 
-/// Minimal GLM-5.3-Flash text runner. Phase 1: basic prefill/decode.
-/// Full smoke suite (sessions, snapshots, tools) comes after GPU kernel
-/// integration is complete.
+/// Minimal GLM-5.3-Flash runner state. Tracks position and provides
+/// basic state management for the serve path.
+class Glm5TextRunnerState final : public TextRunnerState {
+public:
+  explicit Glm5TextRunnerState(std::uint32_t max_context)
+      : max_context_(max_context) {}
+
+  void Invalidate() noexcept override {
+    position_ = 0;
+    tokens_.clear();
+    hidden_state_.clear();
+  }
+
+  [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
+      const noexcept override {
+    return {.per_request_state_bytes = tokens_.size() * sizeof(std::uint32_t) +
+                                       hidden_state_.size() * sizeof(float),
+            .temporary_scratch_bytes = 0};
+  }
+
+  [[nodiscard]] std::size_t position() const noexcept { return position_; }
+  void set_position(std::size_t position) noexcept { position_ = position; }
+
+  [[nodiscard]] const std::vector<std::uint32_t>& tokens() const noexcept {
+    return tokens_;
+  }
+  void set_tokens(std::vector<std::uint32_t> tokens) {
+    tokens_ = std::move(tokens);
+  }
+
+  [[nodiscard]] const std::vector<float>& hidden_state() const noexcept {
+    return hidden_state_;
+  }
+  void set_hidden_state(std::vector<float> state) {
+    hidden_state_ = std::move(state);
+  }
+
+private:
+  std::uint32_t max_context_;
+  std::size_t position_{0};
+  std::vector<std::uint32_t> tokens_;
+  std::vector<float> hidden_state_;
+};
+
+/// Minimal GLM-5.3-Flash runner snapshot (not yet implemented).
+class Glm5TextRunnerSnapshot final : public TextRunnerSnapshot {
+public:
+  Glm5TextRunnerSnapshot(std::shared_ptr<models::glm5_next::Model> model,
+                         std::size_t position)
+      : model(std::move(model)), position(position) {}
+
+  std::shared_ptr<models::glm5_next::Model> model;
+  std::size_t position{0};
+};
+
+/// Minimal GLM-5.3-Flash text runner. Phase 1: basic prefill/decode with
+/// tokenizer + chat template wired. Full smoke suite (sessions, snapshots,
+/// tools) is the remaining #12 work.
 class Glm5TextRunner final : public HipTextModelRunner {
 public:
   Glm5TextRunner(std::shared_ptr<models::glm5_next::Model> model,
@@ -3395,6 +3450,10 @@ public:
     const auto ids =
         tokenizer_->Encode(rendered, {.parse_special_tokens = true});
     return std::vector<TextRunnerToken>(ids.begin(), ids.end());
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    return std::make_unique<Glm5TextRunnerState>(max_context_);
   }
 
 private:
