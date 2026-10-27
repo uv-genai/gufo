@@ -8,6 +8,7 @@ add_library(gufo_glm5_next STATIC
   mhc_reference.cpp
   mla_reference.cpp
   moe_reference.cpp
+  mtp_reference.cpp
   reference.cpp
   weights.cpp)
 
