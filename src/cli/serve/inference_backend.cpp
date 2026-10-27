@@ -46,6 +46,7 @@
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/glm5_next/chat_template.hpp"
 #include "src/models/glm5_next/engine.hpp"
 #include "src/models/qwen/continuation_adapter.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
@@ -3291,8 +3292,11 @@ private:
 class Glm5TextRunner final : public HipTextModelRunner {
 public:
   Glm5TextRunner(std::shared_ptr<models::glm5_next::Model> model,
+                 std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
                  std::uint32_t max_context)
-      : model_(std::move(model)), max_context_(max_context) {}
+      : model_(std::move(model)),
+        tokenizer_(std::move(tokenizer)),
+        max_context_(max_context) {}
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
@@ -3331,21 +3335,71 @@ public:
     return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
   }
 
+  [[nodiscard]] std::uint32_t VocabularySize() const override {
+    return tokenizer_ ? static_cast<std::uint32_t>(tokenizer_->GetVocabSize())
+                      : 0;
+  }
+
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const override {
-    // GLM tokenizer not yet wired into the runner; return empty for now.
-    (void)text;
-    return {};
+    if (!tokenizer_)
+      return {};
+    const auto ids = tokenizer_->Encode(text);
+    return {ids.begin(), ids.end()};
+  }
+
+  [[nodiscard]] std::vector<TextRunnerToken> TokenizeControl(
+      std::string_view text) const override {
+    if (!tokenizer_)
+      return {};
+    const auto ids = tokenizer_->Encode(text, {.parse_special_tokens = true});
+    return {ids.begin(), ids.end()};
   }
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
-    (void)request;
-    return std::nullopt;
+    if (!tokenizer_)
+      return std::nullopt;
+    // Render GLM-5 chat template, then tokenize.
+    std::vector<models::glm5_next::ChatMessage> messages;
+    for (const auto& msg : request.messages) {
+      models::glm5_next::ChatMessage m;
+      // Map Qwen ChatRole to GLM role string.
+      switch (msg.role) {
+        case tokenization::ChatRole::kSystem:
+        case tokenization::ChatRole::kDeveloper:
+          m.role = "system";
+          break;
+        case tokenization::ChatRole::kUser:
+          m.role = "user";
+          break;
+        case tokenization::ChatRole::kAssistant:
+          m.role = "assistant";
+          break;
+        case tokenization::ChatRole::kTool:
+          m.role = "tool";
+          break;
+      }
+      m.content = msg.content;
+      messages.push_back(std::move(m));
+    }
+    std::vector<models::glm5_next::ChatTool> tools;
+    for (const auto& tool : request.tools) {
+      models::glm5_next::ChatTool t;
+      t.name = tool.name;
+      t.description = tool.description;
+      t.parameters_json = tool.parameters_json;
+      tools.push_back(std::move(t));
+    }
+    const auto rendered = models::glm5_next::RenderChat(messages, tools);
+    const auto ids =
+        tokenizer_->Encode(rendered, {.parse_special_tokens = true});
+    return std::vector<TextRunnerToken>(ids.begin(), ids.end());
   }
 
 private:
   std::shared_ptr<models::glm5_next::Model> model_;
+  std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::uint32_t max_context_;
 };
 
