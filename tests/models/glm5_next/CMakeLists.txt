@@ -13,3 +13,4 @@ endfunction()
 
 add_glm5_next_test(config gufo_glm5_next "cpu")
 add_glm5_next_test(chat_template gufo_glm5_next "cpu")
+add_glm5_next_test(kda_oracle gufo_glm5_next "cpu")

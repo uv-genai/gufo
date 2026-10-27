@@ -5,6 +5,7 @@ add_library(gufo_glm5_next STATIC
   chat_template.cpp
   config.cpp
   engine.cpp
+  reference.cpp
   weights.cpp)
 
 target_include_directories(gufo_glm5_next PUBLIC
