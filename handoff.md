@@ -6,13 +6,13 @@ redirect until that copy is removed).
 **When state changes** (merge, tag, push, script/config change, incident): **replace
 or edit this file in full** — do not leave stale tips, shas, or “untested” claims.
 
-Last updated: **2026-10-27** (session: v0.25.0 requalify + tag; fork current with upstream latest).
+Last updated: **2026-10-27** (session: v0.25.0 tagged; DeepSWE README blurb; standalone Q4 smoke; docs pushed).
 
 ---
 
 ## 0. Read next (in order)
 
-1. **This file** (`~/gufo-merge-handoff/handoff.md`)
+1. **This file** (`handoff.md` at repo root)
 2. Repo `AGENTS.md` (build, remotes, TP2 hazards, **nix count must be 0**)
 3. `docs/MERGE-CHECKLIST.md` (merge + TP2 runtime process)
 4. `docs/models/qwen3.8-flash-next/TP2.md` (collective rules)
@@ -30,7 +30,7 @@ Historical dated handoffs in `~/gufo-merge-handoff/HANDOFF-*.md` are **archive o
 | Branch | **`main`** |
 | Push | **`uv-genai` only** → https://github.com/uv-genai/gufo.git |
 | Upstream | `origin` → gufo-org/gufo; local track **`gufo-org`** — **never push** |
-| Tip | **`46eeaf28`** (`main` == `uv-genai/main` after last push) |
+| Tip | **`9ec07407`** (`main` == `uv-genai/main` after last push) |
 | Upstream merged through | **v0.25.0** (`16e8ed47` release — latest at last fetch) |
 
 **Non-negotiables:** `grep -ci nix AGENTS.md` → **0**; never run that package
@@ -44,7 +44,7 @@ manager; Conventional Commits; ask before any GPU launch.
 | --- | --- |
 | Path | `build/release/gufo` on **both** hosts |
 | sha256 | **`3d6457e93d56f41a6dd0cd2d27eddf7018e31d46a7c9c2368c99875486eac46f`** |
-| Built from | `46eeaf28` (v0.25.0) |
+| Built from | `46eeaf28` era (v0.25.0; later commits are docs-only) |
 | Configure | three host flags in `AGENTS.md` (HIP compiler + `-include format`) |
 
 **TP2 serve defaults** (all four `tools/tp2/rank{0,1}-{q4,q8}.sh`):
@@ -129,7 +129,7 @@ Dated tags: v0.16.0-2026-10-17 … **v0.25.0-2026-10-27**. Fork is current with 
 
 | Path | Purpose |
 | --- | --- |
-| `README.md` | fork overview; tracks upstream **through v0.23.0**; TP2 table still 2026-10-14 numbers |
+| `README.md` | fork overview; tracks upstream **through v0.25.0**; TP2 table 2026-10-14; **DeepSWE 1.1 = 90/113 (79.6%) > official leaderboard** |
 | `AGENTS.md` | build, remotes, **TP2 hazard table** |
 | `docs/MERGE-CHECKLIST.md` | merge + runtime checklist |
 | `docs/MERGE-UPSTREAM-2026-10-24.md` | series write-up |
@@ -138,6 +138,13 @@ Dated tags: v0.16.0-2026-10-17 … **v0.25.0-2026-10-27**. Fork is current with 
 
 External: **uv-genai/gufo issue #1** — comment on YaRN implementation
 (v0.21.0+); still open (NTK / `--rope-scale` API not implemented).
+
+**DeepSWE 1.1 (2026-10-26):** `gufo-qwen3.8-flash-next-tp2-q8` scored
+**90/113 (79.6%)** — above the official
+[leaderboard](https://deepswe.datacurve.ai/) (site max **74%**).
+Report: [uv-genai/deepswe-run](https://github.com/uv-genai/deepswe-run/blob/main/reports/final-report-2026-10-26.md)
+(linked from README). Standalone single-host Q4 smoke on this binary also
+passed (2026-10-27); GPU hosts should be **clear of `gufo`** between runs.
 
 ---
 
