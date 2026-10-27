@@ -6,7 +6,7 @@ redirect until that copy is removed).
 **When state changes** (merge, tag, push, script/config change, incident): **replace
 or edit this file in full** — do not leave stale tips, shas, or “untested” claims.
 
-Last updated: **2026-10-25** (session: YaRN+TP2 fused-attention fix + moved here).
+Last updated: **2026-10-27** (session: v0.24.0 requalify + tag).
 
 ---
 
@@ -30,8 +30,8 @@ Historical dated handoffs in `~/gufo-merge-handoff/HANDOFF-*.md` are **archive o
 | Branch | **`main`** |
 | Push | **`uv-genai` only** → https://github.com/uv-genai/gufo.git |
 | Upstream | `origin` → gufo-org/gufo; local track **`gufo-org`** — **never push** |
-| Tip | **`80e3a7c4`** (`main` == `uv-genai/main` after last push) |
-| Upstream merged through | **v0.23.0** (`1fafd5ad` release) |
+| Tip | **`106ff0d0`** (`main` == `uv-genai/main` after last push) |
+| Upstream merged through | **v0.24.0** (`0f1bc87a` release); **v0.25.0** fetched not merged |
 
 **Non-negotiables:** `grep -ci nix AGENTS.md` → **0**; never run that package
 manager; Conventional Commits; ask before any GPU launch.
@@ -43,8 +43,8 @@ manager; Conventional Commits; ask before any GPU launch.
 | | |
 | --- | --- |
 | Path | `build/release/gufo` on **both** hosts |
-| sha256 | **`e53611767f655efdd841e03c91f986d4aee71626c2341890c209c77313856b78`** |
-| Built from | `80e3a7c4` (YaRN group-2 fused attention on TP2) |
+| sha256 | **`85fa974cbb7669128416b4cdf8119286da905f225144470e0ff1a8ea8cd10661`** |
+| Built from | `106ff0d0` (v0.24.0 + YaRN group-2 fused attention) |
 | Configure | three host flags in `AGENTS.md` (HIP compiler + `-include format`) |
 
 **TP2 serve defaults** (all four `tools/tp2/rank{0,1}-{q4,q8}.sh`):
@@ -121,7 +121,7 @@ Prompt lookup type: **`speculative::PromptLookup<>`** (moved in v0.22), payload 
 6. **User llama-swap** validation (Q8-tp2).
 7. Tag `tp2-rdma-merge-vX.Y.Z-<YYYY-MM-DD>`; push **uv-genai only**.
 
-Dated tags so far: v0.16.0-2026-10-17 … **v0.23.0-2026-10-24**.
+Dated tags: v0.16.0-2026-10-17 … **v0.24.0-2026-10-27**. Next: v0.25.0.
 
 ---
 
