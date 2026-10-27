@@ -326,6 +326,112 @@ std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset) {
   return offset + first.length;
 }
 
+/// glm4/glm5 pre-tokenizer piece-end (CHATGLM4 scheme, llama-vocab.cpp).
+/// Two differences from Qwen35: digit runs are `\p{N}{1,3}` (groups of 3),
+/// and the letter class is `\p{L}+` WITHOUT `\p{M}` — combining marks attach
+/// to the following punctuation run.
+std::size_t Glm4PieceEnd(std::string_view text, std::size_t offset) {
+  if (const std::size_t contraction = Qwen35ContractionEnd(text, offset);
+      contraction != offset) {
+    return contraction;
+  }
+
+  const Utf8CodePoint first = DecodeUtf8(text, offset);
+
+  // Digit run: max 3 digits (not whole-run like qwen35).
+  if (IsUnicodeNumber(first.value)) {
+    std::size_t end = offset + first.length;
+    int digit_count = 1;
+    while (end < text.size() && digit_count < 3) {
+      const Utf8CodePoint next = DecodeUtf8(text, end);
+      if (!IsUnicodeNumber(next.value))
+        break;
+      end += next.length;
+      ++digit_count;
+    }
+    return end;
+  }
+
+  // Letter run: `\p{L}+` without `\p{M}` (marks attach to following punct).
+  if (IsUnicodeLetter(first.value)) {
+    std::size_t end = offset + first.length;
+    while (end < text.size()) {
+      const Utf8CodePoint next = DecodeUtf8(text, end);
+      if (!IsUnicodeLetter(next.value))
+        break;
+      end += next.length;
+    }
+    return end;
+  }
+
+  // Optional leading non-letter/number then letters: `[^\r\n\p{L}\p{N}]?\p{L}+`
+  if (!IsNewline(first.value) && !IsUnicodeLetter(first.value) &&
+      !IsUnicodeNumber(first.value) && offset + first.length < text.size()) {
+    const Utf8CodePoint next = DecodeUtf8(text, offset + first.length);
+    if (IsUnicodeLetter(next.value)) {
+      std::size_t end = offset + first.length + next.length;
+      while (end < text.size()) {
+        const Utf8CodePoint letter = DecodeUtf8(text, end);
+        if (!IsUnicodeLetter(letter.value))
+          break;
+        end += letter.length;
+      }
+      return end;
+    }
+  }
+
+  // Punctuation run: ` ?[^\s\p{L}\p{N}]+[\r\n]*` (without `\p{M}`).
+  std::size_t punct_start = offset;
+  if (first.value == ' ' && offset + first.length < text.size()) {
+    const Utf8CodePoint next = DecodeUtf8(text, offset + first.length);
+    if (!IsUnicodeWhitespace(next.value) && !IsUnicodeLetter(next.value) &&
+        !IsUnicodeNumber(next.value)) {
+      punct_start += first.length;
+    }
+  }
+  const Utf8CodePoint punct = DecodeUtf8(text, punct_start);
+  if (!IsUnicodeWhitespace(punct.value) && !IsUnicodeLetter(punct.value) &&
+      !IsUnicodeNumber(punct.value)) {
+    std::size_t end = punct_start;
+    while (end < text.size()) {
+      const Utf8CodePoint next = DecodeUtf8(text, end);
+      if (IsUnicodeWhitespace(next.value) || IsUnicodeLetter(next.value) ||
+          IsUnicodeNumber(next.value)) {
+        break;
+      }
+      end += next.length;
+    }
+    while (end < text.size()) {
+      const Utf8CodePoint next = DecodeUtf8(text, end);
+      if (!IsNewline(next.value))
+        break;
+      end += next.length;
+    }
+    return end;
+  }
+
+  // Whitespace: same as qwen35.
+  if (IsUnicodeWhitespace(first.value)) {
+    std::size_t end = offset;
+    std::size_t last_start = offset;
+    std::size_t last_newline_end = offset;
+    while (end < text.size()) {
+      const Utf8CodePoint next = DecodeUtf8(text, end);
+      if (!IsUnicodeWhitespace(next.value))
+        break;
+      last_start = end;
+      end += next.length;
+      if (IsNewline(next.value))
+        last_newline_end = end;
+    }
+    if (last_newline_end != offset)
+      return last_newline_end;
+    return end < text.size() && last_start > offset ? last_start : end;
+  }
+
+  return offset + first.length;
+}
+
 }  // namespace
 
 std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
@@ -377,6 +483,14 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
   if (reader.GetMetadataString("tokenizer.ggml.pre") ==
       std::optional<std::string_view>{"qwen35"}) {
     tokenizer->pre_tokenizer_ = PreTokenizer::kQwen35;
+  } else if (reader.GetMetadataString("tokenizer.ggml.pre") ==
+             std::optional<std::string_view>{"glm4"}) {
+    tokenizer->pre_tokenizer_ = PreTokenizer::kGlm4;
+    tokenizer->ignore_merges_ = true;
+  } else if (reader.GetMetadataString("tokenizer.ggml.pre") ==
+             std::optional<std::string_view>{"glm5"}) {
+    tokenizer->pre_tokenizer_ = PreTokenizer::kGlm4;
+    tokenizer->ignore_merges_ = true;
   }
 
   if (auto eos = reader.GetMetadataUint32("tokenizer.ggml.eos_token_id")) {
@@ -625,25 +739,40 @@ std::vector<TokenId> QwenTokenizer::BpeMergeChunk(
 }
 
 std::vector<TokenId> QwenTokenizer::BpeEncodeText(std::string_view text) const {
-  if (pre_tokenizer_ != PreTokenizer::kQwen35) {
+  if (pre_tokenizer_ == PreTokenizer::kNone) {
     return BpeMergeChunk(text);
   }
 
   // Qwen's tokenizer.json normalizes each non-special span before applying
   // its Unicode split regex. ASCII needs neither conversion nor allocation.
-  std::string normalized;
-  if (std::ranges::any_of(text,
-                          [](unsigned char byte) { return byte >= 0x80; })) {
-    UErrorCode status = U_ZERO_ERROR;
-    const auto* nfc = icu::Normalizer2::getNFCInstance(status);
-    if (U_FAILURE(status))
-      throw std::runtime_error("could not initialize Qwen NFC normalization");
-    icu::StringByteSink<std::string> sink(&normalized);
-    nfc->normalizeUTF8(0, icu::StringPiece(text), sink, nullptr, status);
-    if (U_FAILURE(status))
-      throw std::runtime_error("Qwen NFC normalization failed");
-    text = normalized;
+  // GLM4 does NOT use NFC normalization.
+  if (pre_tokenizer_ == PreTokenizer::kQwen35) {
+    std::string normalized;
+    if (std::ranges::any_of(text,
+                            [](unsigned char byte) { return byte >= 0x80; })) {
+      UErrorCode status = U_ZERO_ERROR;
+      const auto* nfc = icu::Normalizer2::getNFCInstance(status);
+      if (U_FAILURE(status))
+        throw std::runtime_error("could not initialize Qwen NFC normalization");
+      icu::StringByteSink<std::string> sink(&normalized);
+      nfc->normalizeUTF8(0, icu::StringPiece(text), sink, nullptr, status);
+      if (U_FAILURE(status))
+        throw std::runtime_error("Qwen NFC normalization failed");
+      text = normalized;
+    }
   }
+
+  // Byte-map a piece to the GPT-2 byte-level alphabet (for ignore_merges).
+  const auto byte_map = [this](std::string_view piece) -> std::string {
+    std::string mapped;
+    mapped.reserve(piece.size());
+    for (const unsigned char c : piece)
+      mapped += ByteToGpt2Utf8(c);
+    return mapped;
+  };
+
+  const auto piece_end =
+      pre_tokenizer_ == PreTokenizer::kGlm4 ? Glm4PieceEnd : Qwen35PieceEnd;
 
   std::vector<TokenId> tokens;
   // Repeated words have identical BPE merges within this normalized span.
@@ -654,7 +783,7 @@ std::vector<TokenId> QwenTokenizer::BpeEncodeText(std::string_view text) const {
     pieces.reserve(128);
   std::size_t offset = 0;
   while (offset < text.size()) {
-    const std::size_t end = Qwen35PieceEnd(text, offset);
+    const std::size_t end = piece_end(text, offset);
     const auto piece = text.substr(offset, end - offset);
     if (text.size() >= 1024 && piece.size() > 1 && piece.size() <= 64) {
       if (const auto found = pieces.find(piece); found != pieces.end()) {
@@ -663,7 +792,19 @@ std::vector<TokenId> QwenTokenizer::BpeEncodeText(std::string_view text) const {
         continue;
       }
     }
-    auto piece_tokens = BpeMergeChunk(piece);
+    std::vector<TokenId> piece_tokens;
+    if (ignore_merges_) {
+      // glm4/glm5: an exact vocab hit on the byte-mapped piece emits it whole;
+      // only leftovers go through BPE merges (llama-vocab.cpp L633-637).
+      const std::string mapped = byte_map(piece);
+      if (const auto it = token_to_id_.find(mapped); it != token_to_id_.end()) {
+        piece_tokens.push_back(it->second);
+      } else {
+        piece_tokens = BpeMergeChunk(piece);
+      }
+    } else {
+      piece_tokens = BpeMergeChunk(piece);
+    }
     tokens.insert(tokens.end(), piece_tokens.begin(), piece_tokens.end());
     if (text.size() >= 1024 && piece.size() > 1 && piece.size() <= 64 &&
         pieces.size() < 128)

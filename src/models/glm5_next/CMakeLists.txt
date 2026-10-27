@@ -2,6 +2,7 @@
 # Phase 1: config + GGUF load + weights binding. No GPU kernels yet.
 
 add_library(gufo_glm5_next STATIC
+  chat_template.cpp
   config.cpp
   engine.cpp
   weights.cpp)

@@ -97,6 +97,7 @@ private:
   enum class PreTokenizer : std::uint8_t {
     kNone,
     kQwen35,
+    kGlm4,
   };
 
   struct PairHash {
@@ -135,6 +136,9 @@ private:
   TokenId endoftext_token_id_{kInvalidTokenId};
   TokenId pad_token_id_{kInvalidTokenId};
   PreTokenizer pre_tokenizer_{PreTokenizer::kNone};
+  /// glm4/glm5: an exact vocabulary hit on a pre-token piece emits it whole;
+  /// only leftovers go through BPE merges.
+  bool ignore_merges_{false};
 };
 
 }  // namespace gufo::tokenization
