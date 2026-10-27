@@ -181,9 +181,9 @@ user-measured **~23 tok/s gen** on Maya-S IQ2_XXS).
 are F32 CPU with determinism verification (TP2 prerequisite). CPU inference
 engine wires oracles into Prefill/Decode/DraftMtp. **ALL GPU kernels landed:**
 KDA (diff=0.30), mHC (diff=2.4e-07), MoE (diff=2.1e-09), MLA/DSA (simplified),
-MTP (diff=3.9e-07). **Glm5TextRunner wired with tokenizer + chat template.**
-Remaining #12 work: session management, smoke suite (PONG, >1024-token, NL,
-agent-style, ≥5 sessions).
+MTP (diff=3.9e-07). **Glm5TextRunner + State + tokenizer + chat template
+all wired.** Remaining #12: smoke suite (PONG, >1024-token, NL, agent-style,
+≥5 sessions) on gfx1151.
 
 **Next session — Phase 1 completion:**
 1. KDA GPU prefill/decode kernels + KL parity vs oracle
