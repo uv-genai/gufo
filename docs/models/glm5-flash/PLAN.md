@@ -1,6 +1,7 @@
 # GLM-5.3-Flash on gufo: single-host Strix Halo and TP2 — design study
 
-**Status:** analysis and tentative plan only. **No code.**
+**Status:** analysis and tentative plan only. **No code.**  
+**Detailed implementation plan (issue-tracked):** [TASKS.md](TASKS.md) · tracker **[uv-genai/gufo#2](https://github.com/uv-genai/gufo/issues/2)**
 **Sources:** [mw00/project-maya](https://github.com/mw00/project-maya) (local clone `/tmp/project-maya`, 2026-10-27), especially `docs/GLM5-FLASH.md`, `docs/AMD_*.md`, `docs/QUANT-PLAN.md`, `src/core/glm_*`; gufo tree (`src/models/qwen38_flash_next/`, `docs/MERGE-CHECKLIST.md`, `docs/models/qwen3.8-flash-next/TP2.md`).
 **Author intent:** run **GLM-5.3-Flash** (the model Maya calls GLM-5.3, `glm5-next`) on **one Strix Halo** (as Maya already does) and on **two Strix Halos with gufo TP2**.
 
