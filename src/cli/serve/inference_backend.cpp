@@ -46,6 +46,7 @@
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/glm5_next/engine.hpp"
 #include "src/models/qwen/continuation_adapter.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
@@ -3856,6 +3857,44 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config), ram_cache_config,
                 tp_config);
+  }
+  if (architecture == "glm5-next") {
+    if (tp_config.world_size > 1) {
+      SetError(error, "GLM-5.3-Flash TP2 is not yet supported");
+      return false;
+    }
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+      SetError(error, "GLM-5.3-Flash speculative decoding is not yet wired");
+      return false;
+    }
+    if (!vision_model_path.empty()) {
+      SetError(error, "GLM-5.3-Flash does not support --mmproj yet");
+      return false;
+    }
+    auto model = models::glm5_next::Model::Load(model_path,
+                                                models::glm5_next::ModelOptions{
+                                                    .max_context = max_context,
+                                                },
+                                                &load_error);
+    if (model == nullptr) {
+      SetError(error, "Failed to load GLM-5.3-Flash: " + load_error);
+      return false;
+    }
+    Logger::Info(
+        "loader",
+        "event=glm5_loaded layers=" +
+            std::to_string(model->GetConfig().num_layers) +
+            " dsa=" + std::to_string(model->GetConfig().FullAttentionCount()) +
+            " kda=" + std::to_string(model->GetConfig().KdaLayerCount()) +
+            " experts=" + std::to_string(model->GetConfig().num_experts) +
+            " resident=" + std::to_string(model->ResidentBytes() >> 30) +
+            "GiB");
+    // Phase 1 skeleton: model loads and reports geometry. Decode is not
+    // yet wired into the HTTP runner; reject text generation for now.
+    SetError(error,
+             "GLM-5.3-Flash skeleton loaded successfully (decode not yet "
+             "wired; Phase 1 in progress)");
+    return false;
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {

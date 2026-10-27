@@ -171,6 +171,9 @@ add_subdirectory(src/models/qwen3_asr)
 # EmbeddingGemma 2 is a model-private BF16 text/image embedding runtime.
 add_subdirectory(src/models/embedding_gemma2)
 
+# GLM-5.3-Flash (glm5-next) — config + GGUF skeleton (Phase 1).
+add_subdirectory(src/models/glm5_next)
+
 # Compiler warnings and sanitizers
 option(GUFO_ENABLE_WARNINGS "Enable compiler warnings" ON)
 option(GUFO_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
@@ -357,7 +360,8 @@ endif()
 add_library(gufo_llm_cli STATIC
   src/cli/bench/bench.cpp
   src/cli/prompt/prompt.cpp)
-target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_qwen38_flash_next)
+target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_qwen38_flash_next
+  gufo_glm5_next)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash)
 endif()
@@ -434,7 +438,8 @@ target_compile_definitions(gufo PRIVATE
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo PRIVATE gufo_cache_hip gufo_deepseek_v4_flash)
 endif()
-target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_qwen3_asr gufo_embedding_gemma2)
+target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_qwen3_asr
+  gufo_embedding_gemma2 gufo_glm5_next)
 
 if (NOT WIN32)
   add_custom_target(gufo-server ALL
@@ -716,6 +721,7 @@ if (BUILD_TESTING)
 
   add_subdirectory(tests/models/deepseek_v4_flash)
   add_subdirectory(tests/models/qwen38_flash_next)
+  add_subdirectory(tests/models/glm5_next)
 
   if(ENGINE_ENABLE_HIP)
     add_executable(chat_template_hf_token_golden_test
