@@ -168,14 +168,28 @@ user-measured **~23 tok/s gen** on Maya-S IQ2_XXS).
 - **#4** ✅ ADRs in `TASKS.md`. KDA full replica; expanded-KV MLA first; router piggyback on TP control; fixed MTP width; mHC Sinkhorn per-forward (confirmed vs llama.cpp `272aad8b`).
 - **#5** ✅ `glm5_next` skeleton → `src/models/glm5_next/`. Config/weights/engine + serve dispatch. 6 CPU tests pass. Decode not yet wired.
 
-**Phase 1 IN PROGRESS:**
-- **#6** ✅ Tokenizer + chat template. GLM4 pre-tokenizer (digit groups of 3, `ignore_merges`), `[gMASK]<sop>` framing, tools XML. 9 golden tests.
-- **#7** ✅ KDA F32 CPU oracle (`reference.{hpp,cpp}`). Prefill + decode + determinism. 7 tests. GPU kernels pending.
-- **#8** ✅ mHC Sinkhorn F32 CPU oracle (`mhc_reference.{hpp,cpp}`). Joint inverse-RMS, Sinkhorn 20 iters. 7 tests.
-- **#9** ✅ MoE sigmoid top-8 noaux_tc oracle (`moe_reference.{hpp,cpp}`). Selection parity. 8 tests.
-- **#10–#12** remaining: MLA+DSA oracle, NextN MTP, HTTP serve.
+**Phase 1 — ALL CPU ORACLES DONE:**
+- **#6** ✅ Tokenizer + chat template (9 tests)
+- **#7** ✅ KDA oracle (7 tests) — GPU kernels pending
+- **#8** ✅ mHC Sinkhorn oracle (7 tests) — GPU kernels pending
+- **#9** ✅ MoE sigmoid top-8 oracle (8 tests) — GPU kernels pending
+- **#10** ✅ MLA expanded-KV + DSA indexer oracle (8 tests) — GPU kernels pending
+- **#11** ✅ NextN MTP oracle (6 tests) — GPU kernels pending
+- **#12** ⏳ HTTP serve adapter — **blocked on GPU kernels** (needs #7–#11 GPU)
 
-**Next session — Phase 1 remaining issues in order:**
+**Total: 7 test suites, 45 tests, all green.** All oracles are F32 CPU
+implementations with determinism verification (TP2 prerequisite).
+
+**Next session — GPU kernel implementation (Phase 1 completion):**
+1. KDA GPU prefill/decode kernels + KL parity vs oracle
+2. mHC GPU kernels + parity
+3. MoE GPU GEMM + selection parity
+4. MLA/DSA GPU attention + indexer
+5. MTP GPU draft + verify window
+6. Then #12 HTTP serve smoke on gfx1151
+
+**Alternative: Phase 2 (memory/numbers) can start with CPU oracles only
+for single-host Maya-S24/XS fit testing.**
 1. **[#6](https://github.com/uv-genai/gufo/issues/6)** — Tokenizer + chat template (`[gMASK]<sop>`, glm5 BPE)
 2. **[#7](https://github.com/uv-genai/gufo/issues/7)** — **KDA** mixer prefill/decode + F32 oracle + parity
 3. **[#8](https://github.com/uv-genai/gufo/issues/8)** — **mHC** Sinkhorn(20)/token + oracle
