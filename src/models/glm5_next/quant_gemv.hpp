@@ -42,10 +42,12 @@ bool QuantGemmGroups(const void* W, const float* x, float* y, int groups, int m,
 
 /// Quantized matvec for MoE experts (3D weight tensor).
 /// W: [n_experts, m, n] quantized. ids: [top_k] expert indices.
-/// x_f32: [n] device. y: [top_k * m] device (expert-major).
+/// x_f32: [n] device (x_group=0) or [top_k/x_group, n] with one x per
+/// x_group slots (e.g. x_group=m for per-slot down projections).
+/// y: [top_k * m] device (expert-major).
 bool QuantGemmMoe(const void* W, const float* x_f32, const int32_t* ids,
                   float* y, int m, int n, int n_experts, int top_k,
-                  int ggml_type, hipStream_t stream);
+                  int ggml_type, hipStream_t stream, int x_group = 0);
 
 /// Dequantize one row of a quantized embedding matrix to F32.
 /// embd: [vocab, hidden] quantized. out: [hidden] device.

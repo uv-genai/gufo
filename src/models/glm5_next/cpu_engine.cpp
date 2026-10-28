@@ -2,11 +2,25 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 
 namespace gufo::models::glm5_next {
 namespace {
+
+/// In-place RMS norm with a per-channel scale (Maya's rms_norm_kernel).
+void RmsNormInPlace(std::vector<float>& x, const std::vector<float>& gamma,
+                    std::size_t n) {
+  if (gamma.empty())
+    return;
+  float ms = 0.0F;
+  for (std::size_t i = 0; i < n; ++i)
+    ms += x[i] * x[i];
+  const float inv = 1.0F / std::sqrt(ms / n + 1e-5F);
+  for (std::size_t i = 0; i < n; ++i)
+    x[i] = x[i] * inv * gamma[i];
+}
 
 /// Dequantize a GGUF tensor to F32 (simplified: handles F32, Q8_0, Q6_K).
 std::vector<float> DequantizeTensor(const TensorRef& t) {
@@ -112,6 +126,8 @@ std::shared_ptr<CpuEngine> CpuEngine::Create(const Config& config,
   for (std::uint32_t i = 0; i < n_layers && i < weights.layers.size(); ++i) {
     const auto& L = weights.layers[i];
     auto& cache = engine->layer_cache_[i];
+    cache.attn_norm = safe_dequant(L.attn_norm);
+    cache.ffn_norm = safe_dequant(L.ffn_norm);
 
     // Skip empty layers (defensive).
     if (L.attn_norm.empty() && L.ffn_norm.empty()) {
@@ -128,12 +144,22 @@ std::shared_ptr<CpuEngine> CpuEngine::Create(const Config& config,
       cache.mla.k_b = safe_dequant(L.mla.k_b);
       cache.mla.v_b = safe_dequant(L.mla.v_b);
       cache.mla.output = safe_dequant(L.mla.output);
+      cache.mla.idx_q_b = safe_dequant(L.indexer.q_b);
+      cache.mla.idx_k = safe_dequant(L.indexer.k);
+      cache.mla.idx_k_norm_w = safe_dequant(L.indexer.k_norm_weight);
+      cache.mla.idx_k_norm_b = safe_dequant(L.indexer.k_norm_bias);
+      cache.mla.idx_proj = safe_dequant(L.indexer.proj);
+      cache.mla.idx_ape = safe_dequant(L.indexer.compressor_ape);
+      cache.mla.idx_gate = safe_dequant(L.indexer.compressor_gate);
     } else {
       // KDA layer.
-      cache.kda.w_q = safe_dequant(L.mla.q_a);
-      cache.kda.w_k = safe_dequant(L.mla.k_b);
-      cache.kda.w_v = safe_dequant(L.mla.v_b);
-      cache.kda.w_out = safe_dequant(L.mla.output);
+      cache.kda.w_q = safe_dequant(L.kda.attn_q);
+      cache.kda.w_k = safe_dequant(L.kda.attn_k);
+      cache.kda.w_v = safe_dequant(L.kda.attn_v);
+      cache.kda.w_out = safe_dequant(L.kda.attn_out);
+      cache.kda.conv_q = safe_dequant(L.kda.conv1d_q);
+      cache.kda.conv_k = safe_dequant(L.kda.conv1d_k);
+      cache.kda.conv_v = safe_dequant(L.kda.conv1d_v);
       cache.kda.f_a = safe_dequant(L.kda.f_a);
       cache.kda.f_b = safe_dequant(L.kda.f_b);
       cache.kda.dt_bias = safe_dequant(L.kda.dt_bias);
@@ -149,7 +175,9 @@ std::shared_ptr<CpuEngine> CpuEngine::Create(const Config& config,
       cache.mhc_attn.fn = safe_dequant(L.hc.attn_fn);
       cache.mhc_attn.scale = safe_dequant(L.hc.attn_scale);
       cache.mhc_attn.base = safe_dequant(L.hc.attn_base);
-      cache.mhc_ffn = cache.mhc_attn;  // Same weights for both halves.
+      cache.mhc_ffn.fn = safe_dequant(L.hc.ffn_fn);
+      cache.mhc_ffn.scale = safe_dequant(L.hc.ffn_scale);
+      cache.mhc_ffn.base = safe_dequant(L.hc.ffn_base);
     }
 
     // FFN.
@@ -225,7 +253,9 @@ std::vector<float> CpuEngine::ForwardLayer(std::uint32_t layer,
     mla_geom.v_head_dim = config_.v_head_dim;
     mla_geom.q_lora_rank = config_.q_lora_rank;
     mla_geom.kv_lora_rank = config_.kv_lora_rank;
-    attn_out = DsaLayer(mla_geom, cache.mla, mhc_read.mixed, seq_len);
+    std::vector<float> attn_in(mhc_read.mixed.begin(), mhc_read.mixed.end());
+    RmsNormInPlace(attn_in, cache.attn_norm, H);
+    attn_out = DsaLayer(mla_geom, cache.mla, attn_in, seq_len);
   } else {
     // KDA.
     KdaGeometry kda_geom;
@@ -234,12 +264,16 @@ std::vector<float> CpuEngine::ForwardLayer(std::uint32_t layer,
     kda_geom.head_dim = config_.kda_head_dim;
     kda_geom.conv_kernel = config_.kda_conv_kernel;
     kda_geom.gate_lower_bound = config_.kda_gate_lower_bound;
-    attn_out = KdaPrefill(kda_geom, cache.kda, mhc_read.mixed, seq_len);
+    std::vector<float> attn_in(mhc_read.mixed.begin(), mhc_read.mixed.end());
+    RmsNormInPlace(attn_in, cache.attn_norm, H);
+    attn_out = KdaPrefill(kda_geom, cache.kda, attn_in, seq_len);
   }
 
-  // 3. mHC write half (attn).
+  // 3. mHC write half (attn) — the new residual feeds the FFN half
+  // (Maya step_layers ping-pongs R between hc_post calls).
   auto post_attn = MhcPost(mhc_geom, attn_out, residual, mhc_read.post,
                            mhc_read.comb, seq_len);
+  residual = post_attn;
 
   // 4. FFN (with mHC).
   std::vector<float> ffn_in(H * seq_len);
@@ -249,7 +283,7 @@ std::vector<float> CpuEngine::ForwardLayer(std::uint32_t layer,
     }
   }
 
-  // mHC read half (ffn mixer).
+  // mHC read half (ffn mixer) — on the UPDATED residual.
   auto mhc_ffn = MhcPre(mhc_geom, cache.mhc_ffn, residual, seq_len);
 
   // FFN forward.
@@ -269,7 +303,15 @@ std::vector<float> CpuEngine::ForwardLayer(std::uint32_t layer,
     for (std::uint32_t e = 0; e < H; ++e) {
       token_in[e] = mhc_ffn.mixed[t * H + e];
     }
-    auto token_out = MoEForward(moe_geom, cache.moe, token_in);
+    RmsNormInPlace(token_in, cache.ffn_norm, H);
+    std::vector<float> token_out(H);
+    if (config_.IsDenseFfn(layer)) {
+      token_out =
+          DenseFfnForward(token_in, cache.moe.gate_shexp, cache.moe.up_shexp,
+                          cache.moe.down_shexp, H, config_.dense_ff, 10.0F);
+    } else {
+      token_out = MoEForward(moe_geom, cache.moe, token_in);
+    }
     for (std::uint32_t e = 0; e < H; ++e) {
       ffn_out[t * H + e] = token_out[e];
     }

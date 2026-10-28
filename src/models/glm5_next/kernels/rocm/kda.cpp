@@ -415,7 +415,8 @@ bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
     const dim3 grid(nh, T);
     hipLaunchKernelGGL(RmsNormKernel, grid, dim3(block), 0, stream, o,
                        w.ssm_norm, dk, nh, T, geom.norm_eps);
-    hipMemcpy(normed, o, inner_T * sizeof(float), hipMemcpyDeviceToDevice);
+    hipMemcpyAsync(normed, o, inner_T * sizeof(float), hipMemcpyDeviceToDevice,
+                   stream);
     const int grid_gate = (inner * T + block - 1) / block;
     hipLaunchKernelGGL(OutputGateKernel, dim3(grid_gate), dim3(block), 0,
                        stream, normed, gb_out, inner_T);

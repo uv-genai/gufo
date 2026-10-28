@@ -172,6 +172,189 @@ void TestIq2XxsGolden() {
   std::printf("ok  iq2_xxs golden block\n");
 }
 
+// Host mirror of Q81StoreWarp: d rounded to f16 like the kernel stores it.
+struct Q81Group {
+  float d;
+  std::int8_t qs[32];
+};
+
+std::uint16_t F32ToF16(float v) {
+  std::uint32_t u;
+  std::memcpy(&u, &v, 4);
+  const std::uint32_t sign = (u >> 16) & 0x8000U;
+  std::int32_t exp = static_cast<std::int32_t>((u >> 23) & 0xFF) - 127 + 15;
+  std::uint32_t mant = u & 0x7FFFFFU;
+  if (exp <= 0)
+    return static_cast<std::uint16_t>(sign);
+  if (exp >= 31)
+    return static_cast<std::uint16_t>(sign | 0x7C00U);
+  // round-to-nearest-even (matches __float2half on device)
+  const std::uint32_t rounded = mant + 0xFFFU + ((mant >> 13U) & 1U);
+  if ((rounded & 0x800000U) != 0U) {
+    ++exp;
+    if (exp >= 31)
+      return static_cast<std::uint16_t>(sign | 0x7C00U);
+  }
+  return static_cast<std::uint16_t>(sign | (exp << 10U) |
+                                    ((rounded & 0x7FFFFFU) >> 13U));
+}
+
+float F16BitsToFloat(std::uint16_t h) {
+  const std::uint32_t s = (h >> 15) & 1U;
+  const std::uint32_t e = (h >> 10) & 0x1FU;
+  const std::uint32_t m = h & 0x3FFU;
+  if (e == 0)
+    return (s ? -1.0f : 1.0f) * std::ldexp(m / 1024.0f, -14);
+  if (e == 31)
+    return m ? std::nanf("") : (s ? -INFINITY : INFINITY);
+  return (s ? -1.0f : 1.0f) * std::ldexp(1.0f + m / 1024.0f, e - 15);
+}
+
+void QuantizeQ81Host(const std::vector<float>& x, std::vector<Q81Group>& out) {
+  const std::size_t groups = x.size() / 32;
+  out.resize(groups);
+  for (std::size_t g = 0; g < groups; ++g) {
+    float amax = 0.0f;
+    for (int i = 0; i < 32; ++i)
+      amax = std::max(amax, std::abs(x[g * 32 + i]));
+    const float d = std::min(amax / 127.0f, 65504.0f);
+    out[g].d = F16BitsToFloat(F32ToF16(d));
+    for (int i = 0; i < 32; ++i) {
+      const float v = x[g * 32 + i];
+      out[g].qs[i] = amax == 0.0f
+                         ? 0
+                         : static_cast<std::int8_t>(std::max(
+                               -127.0f, std::min(127.0f, std::round(v / d))));
+    }
+  }
+}
+
+// Reference: host dequant (llama.cpp dequantize_row contract) dotted against
+// the same Q8_1 activation the GPU kernel builds.
+float Q8RefDot(int type, const void* row, std::size_t n,
+               const std::vector<Q81Group>& q8) {
+  std::vector<float> w(n);
+  quant::Dequantize(static_cast<gufo::core::GgmlType>(type), row, w.data(), n);
+  float s = 0.0f;
+  for (std::size_t i = 0; i < n; ++i)
+    s += w[i] * (static_cast<float>(q8[i / 32].qs[i % 32]) * q8[i / 32].d);
+  return s;
+}
+
+// The IQ paths accumulate integers and apply the scale with integer division
+// (llama vecdot / Maya glm_fast.cu — the production rounding). Mirror it here
+// or the last-bit truncation shows up as spurious diffs on small sums.
+float IqIntDotRef(int type, const void* row, std::size_t n,
+                  const std::vector<Q81Group>& q8) {
+  const std::uint8_t* w = static_cast<const std::uint8_t*>(row);
+  const std::size_t nb = n / 256;
+  double total = 0.0;  // accumulate calls in double, scale per call in float
+  float acc = 0.0f;
+  for (std::size_t kb = 0; kb < nb; ++kb) {
+    const std::uint8_t* blk =
+        w + kb * static_cast<std::size_t>(BlockBytes(type));
+    const Q81Group* xg = &q8[kb * 8];
+    for (int iqs = 0; iqs < 16; iqs += 2) {
+      const Q81Group& x = xg[iqs / 2];
+      int sumi = 0, sumi0 = 0, sumi1 = 0;
+      float d_scale = 0.0f;
+      if (type == 16) {
+        // IQ2_XXS
+        std::uint32_t q2, aux32;
+        std::memcpy(&q2, blk + 2 + 4 * iqs, 4);
+        std::memcpy(&aux32, blk + 2 + 4 * iqs + 4, 4);
+        const auto* aux8 = reinterpret_cast<const std::uint8_t*>(&q2);
+        for (int k0 = 0; k0 < 8; k0 += 2) {
+          const std::uint64_t grid = quant::kIq2xxsGrid[aux8[k0 / 2]];
+          const std::uint8_t signs =
+              quant::IqSigns((aux32 >> (7 * k0 / 2)) & 0xFFU);
+          for (int j = 0; j < 8; ++j) {
+            int g = static_cast<std::int8_t>(
+                static_cast<std::uint8_t>(grid >> (8 * j)));
+            if (signs & (1U << j))
+              g = -g;
+            sumi += g * x.qs[4 * k0 + j];
+          }
+        }
+        const int ls = static_cast<int>(aux32 >> 27) | 1;
+        sumi = sumi * ls / 8;
+        d_scale = quant::Fp16ToFloat(
+            static_cast<std::uint16_t>(blk[0] | (blk[1] << 8)));
+      } else if (type == 18) {
+        // IQ3_XXS
+        std::uint32_t a0, a1, aux32;
+        std::memcpy(&a0, blk + 2 + 4 * iqs, 4);
+        std::memcpy(&a1, blk + 2 + 4 * iqs + 4, 4);
+        std::memcpy(&aux32, blk + 2 + 64 + 2 * iqs, 4);
+        const auto* q3 = reinterpret_cast<const std::uint8_t*>(
+            (std::uint64_t)a0 | ((std::uint64_t)a1 << 32));
+        std::uint8_t q3b[8];
+        std::memcpy(q3b, &a0, 4);
+        std::memcpy(q3b + 4, &a1, 4);
+        (void)q3;
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+          const std::uint32_t signs =
+              quant::IqSigns((aux32 >> (7 * l0 / 2)) & 0xFFU);
+          const int g0 = static_cast<std::int8_t>(
+              static_cast<std::uint8_t>(quant::kIq3xxsGrid[q3b[l0 + 0]]));
+          const int g1 = static_cast<std::int8_t>(
+              static_cast<std::uint8_t>(quant::kIq3xxsGrid[q3b[l0 + 1]]));
+          for (int j = 0; j < 4; ++j) {
+            int v0 = static_cast<std::int8_t>(static_cast<std::uint8_t>(
+                quant::kIq3xxsGrid[q3b[l0 + 0]] >> (8 * j)));
+            int v1 = static_cast<std::int8_t>(static_cast<std::uint8_t>(
+                quant::kIq3xxsGrid[q3b[l0 + 1]] >> (8 * j)));
+            if (signs & (1U << j))
+              v0 = -v0;
+            if (signs & (1U << (j + 4)))
+              v1 = -v1;
+            sumi += v0 * x.qs[4 * l0 + j] + v1 * x.qs[4 * l0 + j + 4];
+          }
+          (void)g0;
+          (void)g1;
+        }
+        const int ls = static_cast<int>(aux32 >> 28);
+        sumi = (ls * sumi + sumi / 2) / 2;
+        d_scale = quant::Fp16ToFloat(
+            static_cast<std::uint16_t>(blk[0] | (blk[1] << 8)));
+      } else {
+        // IQ2_S
+        std::uint32_t qp, sp;
+        const int ib = iqs / 2;
+        std::memcpy(&qp, blk + 2 + 4 * ib, 4);
+        std::memcpy(&sp, blk + 2 + 32 + 4 * ib, 4);
+        const auto* codes = reinterpret_cast<const std::uint8_t*>(&qp);
+        const auto* sgn = reinterpret_cast<const std::uint8_t*>(&sp);
+        const std::uint8_t qh = blk[2 + 64 + ib];
+        const std::uint8_t ls0 = blk[2 + 72 + ib] & 0x0FU;
+        const std::uint8_t ls1 = blk[2 + 72 + ib] >> 4U;
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+          const std::uint64_t grid =
+              quant::kIq2sGrid[codes[l0 / 2] | ((qh << (8 - l0)) & 0x300U)];
+          for (int j = 0; j < 8; ++j) {
+            int g = static_cast<std::int8_t>(
+                static_cast<std::uint8_t>(grid >> (8 * j)));
+            const int sgn_bit = (sgn[l0 / 2] >> j) & 1U;
+            if (sgn_bit)
+              g = -g;
+            const int u = x.qs[4 * l0 + j];
+            if (l0 < 4)
+              sumi0 += g * u;
+            else
+              sumi1 += g * u;
+          }
+        }
+        sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+        d_scale = quant::Fp16ToFloat(
+            static_cast<std::uint16_t>(blk[0] | (blk[1] << 8)));
+      }
+      acc += d_scale * x.d * static_cast<float>(sumi);
+      (void)total;
+    }
+  }
+  return acc;
+}
+
 void TestQuantGemmParity(int type, int m, int n, std::uint32_t seed) {
   std::mt19937 rng(seed);
   const std::size_t blk_bytes = BlockBytes(type);
@@ -191,12 +374,19 @@ void TestQuantGemmParity(int type, int m, int n, std::uint32_t seed) {
   for (auto& v : x)
     v = dist(rng);
 
+  std::vector<Q81Group> q8;
+  if (type != 0 && type != 1)
+    QuantizeQ81Host(x, q8);
   std::vector<float> ref(m);
   for (int r = 0; r < m; ++r) {
     const void* row =
         w.data() + static_cast<std::size_t>(r) * n_blocks * blk_bytes;
-    ref[r] = quant::Dot(static_cast<gufo::core::GgmlType>(type), row,
-                        std::span<const float>(x), n);
+    ref[r] = (type == 0 || type == 1)
+                 ? quant::Dot(static_cast<gufo::core::GgmlType>(type), row,
+                              std::span<const float>(x), n)
+             : (type == 16 || type == 18 || type == 22)
+                 ? IqIntDotRef(type, row, n, q8)
+                 : Q8RefDot(type, row, n, q8);
   }
 
   void* d_w = nullptr;
@@ -252,14 +442,17 @@ void TestQuantGemmMoeParity(int type, std::uint32_t seed) {
     v = dist(rng);
   const std::vector<std::int32_t> ids = {2, 0};
 
+  std::vector<Q81Group> q8;
+  QuantizeQ81Host(x, q8);
   std::vector<float> ref(top_k * m);
   const std::size_t expert_bytes = gpu::QuantMatrixBytes(m, n, type);
   for (int slot = 0; slot < top_k; ++slot) {
     for (int r = 0; r < m; ++r) {
       const void* row = w.data() + ids[slot] * expert_bytes +
                         static_cast<std::size_t>(r) * n_blocks * blk_bytes;
-      ref[slot * m + r] = quant::Dot(static_cast<gufo::core::GgmlType>(type),
-                                     row, std::span<const float>(x), n);
+      ref[slot * m + r] = (type == 16 || type == 18 || type == 22)
+                              ? IqIntDotRef(type, row, n, q8)
+                              : Q8RefDot(type, row, n, q8);
     }
   }
 
@@ -293,6 +486,72 @@ void TestQuantGemmMoeParity(int type, std::uint32_t seed) {
                 std::to_string(ref[i]));
   }
   std::printf("ok  QuantGemmMoe type=%d\n", type);
+}
+
+// Per-slot x (x_group = m): each slot's row block multiplies its own x —
+// the MoE down-projection shape. This is what silently read past the Q8
+// scratch before x_vecs was fixed.
+void TestMoePerSlotXParity(int type, std::uint32_t seed) {
+  std::mt19937 rng(seed);
+  const int E = 3, m = 5, n = 512, top_k = 2;
+  const std::size_t blk_bytes = BlockBytes(type);
+  const std::size_t blk_elems = BlockElems(type);
+  const std::size_t n_blocks = n / blk_elems;
+  std::vector<std::uint8_t> w((std::size_t)E * m * n_blocks * blk_bytes);
+  for (int e = 0; e < E; ++e)
+    for (int r = 0; r < m; ++r)
+      for (std::size_t b = 0; b < n_blocks; ++b)
+        FillRandomBlock(
+            type, rng,
+            w.data() + (((std::size_t)e * m + r) * n_blocks + b) * blk_bytes);
+  std::vector<float> x((std::size_t)top_k * n);
+  std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
+  for (auto& v : x)
+    v = dist(rng);
+  const std::vector<std::int32_t> ids = {1, 2};
+
+  std::vector<float> ref((std::size_t)top_k * m);
+  const std::size_t expert_bytes = gpu::QuantMatrixBytes(m, n, type);
+  for (int slot = 0; slot < top_k; ++slot) {
+    std::vector<float> x_slot(x.begin() + slot * n, x.begin() + (slot + 1) * n);
+    std::vector<Q81Group> q8;
+    QuantizeQ81Host(x_slot, q8);
+    for (int r = 0; r < m; ++r) {
+      const void* row = w.data() + ids[slot] * expert_bytes +
+                        static_cast<std::size_t>(r) * n_blocks * blk_bytes;
+      ref[slot * m + r] = IqIntDotRef(type, row, n, q8);
+    }
+  }
+
+  void* d_w = nullptr;
+  float *d_x = nullptr, *d_y = nullptr;
+  std::int32_t* d_ids = nullptr;
+  HIP_CHECK(hipMalloc(&d_w, w.size()));
+  HIP_CHECK(hipMemcpy(d_w, w.data(), w.size(), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&d_x, x.size() * sizeof(float)));
+  HIP_CHECK(hipMemcpy(d_x, x.data(), x.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&d_ids, top_k * sizeof(std::int32_t)));
+  HIP_CHECK(hipMemcpy(d_ids, ids.data(), top_k * sizeof(std::int32_t),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMalloc(&d_y, top_k * m * sizeof(float)));
+  Require(
+      gpu::QuantGemmMoe(d_w, d_x, d_ids, d_y, m, n, E, top_k, type, nullptr, m),
+      "QuantGemmMoe per-slot x");
+  std::vector<float> got(top_k * m);
+  HIP_CHECK(hipMemcpy(got.data(), d_y, top_k * m * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipFree(d_w));
+  HIP_CHECK(hipFree(d_x));
+  HIP_CHECK(hipFree(d_ids));
+  HIP_CHECK(hipFree(d_y));
+  for (int i = 0; i < top_k * m; ++i) {
+    Require(std::abs(got[i] - ref[i]) <= 1e-3F * (1.0F + std::abs(ref[i])),
+            "moe-slot type " + std::to_string(type) + " idx " +
+                std::to_string(i) + ": got " + std::to_string(got[i]) +
+                " want " + std::to_string(ref[i]));
+  }
+  std::printf("ok  QuantGemmMoe per-slot x type=%d\n", type);
 }
 
 void TestEmbedLookupParity(int type, std::uint32_t seed) {
@@ -357,6 +616,9 @@ int main() {
     TestQuantGemmMoeParity(10, 14);
     TestQuantGemmMoeParity(11, 15);
     TestQuantGemmMoeParity(22, 16);
+    TestMoePerSlotXParity(18, 31);
+    TestMoePerSlotXParity(22, 32);
+    TestMoePerSlotXParity(16, 33);
     TestEmbedLookupParity(16, 21);
     TestEmbedLookupParity(18, 22);
     TestEmbedLookupParity(14, 23);

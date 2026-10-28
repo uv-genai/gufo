@@ -335,8 +335,8 @@ bool MhcPreGpu(const MhcGpuGeometry& geom, const MhcGpuWeights& w,
   float* pre = take(hc * T);
 
   // Copy residual to flat (stream-major).
-  HIP_CHECK(hipMemcpy(flat, residual, flat_size * sizeof(float),
-                      hipMemcpyDeviceToDevice));
+  HIP_CHECK(hipMemcpyAsync(flat, residual, flat_size * sizeof(float),
+                           hipMemcpyDeviceToDevice, stream));
 
   // 1. Joint inverse-RMS.
   {
@@ -380,8 +380,8 @@ bool MhcPreGpu(const MhcGpuGeometry& geom, const MhcGpuWeights& w,
   {
     hipLaunchKernelGGL(SinkhornKernel, dim3(T), dim3(256), 0, stream, comb_raw,
                        hc, T, geom.sinkhorn_iters, geom.eps);
-    HIP_CHECK(hipMemcpy(comb, comb_raw, hc * hc * T * sizeof(float),
-                        hipMemcpyDeviceToDevice));
+    HIP_CHECK(hipMemcpyAsync(comb, comb_raw, hc * hc * T * sizeof(float),
+                             hipMemcpyDeviceToDevice, stream));
   }
 
   // 6. Mixed = sum_s pre_s * R_s.

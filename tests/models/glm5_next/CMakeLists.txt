@@ -22,7 +22,8 @@ add_glm5_next_test(cpu_engine gufo_glm5_next "cpu")
 add_glm5_next_test(serve_integration gufo_glm5_next "cpu")
 
 if(ENGINE_ENABLE_HIP)
-  foreach(name IN ITEMS kda_gpu mhc_gpu moe_gpu mla_gpu mtp_gpu quant_gemv_gpu)
+  foreach(name IN ITEMS kda_gpu mhc_gpu moe_gpu mla_gpu mtp_gpu quant_gemv_gpu
+          gpu_engine_e2e)
     set(target glm5_next_${name}_test)
     add_executable(${target} ${name}_test.cpp)
     target_link_libraries(${target} PRIVATE gufo_glm5_next_kernels gufo_glm5_next)

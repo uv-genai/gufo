@@ -267,30 +267,26 @@ std::shared_ptr<GpuEngine> GpuEngine::Create(const Config& config,
     arena_bytes += Align256(s.t->SizeBytes());
   }
 
-  if (arena_bytes == 0) {
-    if (error_msg)
-      *error_msg = "no weights to upload";
-    return nullptr;
-  }
+  // An all-F32 pack has no raw arena tensors — that is legitimate.
   fprintf(stderr, "[glm5_gpu] allocating weight arena: %lu MiB (%lu bytes)\n",
           (unsigned long)(arena_bytes / (1024 * 1024)),
           (unsigned long)arena_bytes);
-  {
+  if (arena_bytes > 0) {
     std::size_t free_b = 0, total_b = 0;
     hipMemGetInfo(&free_b, &total_b);
     fprintf(stderr, "[glm5_gpu] GPU memory: free=%lu MiB total=%lu MiB\n",
             (unsigned long)(free_b / (1024 * 1024)),
             (unsigned long)(total_b / (1024 * 1024)));
+    const hipError_t alloc_err = hipMalloc(&engine->w_arena_, arena_bytes);
+    fprintf(stderr, "[glm5_gpu] arena alloc result: %d (%s)\n", (int)alloc_err,
+            hipGetErrorString(alloc_err));
+    if (alloc_err != hipSuccess) {
+      if (error_msg)
+        *error_msg = "weight arena alloc failed";
+      return nullptr;
+    }
+    engine->w_arena_bytes_ = arena_bytes;
   }
-  const hipError_t alloc_err = hipMalloc(&engine->w_arena_, arena_bytes);
-  fprintf(stderr, "[glm5_gpu] arena alloc result: %d (%s)\n", (int)alloc_err,
-          hipGetErrorString(alloc_err));
-  if (alloc_err != hipSuccess) {
-    if (error_msg)
-      *error_msg = "weight arena alloc failed";
-    return nullptr;
-  }
-  engine->w_arena_bytes_ = arena_bytes;
 
   // Upload tensors (raw quantized bytes into the arena; F32 from dense
   // or forced dequant into individual allocations). The returned type is the
@@ -471,6 +467,7 @@ std::shared_ptr<GpuEngine> GpuEngine::Create(const Config& config,
     rocm::MoeGpuGeometry og{};
     og.hidden_size = engine->H_;
     og.num_experts = config.num_experts;
+    og.top_k = config.num_experts_used;
     og.expert_ff = config.expert_ff;
     og.shared_ff = config.shared_expert_ff;
     const std::uint64_t moe_ws = rocm::MoeScratchFloats(og);
@@ -482,9 +479,14 @@ std::shared_ptr<GpuEngine> GpuEngine::Create(const Config& config,
         *error_msg = "kernel workspace alloc failed";
       return nullptr;
     }
+    fprintf(stderr,
+            "[glm5_gpu] kernel workspace: %lu KiB (kda=%lu moe=%lu dense=%lu "
+            "top_k=%u)\n",
+            (unsigned long)(engine->ws_bytes_ / 1024),
+            (unsigned long)(kda_ws * 4 / 1024),
+            (unsigned long)(moe_ws * 4 / 1024),
+            (unsigned long)(dense_ws * 4 / 1024), config.num_experts_used);
   }
-  fprintf(stderr, "[glm5_gpu] kernel workspace: %lu MiB\n",
-          (unsigned long)(engine->ws_bytes_ / (1024 * 1024)));
 
   // ---- Per-layer DSA state: latent / indexer-key caches + kernel scratch.
   engine->mla_geom_.hidden_size = engine->H_;
@@ -573,6 +575,9 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
     if (!rocm::MhcPreGpu(mhc_geom, mhc_attn_w, R, mixed, post, comb, T, ws_,
                          stream))
       return false;
+    // Maya: rms_norm(mixed, attn_norm) before the mixer.
+    gpu::LaunchRmsNorm(mixed, w_ptrs_[base + kAttnNorm], H_,
+                       config_.layer_norm_rms_eps, stream);
 
     // 2. Attention (KDA mixer or NoPE-MLA + DSA indexer).
     if (config_.IsFullAttention(il)) {
@@ -659,6 +664,9 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
     if (!rocm::MhcPreGpu(mhc_geom, mhc_ffn_w, R, mixed, post, comb, T, ws_,
                          stream))
       return false;
+    // Maya: rms_norm(mixed, ffn_norm) before the FFN.
+    gpu::LaunchRmsNorm(mixed, w_ptrs_[base + kFfnNorm], H_,
+                       config_.layer_norm_rms_eps, stream);
 
     // 5. FFN (dense for leading layers, MoE otherwise).
     float* ffn_out = sc_ + H_ + hc_ + hc_ * hc_ + H_;
@@ -716,14 +724,15 @@ std::vector<float> GpuEngine::RunToken(std::uint32_t token, std::uint32_t pos) {
   float* R = state_;
   if (token_embd_ && token < config_.vocab_size) {
     if (token_embd_type_ == 0) {
-      hipMemcpy(R, token_embd_ + static_cast<std::size_t>(token) * H_,
-                H_ * sizeof(float), hipMemcpyDeviceToDevice);
+      hipMemcpyAsync(R, token_embd_ + static_cast<std::size_t>(token) * H_,
+                     H_ * sizeof(float), hipMemcpyDeviceToDevice, stream_);
     } else if (!gpu::QuantEmbedLookup(token_embd_, R, H_, token,
                                       token_embd_type_, stream_)) {
       return std::vector<float>(H_, 0.0F);
     }
     for (std::uint32_t s = 1; s < hc_; ++s) {
-      hipMemcpy(R + s * H_, R, H_ * sizeof(float), hipMemcpyDeviceToDevice);
+      hipMemcpyAsync(R + s * H_, R, H_ * sizeof(float), hipMemcpyDeviceToDevice,
+                     stream_);
     }
   }
   if (!StepLayers(pos, stream_)) {
@@ -732,7 +741,11 @@ std::vector<float> GpuEngine::RunToken(std::uint32_t token, std::uint32_t pos) {
   // After an even number of mHC writes (2 per layer) the residual is back at
   // the head of the state arena.
   std::vector<float> hidden(H_);
-  hipMemcpy(hidden.data(), state_, H_ * sizeof(float), hipMemcpyDeviceToHost);
+  // Stream-ordered readback + explicit sync: the layers above are async on
+  // stream_ and a default-stream copy would race their writes to state_.
+  hipMemcpyAsync(hidden.data(), state_, H_ * sizeof(float),
+                 hipMemcpyDeviceToHost, stream_);
+  hipStreamSynchronize(stream_);
   return hidden;
 }
 
@@ -756,7 +769,8 @@ std::vector<float> GpuEngine::Step(std::uint32_t token) {
 std::uint32_t GpuEngine::Decode(const std::vector<float>& hidden) {
   // RMS norm + output head + greedy argmax. The head stays quantized on the
   // GPU (QuantGemm dequantizes on-the-fly) — no F32 copy of [vocab, hidden].
-  hipMemcpy(state_, hidden.data(), H_ * sizeof(float), hipMemcpyHostToDevice);
+  hipMemcpyAsync(state_, hidden.data(), H_ * sizeof(float),
+                 hipMemcpyHostToDevice, stream_);
   gpu::LaunchRmsNorm(state_, output_norm_, H_, config_.layer_norm_rms_eps,
                      stream_);
   if (!gpu::QuantGemm(output_head_, state_, sc_, config_.vocab_size, H_,

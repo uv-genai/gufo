@@ -88,6 +88,19 @@ __global__ void AccumulateKernel(float* __restrict__ acc,
   }
 }
 
+/// y[r] = sum_s w[s] * x[s * n + r]  (weighted combine of expert outputs).
+__global__ void WeightedSumKernel(const float* __restrict__ x,
+                                  const float* __restrict__ w,
+                                  float* __restrict__ y, int n, int k) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= n)
+    return;
+  float s = 0.0f;
+  for (int i = 0; i < k; ++i)
+    s += w[i] * x[static_cast<std::size_t>(i) * n + r];
+  y[r] = s;
+}
+
 /// Add shared expert output.
 __global__ void AddKernel(float* __restrict__ out,
                           const float* __restrict__ shexp, int n) {
@@ -100,8 +113,9 @@ __global__ void AddKernel(float* __restrict__ out,
 }  // namespace
 
 std::size_t MoeScratchFloats(const MoeGpuGeometry& geom) {
-  return 3ULL * geom.num_experts + 3ULL * geom.expert_ff +
-         3ULL * geom.hidden_size + 3ULL * geom.shared_ff;
+  const std::size_t k = geom.top_k;
+  return 3ULL * geom.num_experts + 2ULL * k + 3ULL * k * geom.expert_ff +
+         k * geom.hidden_size + 2ULL * geom.hidden_size + 3ULL * geom.shared_ff;
 }
 
 bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
@@ -129,10 +143,12 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
   float* logits = take(E);
   float* probs = take(E);
   float* sel_scores = take(E);
-  float* gate = take(I);
-  float* up = take(I);
-  float* h = take(I);
-  float* expert_out = take(H);
+  float* ids_f = take(k);  // device int32 ids (reused as floats)
+  float* w_dev = take(k);  // device expert weights
+  float* gate_all = take(k * I);
+  float* up_all = take(k * I);
+  float* h_all = take(k * I);
+  float* down_all = take(k * H);
   float* acc = take(H);
   float* gate_s = take(SI);
   float* up_s = take(SI);
@@ -164,11 +180,12 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
   // 4. Top-k selection (on host for simplicity — would be on GPU in
   // production). Copy sel_scores back to host for selection.
   std::vector<float> sel_scores_host(E);
-  HIP_CHECK(hipMemcpy(sel_scores_host.data(), sel_scores, E * sizeof(float),
-                      hipMemcpyDeviceToHost));
   std::vector<float> probs_host(E);
-  HIP_CHECK(hipMemcpy(probs_host.data(), probs, E * sizeof(float),
-                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpyAsync(sel_scores_host.data(), sel_scores,
+                           E * sizeof(float), hipMemcpyDeviceToHost, stream));
+  HIP_CHECK(hipMemcpyAsync(probs_host.data(), probs, E * sizeof(float),
+                           hipMemcpyDeviceToHost, stream));
+  HIP_CHECK(hipStreamSynchronize(stream));
 
   // Top-k descending.
   std::vector<std::pair<float, std::uint32_t>> indexed(E);
@@ -203,48 +220,43 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
     return false;
   }
 
-  // 7. Routed experts.
-  for (std::uint32_t idx = 0; idx < k; ++idx) {
-    const std::uint32_t e = indexed[idx].second;
-    const float weight = weights[idx];
-
-    // gate = gate_exps[e] @ x  [I] (quantized GEMM).
-    {
-      const auto* gW = reinterpret_cast<const void*>(
-          reinterpret_cast<const std::uint8_t*>(w.gate_exps) +
-          static_cast<std::size_t>(e) * gate_stride);
-      if (!gpu::QuantGemm(gW, token_input, gate, I, H, w.gate_exps_type,
-                          stream))
-        return false;
-    }
-    // up = up_exps[e] @ x  [I] (quantized GEMM).
-    {
-      const auto* uW = reinterpret_cast<const void*>(
-          reinterpret_cast<const std::uint8_t*>(w.up_exps) +
-          static_cast<std::size_t>(e) * up_stride);
-      if (!gpu::QuantGemm(uW, token_input, up, I, H, w.up_exps_type, stream))
-        return false;
-    }
-    // h = swiglu_clamp(gate, up).
-    {
-      const int grid = (I + block - 1) / block;
-      hipLaunchKernelGGL(SwigluClampKernel, dim3(grid), dim3(block), 0, stream,
-                         gate, up, h, I, limit);
-    }
-    // expert_out = down_exps[e] @ h  [H] (quantized GEMM).
-    {
-      const auto* dW = reinterpret_cast<const void*>(
-          reinterpret_cast<const std::uint8_t*>(w.down_exps) +
-          static_cast<std::size_t>(e) * down_stride);
-      if (!gpu::QuantGemm(dW, h, expert_out, H, I, w.down_exps_type, stream))
-        return false;
-    }
-    // acc += weight * expert_out.
-    {
-      const int grid = (H + block - 1) / block;
-      hipLaunchKernelGGL(AccumulateKernel, dim3(grid), dim3(block), 0, stream,
-                         acc, expert_out, weight, H);
-    }
+  // 7. Routed experts (batched): gate/up for every expert in one call each,
+  // one swiglu over all slots, one grouped down (per-slot activations), and
+  // one weighted sum. The per-expert loop cost ~48 launches per layer.
+  auto* ids_dev = reinterpret_cast<std::int32_t*>(ids_f);
+  // Persistent host staging, copied on the caller's stream: the copies must
+  // be stream-ordered with the kernels (a default-stream hipMemcpy races
+  // with them), and the source must outlive the async copy (function-locals
+  // died while the stream was still reading them).
+  static std::vector<std::int32_t> s_ids_host;
+  static std::vector<float> s_weights_host;
+  s_ids_host.resize(k);
+  s_weights_host = weights;
+  for (std::uint32_t i = 0; i < k; ++i)
+    s_ids_host[i] = static_cast<std::int32_t>(indexed[i].second);
+  HIP_CHECK(hipMemcpyAsync(ids_dev, s_ids_host.data(), k * sizeof(std::int32_t),
+                           hipMemcpyHostToDevice, stream));
+  HIP_CHECK(hipMemcpyAsync(w_dev, s_weights_host.data(), k * sizeof(float),
+                           hipMemcpyHostToDevice, stream));
+  if (!gpu::QuantGemmMoe(w.gate_exps, token_input, ids_dev, gate_all, I, H, E,
+                         k, w.gate_exps_type, stream))
+    return false;
+  if (!gpu::QuantGemmMoe(w.up_exps, token_input, ids_dev, up_all, I, H, E, k,
+                         w.up_exps_type, stream))
+    return false;
+  {
+    const int total = static_cast<int>(k) * I;
+    const int grid = (total + block - 1) / block;
+    hipLaunchKernelGGL(SwigluClampKernel, dim3(grid), dim3(block), 0, stream,
+                       gate_all, up_all, h_all, total, limit);
+  }
+  if (!gpu::QuantGemmMoe(w.down_exps, h_all, ids_dev, down_all, H, I, E, k,
+                         w.down_exps_type, stream, H))
+    return false;
+  {
+    const int grid = (H + block - 1) / block;
+    hipLaunchKernelGGL(WeightedSumKernel, dim3(grid), dim3(block), 0, stream,
+                       down_all, w_dev, acc, H, static_cast<int>(k));
   }
 
   // 8. Shared expert.
@@ -262,7 +274,8 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
 
   // 9. out = acc + shexp.
   {
-    HIP_CHECK(hipMemcpy(out, acc, H * sizeof(float), hipMemcpyDeviceToDevice));
+    HIP_CHECK(hipMemcpyAsync(out, acc, H * sizeof(float),
+                             hipMemcpyDeviceToDevice, stream));
     const int grid = (H + block - 1) / block;
     hipLaunchKernelGGL(AddKernel, dim3(grid), dim3(block), 0, stream, out,
                        shexp, H);

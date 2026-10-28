@@ -58,6 +58,8 @@ private:
 
   // Per-layer weight caches (F32 for the oracles).
   struct LayerCache {
+    std::vector<float> attn_norm;  ///< [hidden] input rms scale (attn half).
+    std::vector<float> ffn_norm;   ///< [hidden] input rms scale (ffn half).
     KdaWeightsF32 kda;
     MhcWeightsF32 mhc_attn;
     MhcWeightsF32 mhc_ffn;

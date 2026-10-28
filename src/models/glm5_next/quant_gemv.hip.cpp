@@ -556,6 +556,8 @@ __global__ void RowDotKernel(const void* W, const float* x,
     valid = expert >= 0;
     if (valid)
       base += static_cast<std::size_t>(expert) * m * row_bytes;
+    if (valid && x_group > 0)
+      x_base = x + static_cast<std::size_t>(out_row / x_group) * n_blocks * qk;
   } else if (valid && x_group > 0) {
     x_base = x + static_cast<std::size_t>(out_row / x_group) * n_blocks * qk;
   }
@@ -597,9 +599,28 @@ __global__ void EmbedRowKernel(const void* W, float* out, int row, int n_blocks,
 
 constexpr int kThreads = 64;
 
+bool LaunchMmvq(const void* W, const float* x, const int32_t* ids, float* y,
+                int total_rows, int m, int n, int ggml_type, int x_group,
+                hipStream_t stream);
+
 bool LaunchRowDot(const void* W, const float* x, const int32_t* ids, float* y,
                   int total_rows, int m, int n, int ggml_type, int x_group,
                   hipStream_t stream) {
+  // Quantized weights: Maya's Q8_1 / dp4a tier. Dense F32/F16 stay on the
+  // direct F32-activation kernel below.
+  switch (ggml_type) {
+    case kTypeQ8_0:
+    case kTypeQ2_K:
+    case kTypeQ3_K:
+    case kTypeQ6_K:
+    case kTypeIQ2_XXS:
+    case kTypeIQ3_XXS:
+    case kTypeIQ2_S:
+      return LaunchMmvq(W, x, ids, y, total_rows, m, n, ggml_type, x_group,
+                        stream);
+    default:
+      break;
+  }
   const TypeTraits tr = Traits(ggml_type);
   if (W == nullptr || x == nullptr || y == nullptr || tr.qk == 0 ||
       total_rows <= 0 || n <= 0 || (n % tr.qk) != 0 ||
@@ -623,6 +644,479 @@ bool LaunchRowDot(const void* W, const float* x, const int32_t* ids, float* y,
     case kTypeF16:
       launch.template operator()<kTypeF16>();
       break;
+    case kTypeQ8_0:
+      launch.template operator()<kTypeQ8_0>();
+      break;
+    case kTypeQ2_K:
+      launch.template operator()<kTypeQ2_K>();
+      break;
+    case kTypeQ3_K:
+      launch.template operator()<kTypeQ3_K>();
+      break;
+    case kTypeQ6_K:
+      launch.template operator()<kTypeQ6_K>();
+      break;
+    case kTypeIQ2_XXS:
+      launch.template operator()<kTypeIQ2_XXS>();
+      break;
+    case kTypeIQ3_XXS:
+      launch.template operator()<kTypeIQ3_XXS>();
+      break;
+    case kTypeIQ2_S:
+      launch.template operator()<kTypeIQ2_S>();
+      break;
+    default:
+      return false;
+  }
+  return true;
+}
+
+// ---- Q8_1 activation tier -------------------------------------------------
+// CUDA SIMD-in-word helpers, ported from the vendored mmq vendors/hip.h.
+typedef std::int8_t int8x4_t __attribute__((ext_vector_type(4)));
+typedef std::uint8_t uint8x4_t __attribute__((ext_vector_type(4)));
+
+__device__ __forceinline__ int __vsubss4(const int a, const int b) {
+  const int8x4_t va = reinterpret_cast<const int8x4_t&>(a);
+  const int8x4_t vb = reinterpret_cast<const int8x4_t&>(b);
+  const int8x4_t c = __builtin_elementwise_sub_sat(va, vb);
+  return reinterpret_cast<const int&>(c);
+}
+
+__device__ __forceinline__ int __vsub4(const int a, const int b) {
+  return __vsubss4(a, b);
+}
+
+__device__ __forceinline__ unsigned int __vcmpne4(unsigned int a,
+                                                  unsigned int b) {
+  const uint8x4_t& va = reinterpret_cast<const uint8x4_t&>(a);
+  const uint8x4_t& vb = reinterpret_cast<const uint8x4_t&>(b);
+  unsigned int c;
+  uint8x4_t& vc = reinterpret_cast<uint8x4_t&>(c);
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+    vc[i] = va[i] == vb[i] ? 0x00 : 0xff;
+  return c;
+}
+
+__device__ __forceinline__ int __dp4a(const int a, const int b, int c) {
+#if defined(__GFX11__) || defined(__GFX12__) || defined(__gfx1151__)
+  return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#else
+  const int8x4_t va = reinterpret_cast<const int8x4_t&>(a);
+  const int8x4_t& vb = reinterpret_cast<const int8x4_t&>(b);
+  c += va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2] + va[3] * vb[3];
+  return c;
+#endif
+}
+// Ports of Maya glm_fast.cu (itself a transcription of llama.cpp vecdotq):
+// activations quantize to Q8_1 once per GEMV, then each row's dots run in
+// packed int8 (__dp4a) with the dequant scales applied per 8/32-element call.
+// This is the arithmetic Maya's native_mmvq runs; the F32-activation block
+// dots above are only the F32/F16-weight fallback and the embed lookup.
+
+struct block_q8_1 {
+  __half2 ds;  // d = scale (low), s = sum(x) (high)
+  std::int8_t qs[32];
+};
+
+__device__ __forceinline__ float WarpSum32(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    v += __shfl_xor(v, o, 32);
+  return v;
+}
+
+__device__ __forceinline__ float WarpMax32(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    v = fmaxf(v, __shfl_xor(v, o, 32));
+  return v;
+}
+
+// q8_1 quantization of one 32-element activation group (q8_1_store_warp).
+__device__ __forceinline__ void Q81StoreWarp(float v, block_q8_1* dst,
+                                             int lane) {
+  const float amax = WarpMax32(fabsf(v));
+  const float sum = WarpSum32(v);
+  const float d = fminf(amax / 127.0f, 65504.0f);
+  const auto q = static_cast<std::int8_t>(
+      amax == 0.0f ? 0 : fmaxf(-127.0f, fminf(127.0f, roundf(v / d))));
+  dst->qs[lane] = q;
+  if (lane == 0) {
+    __half2 ds;
+    ds.x = __float2half(d);
+    ds.y = __float2half(fmaxf(-65504.0f, fminf(65504.0f, sum)));
+    dst->ds = ds;
+  }
+}
+
+__device__ __forceinline__ int GetIntB2(const void* x, int i32) {
+  const auto* x16 = static_cast<const std::uint16_t*>(x);
+  return static_cast<int>(x16[2 * i32 + 0]) |
+         (static_cast<int>(x16[2 * i32 + 1]) << 16);
+}
+
+__device__ __forceinline__ int GetIntB4(const void* x, int i32) {
+  return static_cast<const int*>(x)[i32];
+}
+
+// 7-bit sign pattern -> per-byte sign masks (llama unpack_ksigns).
+__device__ __forceinline__ std::uint32_t UnpackKsigns(std::uint8_t v) {
+  const std::uint32_t p = __popc(v) & 1;
+  const std::uint32_t s = v ^ (p << 7);
+  return s * 0x01010101U;
+}
+
+__device__ __forceinline__ float H2Lo(__half2 h) {
+  return __low2float(h);
+}
+
+// ---- dots: one call handles 8 or 32 weights of one block ------------------
+
+__device__ __forceinline__ float DotQ8_0(const void* vbq,
+                                         const block_q8_1* bq8_1, int kbx,
+                                         int iqs) {
+  const auto* w = static_cast<const block_q8_0*>(vbq) + kbx;
+  int sumi = 0;
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const int v = GetIntB2(w->qs, iqs + i);
+    const int u = GetIntB4(bq8_1->qs, iqs + i);
+    sumi = __dp4a(v, u, sumi);
+  }
+  return H2F(w->d) * H2Lo(bq8_1->ds) * static_cast<float>(sumi);
+}
+
+__device__ __forceinline__ float DotQ2_K(const void* vbq,
+                                         const block_q8_1* bq8_1, int kbx,
+                                         int iqs) {
+  const auto* b = static_cast<const block_q2_K*>(vbq) + kbx;
+  const int bq8_offset = 4 * (iqs / 8);
+  const std::uint8_t* scales =
+      reinterpret_cast<const std::uint8_t*>(b->scales) +
+      (iqs - iqs % 8 + (iqs % 8) / 4);
+  const int v = GetIntB4(b->qs, iqs);
+  float sumf_d = 0.0f, sumf_m = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const block_q8_1* q8 = bq8_1 + bq8_offset + i;
+    const int u = GetIntB4(q8->qs, iqs % 8);
+    const float d8 = H2Lo(q8->ds);
+    const int sc = scales[2 * i];
+    const int vi = (v >> (2 * i)) & 0x03030303;
+    sumf_d += d8 * (__dp4a(vi, u, 0) * (sc & 0xF));
+    int m = sc >> 4;
+    m |= m << 8;
+    m |= m << 16;
+    sumf_m += d8 * __dp4a(m, u, 0);
+  }
+  return H2F(b->d) * sumf_d - H2F(b->dmin) * sumf_m;
+}
+
+__device__ __forceinline__ float DotQ3_K(const void* vbq,
+                                         const block_q8_1* bq8_1, int kbx,
+                                         int iqs) {
+  const auto* b = static_cast<const block_q3_K*>(vbq) + kbx;
+  const int bq8_offset = 4 * (iqs / 8);
+  const int scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
+  const float d = H2F(b->d);
+  const int vl = GetIntB2(b->qs, iqs);
+  const int vh = ~GetIntB2(b->hmask, iqs % 8) >> bq8_offset;
+  float sumf = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const block_q8_1* q8 = bq8_1 + bq8_offset + i;
+    const int u = GetIntB4(q8->qs, iqs % 8);
+    const float d8 = H2Lo(q8->ds);
+    const int isc = scale_offset + 2 * i;
+    const int sc_low = (b->scales[isc % 8] >> (4 * (isc / 8))) & 0xF;
+    const int sc_high = ((b->scales[8 + isc % 4] >> (2 * (isc / 4))) & 3) << 4;
+    const int sc = (sc_low | sc_high) - 32;
+    const int vil = (vl >> (2 * i)) & 0x03030303;
+    const int vih = ((vh >> i) << 2) & 0x04040404;
+    sumf += d8 * (__dp4a(static_cast<int>(__vsubss4(vil, vih)), u, 0) * sc);
+  }
+  return d * sumf;
+}
+
+__device__ __forceinline__ float DotQ6_K(const void* vbq,
+                                         const block_q8_1* bq8_1, int kbx,
+                                         int iqs) {
+  const auto* w = static_cast<const block_q6_K*>(vbq) + kbx;
+  const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
+  const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+  const int vh_shift = 2 * ((iqs % 16) / 8);
+  const int vl = GetIntB2(w->ql, iqs);
+  const int vh = GetIntB2(w->qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift;
+  const std::int8_t* scales = w->scales + scale_offset;
+  float sumf = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const int u = GetIntB4(bq8_1[bq8_offset + 2 * i].qs, iqs % 8);
+    const float d8 = H2Lo(bq8_1[bq8_offset + 2 * i].ds);
+    const int sc = scales[4 * i];
+    const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
+    const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+    const int vi = __vsubss4(vil | vih, 0x20202020);
+    sumf += d8 * (__dp4a(vi, u, 0) * sc);
+  }
+  return H2F(w->d) * sumf;
+}
+
+__device__ __forceinline__ float DotIQ2_XXS(const void* vbq,
+                                            const block_q8_1* bq8_1, int kbx,
+                                            int iqs) {
+  const auto* bq2 = static_cast<const block_iq2_xxs*>(vbq) + kbx;
+  const int q2 = GetIntB2(bq2->qs, iqs);
+  const auto* aux8 = reinterpret_cast<const std::uint8_t*>(&q2);
+  const std::uint32_t aux32 =
+      static_cast<std::uint32_t>(GetIntB2(bq2->qs, iqs + 1));
+  int sumi = 0;
+#pragma unroll
+  for (int k0 = 0; k0 < 8; k0 += 2) {
+    const uint2 grid_pos =
+        reinterpret_cast<const uint2*>(kIq2xxsGrid)[aux8[k0 / 2]];
+    const std::uint32_t signs = UnpackKsigns((aux32 >> (7 * k0 / 2)) & 0xFF);
+    const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+    const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+    const int u0 = GetIntB4(bq8_1[iqs / 2].qs, k0 + 0);
+    sumi = __dp4a(grid0, u0, sumi);
+    const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+    const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+    const int u1 = GetIntB4(bq8_1[iqs / 2].qs, k0 + 1);
+    sumi = __dp4a(grid1, u1, sumi);
+  }
+  const int ls = (aux32 >> 27) | 1;
+  sumi = sumi * ls / 8;
+  return H2F(bq2->d) * H2Lo(bq8_1[iqs / 2].ds) * static_cast<float>(sumi);
+}
+
+__device__ __forceinline__ float DotIQ3_XXS(const void* vbq,
+                                            const block_q8_1* bq8_1, int kbx,
+                                            int iqs) {
+  const auto* bq3 = static_cast<const block_iq3_xxs*>(vbq) + kbx;
+  const int2 q3_packed =
+      make_int2(GetIntB2(bq3->qs, iqs), GetIntB2(bq3->qs, iqs + 1));
+  const auto* q3 = reinterpret_cast<const std::uint8_t*>(&q3_packed);
+  const std::uint32_t aux32 =
+      static_cast<std::uint32_t>(GetIntB2(bq3->qs, 16 + iqs / 2));
+  int sumi = 0;
+#pragma unroll
+  for (int l0 = 0; l0 < 8; l0 += 2) {
+    const int2 grid_pos = make_int2(static_cast<int>(kIq3xxsGrid[q3[l0 + 0]]),
+                                    static_cast<int>(kIq3xxsGrid[q3[l0 + 1]]));
+    const std::uint32_t signs = UnpackKsigns((aux32 >> (7 * l0 / 2)) & 0xFF);
+    const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+    const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+    const int u0 = GetIntB4(bq8_1[iqs / 2].qs, l0 + 0);
+    const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+    const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+    const int u1 = GetIntB4(bq8_1[iqs / 2].qs, l0 + 1);
+    sumi = __dp4a(grid_l, u0, sumi);
+    sumi = __dp4a(grid_h, u1, sumi);
+  }
+  const int ls = aux32 >> 28;
+  sumi = (ls * sumi + sumi / 2) / 2;
+  return H2F(bq3->d) * H2Lo(bq8_1[iqs / 2].ds) * static_cast<float>(sumi);
+}
+
+__device__ __forceinline__ float DotIQ2_S(const void* vbq,
+                                          const block_q8_1* bq8_1, int kbx,
+                                          int iqs) {
+  const auto* b = static_cast<const block_iq2_s*>(vbq) + kbx;
+  const int ib = iqs / 2;  // 32-element group
+  const block_q8_1* q8 = bq8_1 + ib;
+  const int qs_packed = GetIntB2(b->qs, ib);
+  const auto* qs = reinterpret_cast<const std::uint8_t*>(&qs_packed);
+  const int qh = b->qh[ib];
+  const int signs_packed = GetIntB2(b->qs, 8 + ib);
+  const auto* signs8 = reinterpret_cast<const std::uint8_t*>(&signs_packed);
+  const int ls0 = b->scales[ib] & 0x0F;
+  const int ls1 = b->scales[ib] >> 4;
+  int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+  for (int l0 = 0; l0 < 8; l0 += 2) {
+    const uint2 grid_pos = reinterpret_cast<const uint2*>(
+        kIq2sGrid)[qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)];
+    const int signs0 = __vcmpne4(
+        ((signs8[l0 / 2] & 0x03) << 7) | ((signs8[l0 / 2] & 0x0C) << 21),
+        0x00000000);
+    const int signs1 = __vcmpne4(
+        ((signs8[l0 / 2] & 0x30) << 3) | ((signs8[l0 / 2] & 0xC0) << 17),
+        0x00000000);
+    const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+    const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+    if (l0 < 4) {
+      sumi0 = __dp4a(grid_l, GetIntB4(q8->qs, l0 + 0), sumi0);
+      sumi0 = __dp4a(grid_h, GetIntB4(q8->qs, l0 + 1), sumi0);
+    } else {
+      sumi1 = __dp4a(grid_l, GetIntB4(q8->qs, l0 + 0), sumi1);
+      sumi1 = __dp4a(grid_h, GetIntB4(q8->qs, l0 + 1), sumi1);
+    }
+  }
+  const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+  return H2F(b->d) * H2Lo(q8->ds) * static_cast<float>(sumi);
+}
+
+// ---- F<T>: qk / calls-per-block / iqs stride / block bytes / dot ----------
+template<int T>
+struct FTrait;
+template<>
+struct FTrait<kTypeQ8_0> {
+  static constexpr int qk = 32, ipb = 4, step = 2, bytes = 34;
+};
+template<>
+struct FTrait<kTypeQ2_K> {
+  static constexpr int qk = 256, ipb = 16, step = 1, bytes = 84;
+};
+template<>
+struct FTrait<kTypeQ3_K> {
+  static constexpr int qk = 256, ipb = 16, step = 1, bytes = 110;
+};
+template<>
+struct FTrait<kTypeQ6_K> {
+  static constexpr int qk = 256, ipb = 32, step = 1, bytes = 210;
+};
+template<>
+struct FTrait<kTypeIQ2_XXS> {
+  static constexpr int qk = 256, ipb = 8, step = 2, bytes = 66;
+};
+template<>
+struct FTrait<kTypeIQ3_XXS> {
+  static constexpr int qk = 256, ipb = 8, step = 2, bytes = 98;
+};
+template<>
+struct FTrait<kTypeIQ2_S> {
+  static constexpr int qk = 256, ipb = 8, step = 2, bytes = 82;
+};
+
+template<int T>
+__device__ __forceinline__ float DotCall(const void* v, const block_q8_1* y,
+                                         int kbx, int iqs) {
+  if constexpr (T == kTypeQ8_0)
+    return DotQ8_0(v, y, kbx, iqs);
+  else if constexpr (T == kTypeQ2_K)
+    return DotQ2_K(v, y, kbx, iqs);
+  else if constexpr (T == kTypeQ3_K)
+    return DotQ3_K(v, y, kbx, iqs);
+  else if constexpr (T == kTypeQ6_K)
+    return DotQ6_K(v, y, kbx, iqs);
+  else if constexpr (T == kTypeIQ2_XXS)
+    return DotIQ2_XXS(v, y, kbx, iqs);
+  else if constexpr (T == kTypeIQ3_XXS)
+    return DotIQ3_XXS(v, y, kbx, iqs);
+  else
+    return DotIQ2_S(v, y, kbx, iqs);
+}
+
+// One row against one Q8_1 activation vector, a 32-lane group lane-strided
+// over the row's calls (Maya row_dot), reduced with warp_sum.
+template<int T>
+__device__ __forceinline__ float RowDotQ8(const std::uint8_t* row,
+                                          const block_q8_1* x, int n_in,
+                                          int lane) {
+  using F = FTrait<T>;
+  const int nb = n_in / F::qk;
+  float s = 0.0f;
+#pragma unroll 1
+  for (int k = lane; k < nb * F::ipb; k += 32) {
+    const int kbx = k / F::ipb;
+    const int iqs = F::step * (k % F::ipb);
+    s += DotCall<T>(row, x + kbx * (F::qk / 32), kbx, iqs);
+  }
+  return WarpSum32(s);
+}
+
+// 32-lane rows: 2 rows per wave64. ids != nullptr -> MoE gather
+// (y[slot] = W[ids[slot/m]][slot%m] @ x); x_group > 0 -> per-group x.
+template<int T>
+__global__ void MmvqKernel(const void* W, const block_q8_1* x,
+                           const std::int32_t* __restrict__ ids, float* y,
+                           int total_rows, int m, int n, int x_group) {
+  using F = FTrait<T>;
+  const std::size_t row_bytes = static_cast<std::size_t>(n / F::qk) * F::bytes;
+  const int lane = static_cast<int>(threadIdx.x);
+  const int slot =
+      static_cast<int>(blockIdx.x) * 2 + static_cast<int>(threadIdx.y);
+  if (slot >= total_rows)
+    return;
+  int row_in_matrix = slot;
+  const auto* base = static_cast<const std::uint8_t*>(W);
+  const block_q8_1* xq = x;
+  if (ids != nullptr) {
+    const int expert = ids[slot / m];
+    row_in_matrix = slot % m;
+    if (expert < 0) {
+      if (lane == 0)
+        y[slot] = 0.0f;
+      return;
+    }
+    base += static_cast<std::size_t>(expert) * m * row_bytes;
+    if (x_group > 0)
+      xq = x + static_cast<std::size_t>(slot / x_group) * (n / 32);
+  } else if (x_group > 0) {
+    xq = x + static_cast<std::size_t>(slot / x_group) * (n / 32);
+  }
+  const std::uint8_t* w_row =
+      base + static_cast<std::size_t>(row_in_matrix) * row_bytes;
+  const float s = RowDotQ8<T>(w_row, xq, n, lane);
+  if (lane == 0)
+    y[slot] = s;
+}
+
+__global__ void QuantizeQ81Kernel(const float* __restrict__ x,
+                                  block_q8_1* __restrict__ y, int n) {
+  const int i = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+                static_cast<int>(threadIdx.x);
+  if (i >= n)
+    return;  // caller guarantees n % 32 == 0
+  Q81StoreWarp(x[i], y + i / 32, static_cast<int>(threadIdx.x) & 31);
+}
+
+// Activation Q8_1 scratch: grown on demand (single-stream use, like Maya's
+// q8_scratch).
+void* g_q81 = nullptr;
+std::size_t g_q81_bytes = 0;
+
+block_q8_1* Q81Scratch(std::size_t bytes) {
+  if (bytes > g_q81_bytes) {
+    // Grow only — never free the old buffer: earlier kernels on the stream
+    // may still be reading it (a hipFree here faulted the next row's read).
+    // The stale buffers are a few KB each and bounded by the growth steps.
+    void* fresh = nullptr;
+    if (hipMalloc(&fresh, bytes) != hipSuccess)
+      return nullptr;
+    g_q81 = fresh;
+    g_q81_bytes = bytes;
+  }
+  return static_cast<block_q8_1*>(g_q81);
+}
+
+bool LaunchMmvq(const void* W, const float* x, const int32_t* ids, float* y,
+                int total_rows, int m, int n, int ggml_type, int x_group,
+                hipStream_t stream) {
+  const TypeTraits tr = Traits(ggml_type);
+  if (W == nullptr || x == nullptr || y == nullptr || tr.qk == 0 ||
+      total_rows <= 0 || n <= 0 || (n % 32) != 0 || (ids != nullptr && m <= 0))
+    return false;
+  block_q8_1* xq =
+      Q81Scratch(static_cast<std::size_t>(n / 32) * sizeof(block_q8_1));
+  if (!xq)
+    return false;
+  // x_group > 0: each group of slots shares one x vector; quantize all of
+  // them (one vector would leave the kernel reading past the scratch).
+  const int x_vecs = x_group > 0 ? (total_rows + x_group - 1) / x_group : 1;
+  const int x_elems = x_vecs * n;
+  xq = Q81Scratch(static_cast<std::size_t>(x_elems / 32) * sizeof(block_q8_1));
+  hipLaunchKernelGGL(QuantizeQ81Kernel, dim3((x_elems + 255) / 256), dim3(256),
+                     0, stream, x, xq, x_elems);
+  const int grid = (total_rows + 1) / 2;
+  const auto launch = [&]<int TYPE>() {
+    hipLaunchKernelGGL(MmvqKernel<TYPE>, dim3(grid), dim3(32, 2), 0, stream, W,
+                       xq, ids, y, total_rows, m, n, x_group);
+  };
+  switch (ggml_type) {
     case kTypeQ8_0:
       launch.template operator()<kTypeQ8_0>();
       break;
@@ -677,10 +1171,11 @@ bool QuantGemmGroups(const void* W, const float* x, float* y, int groups, int m,
 
 bool QuantGemmMoe(const void* W, const float* x_f32, const int32_t* ids,
                   float* y, int m, int n, int n_experts, int top_k,
-                  int ggml_type, hipStream_t stream) {
+                  int ggml_type, hipStream_t stream, int x_group) {
   if (n_experts <= 0 || top_k <= 0)
     return false;
-  return LaunchRowDot(W, x_f32, ids, y, top_k * m, m, n, ggml_type, 0, stream);
+  return LaunchRowDot(W, x_f32, ids, y, top_k * m, m, n, ggml_type, x_group,
+                      stream);
 }
 
 bool QuantEmbedLookup(const void* embd, float* out, int hidden, int token,

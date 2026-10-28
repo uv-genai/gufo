@@ -358,7 +358,11 @@ bool MlaStepGpu(const MlaGpuGeometry& geom, const MlaGpuWeights& w,
   if (n_cells > max_cells)
     return false;
   if (n_cells > 0) {
-    HIP_CHECK(hipMemcpyAsync(cells_dev, cells_host.data(),
+    // Persistent staging: cells_host is a function-local and must not die
+    // while the stream still reads it.
+    static std::vector<std::int32_t> s_cells_host;
+    s_cells_host = cells_host;
+    HIP_CHECK(hipMemcpyAsync(cells_dev, s_cells_host.data(),
                              n_cells * sizeof(std::int32_t),
                              hipMemcpyHostToDevice, stream));
   }
