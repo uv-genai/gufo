@@ -97,36 +97,50 @@ __device__ float BlockDotQ8_0(const void* blk, const float* x) {
 }
 
 // llama.cpp dequantize_row_q6_K fused with the activation dot product.
+// Weights are loaded as 32-bit words (byte loads serialize the VALU); values
+// are packed int8 so the per-16-element scale pairs accumulate in groups.
 __device__ float BlockDotQ6_K(const void* blk, const float* x) {
   const auto* b = static_cast<const block_q6_K*>(blk);
   const float d = H2F(b->d);
+  const auto* ql = reinterpret_cast<const std::uint32_t*>(b->ql);
+  const auto* qh = reinterpret_cast<const std::uint32_t*>(b->qh);
+  const auto* sc = reinterpret_cast<const std::int32_t*>(b->scales);
   float acc = 0.0F;
   for (int half = 0; half < 2; ++half) {
-    const std::uint8_t* ql = b->ql + half * 64;
-    const std::uint8_t* qh = b->qh + half * 32;
-    const std::int8_t* sc = b->scales + half * 8;
+    const std::uint32_t* qlw = ql + half * 16;  // 64 bytes = 16 words
+    const std::uint32_t* qhw = qh + half * 8;   // 32 bytes = 8 words
+    // 4 int8 scales per int32 word.
+    const std::int8_t* scr =
+        reinterpret_cast<const std::int8_t*>(sc + half * 2);
     const float* xx = x + half * 128;
     for (int l = 0; l < 32; ++l) {
-      const int is = l / 16;
-      const int v1 = (static_cast<int>(ql[l] & 0x0FU) |
-                      (static_cast<int>(qh[l] & 0x03U) << 4)) -
+      const std::uint32_t qll = qlw[l >> 2];
+      const std::uint32_t qhh = qhw[l >> 2];
+      const int sh = (l & 3) * 8;
+      const std::uint8_t b0 = (qll >> sh) & 0xFFU;
+      const std::uint8_t b1 = (qlw[8 + (l >> 2)] >> sh) & 0xFFU;
+      const std::uint8_t h0 = (qhh >> sh) & 0xFFU;
+      const int is = l >> 4;
+      const int v1 =
+          (static_cast<int>(b0 & 0x0FU) | (static_cast<int>(h0 & 0x03U) << 4)) -
+          32;
+      const int v2 = (static_cast<int>(b1 & 0x0FU) |
+                      (static_cast<int>((h0 >> 2U) & 0x03U) << 4)) -
                      32;
-      const int v2 = (static_cast<int>(ql[l + 32] & 0x0FU) |
-                      (static_cast<int>((qh[l] >> 2U) & 0x03U) << 4)) -
+      const int v3 = (static_cast<int>(b0 >> 4U) |
+                      (static_cast<int>((h0 >> 4U) & 0x03U) << 4)) -
                      32;
-      const int v3 = (static_cast<int>(ql[l] >> 4U) |
-                      (static_cast<int>((qh[l] >> 4U) & 0x03U) << 4)) -
+      const int v4 = (static_cast<int>(b1 >> 4U) |
+                      (static_cast<int>((h0 >> 6U) & 0x03U) << 4)) -
                      32;
-      const int v4 = (static_cast<int>(ql[l + 32] >> 4U) |
-                      (static_cast<int>((qh[l] >> 6U) & 0x03U) << 4)) -
-                     32;
-      acc += static_cast<float>(sc[is + 0]) * static_cast<float>(v1) * xx[l];
+      const float s0 = static_cast<float>(scr[is]);
+      const float s1 = static_cast<float>(scr[is + 2]);
+      acc += s0 * static_cast<float>(v1) * xx[l];
+      acc += s1 * static_cast<float>(v2) * xx[l + 32];
       acc +=
-          static_cast<float>(sc[is + 2]) * static_cast<float>(v2) * xx[l + 32];
+          static_cast<float>(scr[is + 4]) * static_cast<float>(v3) * xx[l + 64];
       acc +=
-          static_cast<float>(sc[is + 4]) * static_cast<float>(v3) * xx[l + 64];
-      acc +=
-          static_cast<float>(sc[is + 6]) * static_cast<float>(v4) * xx[l + 96];
+          static_cast<float>(scr[is + 6]) * static_cast<float>(v4) * xx[l + 96];
     }
   }
   return d * acc;
@@ -282,29 +296,28 @@ __device__ float BlockDotIQ2_S(const void* blk, const float* x) {
   return acc;
 }
 
-__device__ float BlockDot(int type, const void* blk, const float* x) {
-  switch (type) {
-    case kTypeF32:
-      return BlockDotF32(blk, x);
-    case kTypeF16:
-      return BlockDotF16(blk, x);
-    case kTypeQ8_0:
-      return BlockDotQ8_0(blk, x);
-    case kTypeQ6_K:
-      return BlockDotQ6_K(blk, x);
-    case kTypeIQ2_XXS:
-      return BlockDotIQ2_XXS(blk, x);
-    case kTypeIQ3_XXS:
-      return BlockDotIQ3_XXS(blk, x);
-    case kTypeIQ2_S:
-      return BlockDotIQ2_S(blk, x);
-    case kTypeQ2_K:
-      return BlockDotQ2_K(blk, x);
-    case kTypeQ3_K:
-      return BlockDotQ3_K(blk, x);
-    default:
-      return 0.0F;
-  }
+/// Compile-time dispatched block dot (a runtime switch here would keep every
+/// type's registers live and spill to scratch — a measured 10x slowdown).
+template<int TYPE>
+__device__ __forceinline__ float BlockDotT(const void* blk, const float* x) {
+  if constexpr (TYPE == kTypeF32)
+    return BlockDotF32(blk, x);
+  else if constexpr (TYPE == kTypeF16)
+    return BlockDotF16(blk, x);
+  else if constexpr (TYPE == kTypeQ8_0)
+    return BlockDotQ8_0(blk, x);
+  else if constexpr (TYPE == kTypeQ6_K)
+    return BlockDotQ6_K(blk, x);
+  else if constexpr (TYPE == kTypeIQ2_XXS)
+    return BlockDotIQ2_XXS(blk, x);
+  else if constexpr (TYPE == kTypeIQ3_XXS)
+    return BlockDotIQ3_XXS(blk, x);
+  else if constexpr (TYPE == kTypeIQ2_S)
+    return BlockDotIQ2_S(blk, x);
+  else if constexpr (TYPE == kTypeQ2_K)
+    return BlockDotQ2_K(blk, x);
+  else
+    return BlockDotQ3_K(blk, x);
 }
 
 // ---- full-block dequant (embedding lookup) ---------------------------------
@@ -518,11 +531,14 @@ __device__ void DequantBlock(int type, const void* blk, float* out) {
 
 /// y[row] = W[row] @ x over `total_rows` output rows.
 /// With `ids != nullptr` output row r maps to expert ids[r / m], row r % m of
-/// a [n_experts, m, n] weight tensor (MoE).
+/// a [n_experts, m, n] weight tensor (MoE, shared x).
+/// With `x_group > 0`, output rows of group g read x at x + g*n (per-group
+/// activations, e.g. per-head k_b/v_b projections).
+template<int TYPE>
 __global__ void RowDotKernel(const void* W, const float* x,
                              const int32_t* __restrict__ ids, float* y,
                              int total_rows, int m, int n_blocks, int qk,
-                             int block_bytes, int type, int tpr) {
+                             int block_bytes, int tpr, int x_group) {
   __shared__ float red[64];
   const int r = static_cast<int>(threadIdx.x) / tpr;
   const int t = static_cast<int>(threadIdx.x) % tpr;
@@ -533,30 +549,36 @@ __global__ void RowDotKernel(const void* W, const float* x,
   bool valid = out_row < total_rows;
   int row_in_matrix = out_row;
   const auto* base = static_cast<const std::uint8_t*>(W);
+  const float* x_base = x;
   if (valid && ids != nullptr) {
     const int expert = ids[out_row / m];
     row_in_matrix = out_row % m;
     valid = expert >= 0;
     if (valid)
       base += static_cast<std::size_t>(expert) * m * row_bytes;
+  } else if (valid && x_group > 0) {
+    x_base = x + static_cast<std::size_t>(out_row / x_group) * n_blocks * qk;
   }
   if (valid) {
     const std::uint8_t* w_row =
         base + static_cast<std::size_t>(row_in_matrix) * row_bytes;
     for (int b = t; b < n_blocks; b += tpr) {
-      acc += BlockDot(type, w_row + static_cast<std::size_t>(b) * block_bytes,
-                      x + static_cast<std::size_t>(b) * qk);
+      acc += BlockDotT<TYPE>(w_row + static_cast<std::size_t>(b) * block_bytes,
+                             x_base + static_cast<std::size_t>(b) * qk);
     }
   }
   red[threadIdx.x] = acc;
   __syncthreads();
-  for (int s = tpr / 2; s > 0; s >>= 1) {
-    if (t < s)
-      red[r * tpr + t] += red[r * tpr + t + s];
-    __syncthreads();
+  // In-order reduction per row: matches a serial dot when a thread holds at
+  // most one block (a tree reduction can flip MoE top-k selection through
+  // rounding).
+  if (t == 0) {
+    float s = 0.0F;
+    for (int i = 0; i < tpr; ++i)
+      s += red[r * tpr + i];
+    if (out_row < total_rows)
+      y[out_row] = s;
   }
-  if (t == 0 && out_row < total_rows)
-    y[out_row] = red[r * tpr];
 }
 
 /// out[hidden] = dequantized row `row` of a [vocab, hidden] weight matrix.
@@ -576,7 +598,7 @@ __global__ void EmbedRowKernel(const void* W, float* out, int row, int n_blocks,
 constexpr int kThreads = 64;
 
 bool LaunchRowDot(const void* W, const float* x, const int32_t* ids, float* y,
-                  int total_rows, int m, int n, int ggml_type,
+                  int total_rows, int m, int n, int ggml_type, int x_group,
                   hipStream_t stream) {
   const TypeTraits tr = Traits(ggml_type);
   if (W == nullptr || x == nullptr || y == nullptr || tr.qk == 0 ||
@@ -589,9 +611,42 @@ bool LaunchRowDot(const void* W, const float* x, const int32_t* ids, float* y,
     tpr *= 2;
   const int rpw = kThreads / tpr;
   const int grid = (total_rows + rpw - 1) / rpw;
-  hipLaunchKernelGGL(RowDotKernel, dim3(grid), dim3(kThreads), 0, stream, W, x,
-                     ids, y, total_rows, m, n_blocks, tr.qk, tr.block_bytes,
-                     ggml_type, tpr);
+  const auto launch = [&]<int TYPE>() {
+    hipLaunchKernelGGL(RowDotKernel<TYPE>, dim3(grid), dim3(kThreads), 0,
+                       stream, W, x, ids, y, total_rows, m, n_blocks, tr.qk,
+                       tr.block_bytes, tpr, x_group);
+  };
+  switch (ggml_type) {
+    case kTypeF32:
+      launch.template operator()<kTypeF32>();
+      break;
+    case kTypeF16:
+      launch.template operator()<kTypeF16>();
+      break;
+    case kTypeQ8_0:
+      launch.template operator()<kTypeQ8_0>();
+      break;
+    case kTypeQ2_K:
+      launch.template operator()<kTypeQ2_K>();
+      break;
+    case kTypeQ3_K:
+      launch.template operator()<kTypeQ3_K>();
+      break;
+    case kTypeQ6_K:
+      launch.template operator()<kTypeQ6_K>();
+      break;
+    case kTypeIQ2_XXS:
+      launch.template operator()<kTypeIQ2_XXS>();
+      break;
+    case kTypeIQ3_XXS:
+      launch.template operator()<kTypeIQ3_XXS>();
+      break;
+    case kTypeIQ2_S:
+      launch.template operator()<kTypeIQ2_S>();
+      break;
+    default:
+      return false;
+  }
   return true;
 }
 
@@ -610,7 +665,14 @@ std::size_t QuantMatrixBytes(int m, int n, int ggml_type) noexcept {
 
 bool QuantGemm(const void* W, const float* x_f32, float* y, int m, int n,
                int ggml_type, hipStream_t stream) {
-  return LaunchRowDot(W, x_f32, nullptr, y, m, m, n, ggml_type, stream);
+  return LaunchRowDot(W, x_f32, nullptr, y, m, m, n, ggml_type, 0, stream);
+}
+
+bool QuantGemmGroups(const void* W, const float* x, float* y, int groups, int m,
+                     int n, int ggml_type, hipStream_t stream) {
+  if (groups <= 0)
+    return false;
+  return LaunchRowDot(W, x, nullptr, y, groups * m, m, n, ggml_type, m, stream);
 }
 
 bool QuantGemmMoe(const void* W, const float* x_f32, const int32_t* ids,
@@ -618,7 +680,7 @@ bool QuantGemmMoe(const void* W, const float* x_f32, const int32_t* ids,
                   int ggml_type, hipStream_t stream) {
   if (n_experts <= 0 || top_k <= 0)
     return false;
-  return LaunchRowDot(W, x_f32, ids, y, top_k * m, m, n, ggml_type, stream);
+  return LaunchRowDot(W, x_f32, ids, y, top_k * m, m, n, ggml_type, 0, stream);
 }
 
 bool QuantEmbedLookup(const void* embd, float* out, int hidden, int token,

@@ -225,8 +225,8 @@ void TestGpuKdaParity() {
   hipStream_t stream;
   HIP_CHECK(hipStreamCreate(&stream));
 
-  const bool ok =
-      rocm::KdaPrefillGpu(geom_gpu, w_gpu, d_input, d_state, d_out, 8, stream);
+  const bool ok = rocm::KdaPrefillGpu(geom_gpu, w_gpu, d_input, d_state, d_out,
+                                      8, nullptr, stream);
   Require(ok, "GPU KDA prefill failed");
 
   // Copy back and compare.

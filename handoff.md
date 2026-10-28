@@ -200,28 +200,53 @@ Our approach:
    `QuantEmbedLookup` on the quantized weights (no F32 head copy).
 5. Quant types come from the loaded tensors — never hardcoded.
 
-**STATUS 2026-10-28 (issue #19): forward pass runs end-to-end on gfx1151.**
-`gufo prompt --model <gguf> --prompt "Hello" --max-tokens 4` exits 0;
-load 81.7 s. Generated text is still degenerate ("!!!!") because DSA layers
-use the simplified copy path (see Known issues).
+**STATUS 2026-10-28 (issue #19): GPU inference runs end-to-end with real
+MLA/DSA attention; 285 ms/token (3.5 tok/s) vs Maya 43 ms (23 tok/s).**
+`gufo prompt --prompt "The capital of France is" --max-tokens 16 --verbose`
+exits 0 with language-like continuations and prints per-token ms.
 
-Fixed on the way (all were silent-failure traps):
-- `SizeBytes()` returned 0 for IQ3_XXS/IQ2_S → whole tensors silently skipped
-  → MoE down_projections ran on NULL bases. Size table now covers
-  IQ2_XS/IQ2_S/IQ3_XXS/IQ1_S/IQ1_M; zero-size uploads hard-fail.
-- IQ3_XXS device dequant was zero-filled; IQ2_XXS codebook was approximate;
-  Q6_K scale indexing was wrong. All re-ported from llama.cpp and pinned by
-  `tests/models/glm5_next/quant_gemv_gpu_test.cpp` (9 types × shapes, MoE,
-  embed, golden blocks; host reference in `src/core/quant/ggml_dequant.*`,
-  codebooks in `src/core/quant/iq_grids.hpp`).
-- blk.45 (NextN draft block) ran in the trunk and dereferenced its absent mHC
-  weights; it is drafter-only (`num_layers - nextn`) and now skipped.
-- Arena budget over-advanced for F32 uploads (OOM risk); embed lookup copied
-  quantized bytes as F32; expert strides used element math on quantized
-  tensors. All fixed.
-- `Decode`/`Prefill` contract matches CPU engine again (Prefill returns raw
-  hidden; `Step(token)` advances state; CLI loop no longer re-decodes one
-  hidden).
+This session's correctness work (all GPU kernels use the loaded model's
+quantization):
+- **DSA/MLA real attention** — `MlaStepGpu` with incremental latent/ik/ig
+  caches (pool scoring, top-k selection, selected-cell softmax, v_b/wo).
+  GPU↔oracle parity 2e-7 (`mla_gpu_test`). The oracle now includes the
+  indexer `k_norm` on ik (it was skipped).
+- **mHC FFN mixer uses hc_ffn_\*** (was reusing attn mixer weights).
+- All quant types exact (Q2_K/Q3_K/Q6_K/IQ2_XXS/IQ3_XXS/IQ2_S/Q8_0/F32/F16),
+  per-tensor types plumbed from the pack; output head + embed lookup
+  quantized; expert byte-strides; blk.45 drafter-only.
+
+This session's speed work (520 → 285 ms/token):
+- Persistent kernel workspaces (was ~1600 hipMalloc/free per token).
+- Block-per-row matvecs (thread-per-row serial chains were latency-bound;
+  mHC fn matvec alone was 0.78 ms/call → 0.016 ms).
+- Fused mHC Sinkhorn (39 launches → 1).
+- In-order reductions (tree reduction flipped MoE top-k via rounding).
+
+Measured profile per token (bench: `qbench2` harness):
+| component | time | x count | total |
+| --- | --- | --- | --- |
+| KDA layer (4x Q6_K GEMM 8192x4096 @ 920 us) | 4.4 ms | 34 | 150 ms |
+| MoE layer | 1.44 ms | 45 | 65 ms |
+| DSA step @ 32K ctx | 5.4 ms | 12 | 65 ms |
+| mHC pre/post | 0.26/0.003 ms | 90 | 24 ms |
+
+### IMMEDIATE NEXT STEPS
+
+1. **QuantGemm Q8_1/dp4a tier** — the fused dequant-dot achieves ~30 GB/s vs
+   the ~150 GB/s effective Maya's `native_mmvq` hits. Port
+   `vec_dot_{q6_K,iq2_xxs,iq3_xxs}_q8_1` (vendored in
+   `qwen38_flash_next/kernels/rocm/mmq/vecdotq.hpp`) + a real
+   `QuantizeQ81`. Expected 285 → ~60-80 ms/token. Tried: templated kernels
+   (no change), word-load Q6_K (no change), dual-stream accumulators
+   (worse, reverted) — the win is in integer dp4a dots, not layout tweaks.
+2. **Quality vs Maya** — output is language-like but below Maya: check KDA
+   conv/state details, swiglu clamp (`swiglu_clamp_exp` config), and
+   compare logits against Maya (`maya --check-logits`).
+3. **Load time 69-81 s vs Maya 38 s** — per-tensor timings print to stderr;
+   likely host-side dequant + memcpy order.
+4. mHC Sinkhorn is single-threaded (0.12 ms/call); parallelize per column.
+5. MTP draft wiring (blk.45); expert top-k on GPU (still host D2H per layer).
 
 ### Memory budget (Maya-S v2 on 124 GB GPU)
 
@@ -277,15 +302,16 @@ Fixed on the way (all were silent-failure traps):
 
 ### Known issues
 
-1. **DSA/MLA attention is a copy-through stub** in `StepLayers` — DSA layers
-   (3,7,…,43) don't attend. Main quality gap.
-2. **Generated text is degenerate** ("!!!!") until (1) lands; the pipeline
-   itself (load, embed, KDA, MoE, mHC, head, step) runs on GPU.
-3. **Load 81 s vs Maya 38 s**; per-tensor load timings print to stderr.
-4. **mHC FFN mixer reuses the attn-mixer weights** (hc_ffn_* are bound but not
-   uploaded — GPU engine has 3 hc slots, model has 6).
-5. **MTP (blk.45) drafter not wired** (engine skips the block entirely).
-6. Expert routing top-k runs on host (copy of scores per token).
+1. **Quality below Maya** — text is language-like but garbled; remaining gaps
+   in KDA conv/state details and swiglu clamp params (see next steps).
+2. **QuantGemm tier is dequant-dot (~30 GB/s)** — the Q8_1/dp4a port is the
+   identified path to Maya-level tok/s.
+3. **Load 69-81 s vs Maya 38 s**; per-tensor load timings print to stderr.
+4. **DSA caches capped at 32K positions** (`kMaxDsaPos`) — 1M-context needs
+   KV streaming (issue #18).
+5. Expert routing top-k runs on host (2 small D2H syncs per MoE layer);
+   DSA pool selection does one D2H sync per full-attention layer.
+6. mHC Sinkhorn kernel is single-threaded per token.
 
 **Key geometry:** 46 blocks, hidden 4096, 34 KDA + 12 DSA (layers 3,7,…,43,45).
 Block 45 = MLA+DSA + MoE + NextN MTP, **no mHC**. 288+1 experts top-8 inter 2048

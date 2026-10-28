@@ -3,6 +3,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace gufo::models::glm5_next::rocm {
@@ -47,12 +48,18 @@ struct MoeGpuWeights {
   int down_exps_type{0};     ///< ggml_type for down_exps
 };
 
+/// Device scratch floats for one MoE / dense-FFN call.
+[[nodiscard]] std::size_t MoeScratchFloats(const MoeGpuGeometry& geom);
+[[nodiscard]] std::size_t DenseScratchFloats(std::uint32_t inter);
+
 /// Run MoE forward on GPU for one token.
 /// token_input: [hidden] on device.
 /// out: [hidden] on device (output).
-/// Returns true on success.
+/// scratch: MoeScratchFloats() floats of device memory, or nullptr to
+/// allocate internally (slow — tests only).
 bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
-                   const float* token_input, float* out, hipStream_t stream);
+                   const float* token_input, float* out, float* scratch,
+                   hipStream_t stream);
 
 /// Run dense FFN forward on GPU for one token.
 /// gate/up: [inter, hidden], down: [hidden, inter] on device, each stored in
@@ -61,7 +68,7 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
 bool DenseFfnForwardGpu(std::uint32_t hidden, std::uint32_t inter, float limit,
                         const float* gate, const float* up, const float* down,
                         int gate_type, int up_type, int down_type,
-                        const float* token_input, float* out,
+                        const float* token_input, float* out, float* scratch,
                         hipStream_t stream);
 
 }  // namespace gufo::models::glm5_next::rocm

@@ -34,6 +34,12 @@ namespace gufo::models::glm5_next::gpu {
 bool QuantGemm(const void* W, const float* x_f32, float* y, int m, int n,
                int ggml_type, hipStream_t stream);
 
+/// Quantized matvec per group: y[g*m + r] = W[g] row r @ x[g*n + :].
+/// W: [groups*m, n] quantized row-major (e.g. per-head k_b/v_b projections).
+/// x: [groups*n] device, y: [groups*m] device.
+bool QuantGemmGroups(const void* W, const float* x, float* y, int groups, int m,
+                     int n, int ggml_type, hipStream_t stream);
+
 /// Quantized matvec for MoE experts (3D weight tensor).
 /// W: [n_experts, m, n] quantized. ids: [top_k] expert indices.
 /// x_f32: [n] device. y: [top_k * m] device (expert-major).

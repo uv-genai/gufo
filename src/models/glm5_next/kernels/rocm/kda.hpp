@@ -3,6 +3,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace gufo::models::glm5_next::rocm {
@@ -54,23 +55,27 @@ struct KdaGpuWeights {
   int w_out_type{0};
 };
 
+/// Device scratch floats KdaPrefillGpu needs for T tokens.
+[[nodiscard]] std::size_t KdaScratchFloats(const KdaGpuGeometry& geom,
+                                           std::uint32_t seq_len);
+
 /// Run KDA prefill on GPU for a chunk of tokens.
 /// input: [hidden, T] on device.
 /// state: [num_heads, head_dim, head_dim] on device (recurrent state).
 /// out: [hidden, T] on device.
-/// Returns true on success.
+/// scratch: KdaScratchFloats() floats of device memory, or nullptr to
+/// allocate internally (slow — tests only).
 bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
                    const float* input, float* state, float* out,
-                   std::uint32_t seq_len, hipStream_t stream);
+                   std::uint32_t seq_len, float* scratch, hipStream_t stream);
 
 /// Run KDA decode on GPU for one token.
 /// token_input: [hidden] on device.
 /// state: [num_heads, head_dim, head_dim] on device (updated in place).
 /// out: [hidden] on device.
-/// Returns true on success.
 bool KdaDecodeGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
                   const float* token_input, float* state, float* out,
-                  hipStream_t stream);
+                  float* scratch, hipStream_t stream);
 
 }  // namespace gufo::models::glm5_next::rocm
 

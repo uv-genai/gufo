@@ -231,12 +231,17 @@ void TestGpuMlaParity() {
   HIP_CHECK(hipMemcpy(out_gpu.data(), d_out, H * 4 * sizeof(float),
                       hipMemcpyDeviceToHost));
 
-  // GPU implementation is simplified (no DSA indexer selection yet).
-  // Just verify it produces finite output.
-  for (float v : out_gpu) {
-    Require(std::isfinite(v), "non-finite GPU output");
+  // Compare against the CPU oracle (same math, including DSA selection).
+  const auto out_ref = glm5::DsaLayer(geom, w_cpu, cur, 4);
+  Require(out_ref.size() == out_gpu.size(), "oracle size mismatch");
+  double max_err = 0.0;
+  for (std::size_t i = 0; i < out_gpu.size(); ++i) {
+    Require(std::isfinite(out_gpu[i]), "non-finite GPU output");
+    const double err = std::abs(static_cast<double>(out_gpu[i]) - out_ref[i]);
+    max_err = std::max(max_err, err);
   }
-  std::cout << "TestGpuMlaParity: output finite (simplified GPU path)\n";
+  Require(max_err < 1e-3, "GPU DSA layer diverges from oracle");
+  std::cout << "TestGpuMlaParity: PASS (max err " << max_err << ")\n";
 
   // Cleanup.
   HIP_CHECK(hipStreamDestroy(stream));

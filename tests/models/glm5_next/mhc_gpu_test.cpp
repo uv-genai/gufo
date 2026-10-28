@@ -122,7 +122,7 @@ void TestGpuMhcParity() {
   HIP_CHECK(hipStreamCreate(&stream));
 
   const bool ok = rocm::MhcPreGpu(geom_gpu, w_gpu, d_residual, d_mixed, d_post,
-                                  d_comb, 4, stream);
+                                  d_comb, 4, nullptr, stream);
   Require(ok, "GPU mHC pre failed");
 
   // Copy back and compare mixed.

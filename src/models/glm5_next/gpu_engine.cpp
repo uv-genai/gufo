@@ -22,6 +22,63 @@ namespace {
 
 constexpr std::uint64_t kArenaAlign = 256;
 
+/// Per-layer weight-slot layout (parallel w_ptrs_/w_types_ arrays).
+enum Slot : int {
+  kKdaQ = 0,
+  kKdaK,
+  kKdaV,
+  kKdaOut,
+  kKdaConvQ,
+  kKdaConvK,
+  kKdaConvV,
+  kKdaA,
+  kKdaDtBias,
+  kKdaFa,
+  kKdaFb,
+  kKdaBeta,
+  kKdaGa,
+  kKdaGb,
+  kKdaNorm,
+  kHcAttnFn,
+  kHcAttnScale,
+  kHcAttnBase,
+  kMoeGateInp,
+  kMoeExpProbsB,
+  kMoeGateExps,
+  kMoeUpExps,
+  kMoeDownExps,
+  kMoeGateShexp,
+  kMoeUpShexp,
+  kMoeDownShexp,
+  kAttnNorm,
+  kFfnNorm,
+  kMlaQa,
+  kMlaQaNorm,
+  kMlaQb,
+  kMlaKvAMqa,
+  kMlaKvANorm,
+  kMlaKb,
+  kMlaVb,
+  kMlaOut,
+  kIdxQb,
+  kIdxK,
+  kIdxKNormW,
+  kIdxKNormB,
+  kIdxProj,
+  kIdxApe,
+  kIdxGate,
+  kDenseGate,
+  kDenseUp,
+  kDenseDown,
+  kHcFfnFn,
+  kHcFfnScale,
+  kHcFfnBase,
+  kSlotCount,
+};
+
+/// Decode-position cap for DSA latent caches (Maya's default context).
+constexpr std::uint32_t kMaxDsaPos = 32768;
+
 std::uint64_t Align256(std::uint64_t n) {
   return (n + kArenaAlign - 1) & ~(kArenaAlign - 1);
 }
@@ -86,6 +143,12 @@ void DequantToHost(const TensorRef& t, std::vector<float>& out) {
 }  // namespace
 
 GpuEngine::~GpuEngine() {
+  for (auto& st : mla_state_) {
+    // Caches and scratch are one allocation each (see Create).
+    hipFree(st.latents);
+    hipFree(st.scratch);
+  }
+  hipFree(ws_);
   hipFree(w_arena_);
   hipFree(state_);
   hipFree(sc_);
@@ -140,25 +203,58 @@ std::shared_ptr<GpuEngine> GpuEngine::Create(const Config& config,
     // KDA attention weights (quantized) + small F32 mixer weights,
     // mHC, MoE (experts quantized, router/shared F32), norms, MLA,
     // dense FFN (leading layers only; quantized).
-    const SlotSpec specs[35] = {
-        {&W.kda.attn_q, false},    {&W.kda.attn_k, false},
-        {&W.kda.attn_v, false},    {&W.kda.attn_out, false},
-        {&W.kda.conv1d_q, true},   {&W.kda.conv1d_k, true},
-        {&W.kda.conv1d_v, true},   {&W.kda.a, true},
-        {&W.kda.dt_bias, true},    {&W.kda.f_a, true},
-        {&W.kda.f_b, true},        {&W.kda.beta, true},
-        {&W.kda.g_a, true},        {&W.kda.g_b, true},
-        {&W.kda.norm, true},       {&W.hc.attn_fn, true},
-        {&W.hc.attn_scale, true},  {&W.hc.attn_base, true},
-        {&W.moe.gate_inp, true},   {&W.moe.exp_probs_b, true},
-        {&W.moe.gate_exps, false}, {&W.moe.up_exps, false},
-        {&W.moe.down_exps, false}, {&W.moe.gate_shexp, true},
-        {&W.moe.up_shexp, true},   {&W.moe.down_shexp, true},
-        {&W.attn_norm, true},      {&W.ffn_norm, true},
-        {&W.mla.q_a, true},        {&W.mla.q_a_norm, true},
-        {&W.mla.q_b, true},        {&W.mla.kv_a_mqa, true},
-        {&W.dense.gate, false},    {&W.dense.up, false},
-        {&W.dense.down, false},
+    // Per-layer slot order must match the Slot enum. Quantized tensors upload
+    // raw (kernels dequantize on the fly); small F32 tensors upload dense.
+    const SlotSpec specs[kSlotCount] = {
+        {&W.kda.attn_q, false},               // kKdaQ
+        {&W.kda.attn_k, false},               // kKdaK
+        {&W.kda.attn_v, false},               // kKdaV
+        {&W.kda.attn_out, false},             // kKdaOut
+        {&W.kda.conv1d_q, true},              // kKdaConvQ
+        {&W.kda.conv1d_k, true},              // kKdaConvK
+        {&W.kda.conv1d_v, true},              // kKdaConvV
+        {&W.kda.a, true},                     // kKdaA
+        {&W.kda.dt_bias, true},               // kKdaDtBias
+        {&W.kda.f_a, true},                   // kKdaFa
+        {&W.kda.f_b, true},                   // kKdaFb
+        {&W.kda.beta, true},                  // kKdaBeta
+        {&W.kda.g_a, true},                   // kKdaGa
+        {&W.kda.g_b, true},                   // kKdaGb
+        {&W.kda.norm, true},                  // kKdaNorm
+        {&W.hc.attn_fn, true},                // kHcAttnFn
+        {&W.hc.attn_scale, true},             // kHcAttnScale
+        {&W.hc.attn_base, true},              // kHcAttnBase
+        {&W.moe.gate_inp, true},              // kMoeGateInp
+        {&W.moe.exp_probs_b, true},           // kMoeExpProbsB
+        {&W.moe.gate_exps, false},            // kMoeGateExps
+        {&W.moe.up_exps, false},              // kMoeUpExps
+        {&W.moe.down_exps, false},            // kMoeDownExps
+        {&W.moe.gate_shexp, true},            // kMoeGateShexp
+        {&W.moe.up_shexp, true},              // kMoeUpShexp
+        {&W.moe.down_shexp, true},            // kMoeDownShexp
+        {&W.attn_norm, true},                 // kAttnNorm
+        {&W.ffn_norm, true},                  // kFfnNorm
+        {&W.mla.q_a, false},                  // kMlaQa
+        {&W.mla.q_a_norm, true},              // kMlaQaNorm
+        {&W.mla.q_b, false},                  // kMlaQb
+        {&W.mla.kv_a_mqa, false},             // kMlaKvAMqa
+        {&W.mla.kv_a_norm, true},             // kMlaKvANorm
+        {&W.mla.k_b, false},                  // kMlaKb
+        {&W.mla.v_b, false},                  // kMlaVb
+        {&W.mla.output, false},               // kMlaOut
+        {&W.indexer.q_b, false},              // kIdxQb
+        {&W.indexer.k, false},                // kIdxK
+        {&W.indexer.k_norm_weight, true},     // kIdxKNormW
+        {&W.indexer.k_norm_bias, true},       // kIdxKNormB
+        {&W.indexer.proj, false},             // kIdxProj
+        {&W.indexer.compressor_ape, true},    // kIdxApe
+        {&W.indexer.compressor_gate, false},  // kIdxGate
+        {&W.dense.gate, false},               // kDenseGate
+        {&W.dense.up, false},                 // kDenseUp
+        {&W.dense.down, false},               // kDenseDown
+        {&W.hc.ffn_fn, true},                 // kHcFfnFn
+        {&W.hc.ffn_scale, true},              // kHcFfnScale
+        {&W.hc.ffn_base, true},               // kHcFfnBase
     };
     flat.insert(flat.end(), std::begin(specs), std::end(specs));
   }
@@ -301,13 +397,15 @@ std::shared_ptr<GpuEngine> GpuEngine::Create(const Config& config,
           engine->token_embd_type_, (void*)engine->output_head_,
           engine->output_head_type_, (void*)engine->output_norm_);
 
-  std::vector<float*> layer_ptr(n_layers * 35, nullptr);
-  std::vector<int> layer_type(n_layers * 35, 0);
+  std::vector<float*> layer_ptr(static_cast<std::size_t>(n_layers) * kSlotCount,
+                                nullptr);
+  std::vector<int> layer_type(static_cast<std::size_t>(n_layers) * kSlotCount,
+                              0);
   for (std::uint32_t i = 0; i < n_layers && i < weights.layers.size(); ++i) {
-    for (int k = 0; k < 35; ++k) {
-      const std::size_t src = 3 + i * 35 + k;
-      layer_ptr[i * 35 + k] = flat_dev[src];
-      layer_type[i * 35 + k] = flat_type[src];
+    for (int k = 0; k < kSlotCount; ++k) {
+      const std::size_t src = 3 + static_cast<std::size_t>(i) * kSlotCount + k;
+      layer_ptr[static_cast<std::size_t>(i) * kSlotCount + k] = flat_dev[src];
+      layer_type[static_cast<std::size_t>(i) * kSlotCount + k] = flat_type[src];
     }
   }
   engine->w_ptrs_ = std::move(layer_ptr);
@@ -361,6 +459,82 @@ std::shared_ptr<GpuEngine> GpuEngine::Create(const Config& config,
   }
   fprintf(stderr, "[glm5_gpu] scratch arena done\n");
 
+  // ---- Shared kernel workspace (one allocation reused by every kernel call).
+  {
+    const std::uint64_t kda_ws = rocm::KdaScratchFloats(
+        {engine->H_, engine->nh_, engine->dk_, 0, 0.0F, 0.0F}, 1);
+    rocm::MhcGpuGeometry mg{};
+    mg.hidden_size = engine->H_;
+    mg.hc_count = engine->hc_;
+    mg.hc_mix_dim = 24;
+    const std::uint64_t mhc_ws = rocm::MhcScratchFloats(mg, 1);
+    rocm::MoeGpuGeometry og{};
+    og.hidden_size = engine->H_;
+    og.num_experts = config.num_experts;
+    og.expert_ff = config.expert_ff;
+    og.shared_ff = config.shared_expert_ff;
+    const std::uint64_t moe_ws = rocm::MoeScratchFloats(og);
+    const std::uint64_t dense_ws = rocm::DenseScratchFloats(config.dense_ff);
+    engine->ws_bytes_ =
+        std::max({kda_ws, mhc_ws, moe_ws, dense_ws}) * sizeof(float);
+    if (hipMalloc(&engine->ws_, engine->ws_bytes_) != hipSuccess) {
+      if (error_msg)
+        *error_msg = "kernel workspace alloc failed";
+      return nullptr;
+    }
+  }
+  fprintf(stderr, "[glm5_gpu] kernel workspace: %lu MiB\n",
+          (unsigned long)(engine->ws_bytes_ / (1024 * 1024)));
+
+  // ---- Per-layer DSA state: latent / indexer-key caches + kernel scratch.
+  engine->mla_geom_.hidden_size = engine->H_;
+  engine->mla_geom_.num_heads = config.num_attention_heads;
+  engine->mla_geom_.qk_nope = config.qk_nope_dim;
+  engine->mla_geom_.v_head_dim = config.v_head_dim;
+  engine->mla_geom_.q_lora_rank = config.q_lora_rank;
+  engine->mla_geom_.kv_lora_rank = config.kv_lora_rank;
+  engine->mla_geom_.norm_eps = config.layer_norm_rms_eps;
+  engine->mla_geom_.idx_n_head = config.indexer_heads;
+  engine->mla_geom_.idx_key_dim = config.indexer_head_dim;
+  engine->mla_geom_.idx_top_k = config.indexer_top_k;
+  engine->mla_geom_.idx_kpool = config.indexer_kpool;
+  engine->mla_geom_.idx_kpool_select_tail = true;
+  engine->mla_state_.assign(n_layers, rocm::MlaGpuState{});
+  const std::uint32_t max_pos =
+      std::min<std::uint32_t>(config.context_length, kMaxDsaPos);
+  for (std::uint32_t i = 0; i < n_layers; ++i) {
+    if (!config.IsFullAttention(i))
+      continue;
+    auto& st = engine->mla_state_[i];
+    st.max_pos = max_pos;
+    const std::uint64_t cache_bytes =
+        rocm::MlaCacheBytes(max_pos, engine->mla_geom_);
+    void* caches = nullptr;
+    if (hipMalloc(&caches, cache_bytes) != hipSuccess) {
+      if (error_msg)
+        *error_msg = "DSA cache alloc failed";
+      return nullptr;
+    }
+    hipMemset(caches, 0, cache_bytes);
+    st.latents = static_cast<float*>(caches);
+    st.idx_ik = reinterpret_cast<float*>(static_cast<char*>(caches) +
+                                         static_cast<std::size_t>(max_pos) *
+                                             sizeof(float) *
+                                             engine->mla_geom_.kv_lora_rank);
+    st.idx_ig = reinterpret_cast<float*>(
+        static_cast<char*>(caches) +
+        static_cast<std::size_t>(max_pos) * sizeof(float) *
+            (engine->mla_geom_.kv_lora_rank + engine->mla_geom_.idx_key_dim));
+    const std::uint64_t scratch_bytes =
+        rocm::MlaStateFloats(max_pos, engine->mla_geom_) * sizeof(float);
+    if (hipMalloc(&st.scratch, scratch_bytes) != hipSuccess) {
+      if (error_msg)
+        *error_msg = "DSA scratch alloc failed";
+      return nullptr;
+    }
+  }
+  fprintf(stderr, "[glm5_gpu] DSA state done (max_pos=%u)\n", max_pos);
+
   fprintf(stderr, "[glm5_gpu] Create complete\n");
   return engine;
 }
@@ -375,7 +549,7 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
     // The NextN draft block is drafter-only (Maya runs the trunk without it).
     if (config_.IsMtpLayer(il))
       continue;
-    const std::size_t base = il * 35;
+    const std::size_t base = static_cast<std::size_t>(il) * kSlotCount;
 
     // 1. mHC read (attn mixer).
     rocm::MhcGpuGeometry mhc_geom;
@@ -386,23 +560,52 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
     mhc_geom.eps = config_.hc_epsilon;
     mhc_geom.norm_eps = config_.layer_norm_rms_eps;
 
-    rocm::MhcGpuWeights mhc_w;
-    mhc_w.fn = w_ptrs_[base + 15];
-    mhc_w.scale = w_ptrs_[base + 16];
-    mhc_w.base = w_ptrs_[base + 17];
+    rocm::MhcGpuWeights mhc_attn_w;
+    mhc_attn_w.fn = w_ptrs_[base + kHcAttnFn];
+    mhc_attn_w.scale = w_ptrs_[base + kHcAttnScale];
+    mhc_attn_w.base = w_ptrs_[base + kHcAttnBase];
 
     float* mixed = sc_;
     float* post = sc_ + H_;
     float* comb = post + hc_;
     float* attn_out = comb + hc_ * hc_;
 
-    if (!rocm::MhcPreGpu(mhc_geom, mhc_w, R, mixed, post, comb, T, stream))
+    if (!rocm::MhcPreGpu(mhc_geom, mhc_attn_w, R, mixed, post, comb, T, ws_,
+                         stream))
       return false;
 
-    // 2. Attention (KDA or DSA).
+    // 2. Attention (KDA mixer or NoPE-MLA + DSA indexer).
     if (config_.IsFullAttention(il)) {
-      // MLA/DSA — simplified for now (copy mixed to attn_out).
-      hipMemcpy(attn_out, mixed, H_ * sizeof(float), hipMemcpyDeviceToDevice);
+      rocm::MlaGpuWeights mla_w;
+      mla_w.q_a = w_ptrs_[base + kMlaQa];
+      mla_w.q_a_type = w_types_[base + kMlaQa];
+      mla_w.q_a_norm = w_ptrs_[base + kMlaQaNorm];
+      mla_w.q_b = w_ptrs_[base + kMlaQb];
+      mla_w.q_b_type = w_types_[base + kMlaQb];
+      mla_w.kv_a_mqa = w_ptrs_[base + kMlaKvAMqa];
+      mla_w.kv_a_mqa_type = w_types_[base + kMlaKvAMqa];
+      mla_w.kv_a_norm = w_ptrs_[base + kMlaKvANorm];
+      mla_w.k_b = w_ptrs_[base + kMlaKb];
+      mla_w.k_b_type = w_types_[base + kMlaKb];
+      mla_w.v_b = w_ptrs_[base + kMlaVb];
+      mla_w.v_b_type = w_types_[base + kMlaVb];
+      mla_w.output = w_ptrs_[base + kMlaOut];
+      mla_w.output_type = w_types_[base + kMlaOut];
+      mla_w.idx_q_b = w_ptrs_[base + kIdxQb];
+      mla_w.idx_q_b_type = w_types_[base + kIdxQb];
+      mla_w.idx_k = w_ptrs_[base + kIdxK];
+      mla_w.idx_k_type = w_types_[base + kIdxK];
+      mla_w.idx_k_norm_w = w_ptrs_[base + kIdxKNormW];
+      mla_w.idx_k_norm_b = w_ptrs_[base + kIdxKNormB];
+      mla_w.idx_proj = w_ptrs_[base + kIdxProj];
+      mla_w.idx_proj_type = w_types_[base + kIdxProj];
+      mla_w.idx_ape = w_ptrs_[base + kIdxApe];
+      mla_w.idx_gate = w_ptrs_[base + kIdxGate];
+      mla_w.idx_gate_type = w_types_[base + kIdxGate];
+
+      if (!rocm::MlaStepGpu(mla_geom_, mla_w, mla_state_[il], mixed, attn_out,
+                            pos, stream))
+        return false;
     } else {
       // KDA mixer.
       rocm::KdaGpuGeometry kda_geom;
@@ -414,31 +617,31 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
       kda_geom.norm_eps = config_.layer_norm_rms_eps;
 
       rocm::KdaGpuWeights kda_w;
-      kda_w.w_q = w_ptrs_[base + 0];
-      kda_w.w_k = w_ptrs_[base + 1];
-      kda_w.w_v = w_ptrs_[base + 2];
-      kda_w.w_out = w_ptrs_[base + 3];
+      kda_w.w_q = w_ptrs_[base + kKdaQ];
+      kda_w.w_k = w_ptrs_[base + kKdaK];
+      kda_w.w_v = w_ptrs_[base + kKdaV];
+      kda_w.w_out = w_ptrs_[base + kKdaOut];
       // Quant types come from the loaded tensors, not hardcoded constants.
-      kda_w.w_q_type = w_types_[base + 0];
-      kda_w.w_k_type = w_types_[base + 1];
-      kda_w.w_v_type = w_types_[base + 2];
-      kda_w.w_out_type = w_types_[base + 3];
-      kda_w.conv_q = w_ptrs_[base + 4];
-      kda_w.conv_k = w_ptrs_[base + 5];
-      kda_w.conv_v = w_ptrs_[base + 6];
-      kda_w.ssm_a = w_ptrs_[base + 7];
-      kda_w.dt_bias = w_ptrs_[base + 8];
-      kda_w.f_a = w_ptrs_[base + 9];
-      kda_w.f_b = w_ptrs_[base + 10];
-      kda_w.ssm_beta = w_ptrs_[base + 11];
-      kda_w.g_a = w_ptrs_[base + 12];
-      kda_w.g_b = w_ptrs_[base + 13];
-      kda_w.ssm_norm = w_ptrs_[base + 14];
+      kda_w.w_q_type = w_types_[base + kKdaQ];
+      kda_w.w_k_type = w_types_[base + kKdaK];
+      kda_w.w_v_type = w_types_[base + kKdaV];
+      kda_w.w_out_type = w_types_[base + kKdaOut];
+      kda_w.conv_q = w_ptrs_[base + kKdaConvQ];
+      kda_w.conv_k = w_ptrs_[base + kKdaConvK];
+      kda_w.conv_v = w_ptrs_[base + kKdaConvV];
+      kda_w.ssm_a = w_ptrs_[base + kKdaA];
+      kda_w.dt_bias = w_ptrs_[base + kKdaDtBias];
+      kda_w.f_a = w_ptrs_[base + kKdaFa];
+      kda_w.f_b = w_ptrs_[base + kKdaFb];
+      kda_w.ssm_beta = w_ptrs_[base + kKdaBeta];
+      kda_w.g_a = w_ptrs_[base + kKdaGa];
+      kda_w.g_b = w_ptrs_[base + kKdaGb];
+      kda_w.ssm_norm = w_ptrs_[base + kKdaNorm];
 
       float* state_ptr =
           kda_S_off_[il] >= 0 ? state_ + kda_S_off_[il] : nullptr;
       if (!rocm::KdaPrefillGpu(kda_geom, kda_w, mixed, state_ptr, attn_out, T,
-                               stream))
+                               ws_, stream))
         return false;
     }
 
@@ -448,17 +651,23 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
       return false;
     R = R_new;
 
-    // 4. mHC read (FFN mixer).
-    if (!rocm::MhcPreGpu(mhc_geom, mhc_w, R, mixed, post, comb, T, stream))
+    // 4. mHC read (FFN mixer) — uses the FFN mixer weights.
+    rocm::MhcGpuWeights mhc_ffn_w;
+    mhc_ffn_w.fn = w_ptrs_[base + kHcFfnFn];
+    mhc_ffn_w.scale = w_ptrs_[base + kHcFfnScale];
+    mhc_ffn_w.base = w_ptrs_[base + kHcFfnBase];
+    if (!rocm::MhcPreGpu(mhc_geom, mhc_ffn_w, R, mixed, post, comb, T, ws_,
+                         stream))
       return false;
 
     // 5. FFN (dense for leading layers, MoE otherwise).
     float* ffn_out = sc_ + H_ + hc_ + hc_ * hc_ + H_;
     if (config_.IsDenseFfn(il)) {
       if (!rocm::DenseFfnForwardGpu(
-              H_, config_.dense_ff, 10.0f, w_ptrs_[base + 32],
-              w_ptrs_[base + 33], w_ptrs_[base + 34], w_types_[base + 32],
-              w_types_[base + 33], w_types_[base + 34], mixed, ffn_out, stream))
+              H_, config_.dense_ff, 10.0f, w_ptrs_[base + kDenseGate],
+              w_ptrs_[base + kDenseUp], w_ptrs_[base + kDenseDown],
+              w_types_[base + kDenseGate], w_types_[base + kDenseUp],
+              w_types_[base + kDenseDown], mixed, ffn_out, ws_, stream))
         return false;
     } else {
       rocm::MoeGpuGeometry moe_geom;
@@ -473,21 +682,21 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
       moe_geom.renorm_clamp = 6.103515625e-5f;
 
       rocm::MoeGpuWeights moe_w;
-      moe_w.gate_inp = w_ptrs_[base + 18];
-      moe_w.exp_probs_b = w_ptrs_[base + 19];
-      moe_w.gate_exps = w_ptrs_[base + 20];
-      moe_w.up_exps = w_ptrs_[base + 21];
-      moe_w.down_exps = w_ptrs_[base + 22];
-      moe_w.gate_shexp = w_ptrs_[base + 23];
-      moe_w.up_shexp = w_ptrs_[base + 24];
-      moe_w.down_shexp = w_ptrs_[base + 25];
+      moe_w.gate_inp = w_ptrs_[base + kMoeGateInp];
+      moe_w.exp_probs_b = w_ptrs_[base + kMoeExpProbsB];
+      moe_w.gate_exps = w_ptrs_[base + kMoeGateExps];
+      moe_w.up_exps = w_ptrs_[base + kMoeUpExps];
+      moe_w.down_exps = w_ptrs_[base + kMoeDownExps];
+      moe_w.gate_shexp = w_ptrs_[base + kMoeGateShexp];
+      moe_w.up_shexp = w_ptrs_[base + kMoeUpShexp];
+      moe_w.down_shexp = w_ptrs_[base + kMoeDownShexp];
       // Quant types come from the loaded tensors (Maya-S: IQ2_XXS gate/up,
-      // IQ3_XXS down — but never hardcoded here).
-      moe_w.gate_exps_type = w_types_[base + 20];
-      moe_w.up_exps_type = w_types_[base + 21];
-      moe_w.down_exps_type = w_types_[base + 22];
+      // IQ2_S/IQ3_XXS/Q3_K down — but never hardcoded here).
+      moe_w.gate_exps_type = w_types_[base + kMoeGateExps];
+      moe_w.up_exps_type = w_types_[base + kMoeUpExps];
+      moe_w.down_exps_type = w_types_[base + kMoeDownExps];
 
-      if (!rocm::MoeForwardGpu(moe_geom, moe_w, mixed, ffn_out, stream))
+      if (!rocm::MoeForwardGpu(moe_geom, moe_w, mixed, ffn_out, ws_, stream))
         return false;
     }
 

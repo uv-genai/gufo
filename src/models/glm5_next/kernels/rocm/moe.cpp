@@ -43,14 +43,25 @@ __global__ void AddBiasKernel(const float* __restrict__ probs,
 __global__ void MatVecKernel(const float* __restrict__ W,
                              const float* __restrict__ x, float* __restrict__ y,
                              int m, int n) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < m) {
-    float acc = 0.0f;
-    const float* row = W + i * n;
-    for (int j = 0; j < n; ++j) {
-      acc += row[j] * x[j];
-    }
-    y[i] = acc;
+  // One workgroup per row; threads split the dot and sum partials in thread
+  // order (a serial per-row chain is latency-bound; a tree reduction can flip
+  // MoE top-k selection through rounding).
+  __shared__ float red[256];
+  const int row = blockIdx.x;
+  if (row >= m)
+    return;
+  const float* wrow = W + static_cast<std::size_t>(row) * n;
+  float acc = 0.0f;
+  for (int j = static_cast<int>(threadIdx.x); j < n;
+       j += static_cast<int>(blockDim.x))
+    acc += wrow[j] * x[j];
+  red[threadIdx.x] = acc;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float s = 0.0f;
+    for (int i = 0; i < static_cast<int>(blockDim.x); ++i)
+      s += red[i];
+    y[row] = s;
   }
 }
 
@@ -88,8 +99,14 @@ __global__ void AddKernel(float* __restrict__ out,
 
 }  // namespace
 
+std::size_t MoeScratchFloats(const MoeGpuGeometry& geom) {
+  return 3ULL * geom.num_experts + 3ULL * geom.expert_ff +
+         3ULL * geom.hidden_size + 3ULL * geom.shared_ff;
+}
+
 bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
-                   const float* token_input, float* out, hipStream_t stream) {
+                   const float* token_input, float* out, float* scratch,
+                   hipStream_t stream) {
   const std::uint32_t H = geom.hidden_size;
   const std::uint32_t E = geom.num_experts;
   const std::uint32_t I = geom.expert_ff;
@@ -97,31 +114,37 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
   const std::uint32_t k = geom.top_k;
   const float limit = geom.swiglu_limit;
 
-  // Allocate scratch.
-  float *logits, *probs, *sel_scores;
-  float *gate, *up, *h, *expert_out, *acc;
-  float *gate_s, *up_s, *h_s, *shexp;
-
-  HIP_CHECK(hipMalloc(&logits, E * sizeof(float)));
-  HIP_CHECK(hipMalloc(&probs, E * sizeof(float)));
-  HIP_CHECK(hipMalloc(&sel_scores, E * sizeof(float)));
-  HIP_CHECK(hipMalloc(&gate, I * sizeof(float)));
-  HIP_CHECK(hipMalloc(&up, I * sizeof(float)));
-  HIP_CHECK(hipMalloc(&h, I * sizeof(float)));
-  HIP_CHECK(hipMalloc(&expert_out, H * sizeof(float)));
-  HIP_CHECK(hipMalloc(&acc, H * sizeof(float)));
-  HIP_CHECK(hipMalloc(&gate_s, SI * sizeof(float)));
-  HIP_CHECK(hipMalloc(&up_s, SI * sizeof(float)));
-  HIP_CHECK(hipMalloc(&h_s, SI * sizeof(float)));
-  HIP_CHECK(hipMalloc(&shexp, H * sizeof(float)));
+  // Device scratch (caller-owned when provided; bump-allocated).
+  float* owned = nullptr;
+  if (scratch == nullptr) {
+    HIP_CHECK(hipMalloc(&owned, MoeScratchFloats(geom) * sizeof(float)));
+    scratch = owned;
+  }
+  float* sp = scratch;
+  auto take = [&sp](std::size_t n) {
+    float* r = sp;
+    sp += n;
+    return r;
+  };
+  float* logits = take(E);
+  float* probs = take(E);
+  float* sel_scores = take(E);
+  float* gate = take(I);
+  float* up = take(I);
+  float* h = take(I);
+  float* expert_out = take(H);
+  float* acc = take(H);
+  float* gate_s = take(SI);
+  float* up_s = take(SI);
+  float* h_s = take(SI);
+  float* shexp = take(H);
 
   const int block = 256;
 
   // 1. Router: logits = gate_inp @ x.
   {
-    const int grid = (E + block - 1) / block;
-    hipLaunchKernelGGL(MatVecKernel, dim3(grid), dim3(block), 0, stream,
-                       w.gate_inp, token_input, logits, E, H);
+    hipLaunchKernelGGL(MatVecKernel, dim3(E), dim3(256), 0, stream, w.gate_inp,
+                       token_input, logits, E, H);
   }
 
   // 2. probs = sigmoid(logits).
@@ -226,15 +249,14 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
 
   // 8. Shared expert.
   {
-    int grid = (SI + block - 1) / block;
-    hipLaunchKernelGGL(MatVecKernel, dim3(grid), dim3(block), 0, stream,
+    const int grid = (SI + block - 1) / block;
+    hipLaunchKernelGGL(MatVecKernel, dim3(SI), dim3(256), 0, stream,
                        w.gate_shexp, token_input, gate_s, SI, H);
-    hipLaunchKernelGGL(MatVecKernel, dim3(grid), dim3(block), 0, stream,
-                       w.up_shexp, token_input, up_s, SI, H);
+    hipLaunchKernelGGL(MatVecKernel, dim3(SI), dim3(256), 0, stream, w.up_shexp,
+                       token_input, up_s, SI, H);
     hipLaunchKernelGGL(SwigluClampKernel, dim3(grid), dim3(block), 0, stream,
                        gate_s, up_s, h_s, SI, limit);
-    grid = (H + block - 1) / block;
-    hipLaunchKernelGGL(MatVecKernel, dim3(grid), dim3(block), 0, stream,
+    hipLaunchKernelGGL(MatVecKernel, dim3(H), dim3(256), 0, stream,
                        w.down_shexp, h_s, shexp, H, SI);
   }
 
@@ -246,41 +268,36 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
                        shexp, H);
   }
 
-  // Cleanup.
-  HIP_CHECK(hipFree(logits));
-  HIP_CHECK(hipFree(probs));
-  HIP_CHECK(hipFree(sel_scores));
-  HIP_CHECK(hipFree(gate));
-  HIP_CHECK(hipFree(up));
-  HIP_CHECK(hipFree(h));
-  HIP_CHECK(hipFree(expert_out));
-  HIP_CHECK(hipFree(acc));
-  HIP_CHECK(hipFree(gate_s));
-  HIP_CHECK(hipFree(up_s));
-  HIP_CHECK(hipFree(h_s));
-  HIP_CHECK(hipFree(shexp));
-  HIP_CHECK(hipStreamSynchronize(stream));
+  if (owned)
+    hipFree(owned);
   return true;
+}
+
+std::size_t DenseScratchFloats(std::uint32_t inter) {
+  return 3ULL * inter;
 }
 
 bool DenseFfnForwardGpu(std::uint32_t hidden, std::uint32_t inter, float limit,
                         const float* gate, const float* up, const float* down,
                         int gate_type, int up_type, int down_type,
-                        const float* token_input, float* out,
+                        const float* token_input, float* out, float* scratch,
                         hipStream_t stream) {
-  float *g, *u, *h;
-  HIP_CHECK(hipMalloc(&g, inter * sizeof(float)));
-  HIP_CHECK(hipMalloc(&u, inter * sizeof(float)));
-  HIP_CHECK(hipMalloc(&h, inter * sizeof(float)));
+  float* owned = nullptr;
+  if (scratch == nullptr) {
+    HIP_CHECK(hipMalloc(&owned, DenseScratchFloats(inter) * sizeof(float)));
+    scratch = owned;
+  }
+  float* g = scratch;
+  float* u = scratch + inter;
+  float* h = scratch + 2 * inter;
 
   const int block = 256;
 
   // gate = gate @ x, up = up @ x (quantized on-the-fly).
   if (!gpu::QuantGemm(gate, token_input, g, inter, hidden, gate_type, stream) ||
       !gpu::QuantGemm(up, token_input, u, inter, hidden, up_type, stream)) {
-    HIP_CHECK(hipFree(g));
-    HIP_CHECK(hipFree(u));
-    HIP_CHECK(hipFree(h));
+    if (owned)
+      hipFree(owned);
     return false;
   }
   {
@@ -293,10 +310,8 @@ bool DenseFfnForwardGpu(std::uint32_t hidden, std::uint32_t inter, float limit,
   const bool ok =
       gpu::QuantGemm(down, h, out, hidden, inter, down_type, stream);
 
-  HIP_CHECK(hipFree(g));
-  HIP_CHECK(hipFree(u));
-  HIP_CHECK(hipFree(h));
-  HIP_CHECK(hipStreamSynchronize(stream));
+  if (owned)
+    hipFree(owned);
   return ok;
 }
 

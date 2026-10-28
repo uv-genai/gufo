@@ -1091,6 +1091,7 @@ int RunPrompt(std::span<const char* const> args) {
       const int max_tokens =
           opt.max_tokens > 0 ? static_cast<int>(opt.max_tokens) : 128;
       std::string output;
+      auto t_tok = std::chrono::steady_clock::now();
       for (int i = 0; i < max_tokens; ++i) {
         const auto token = engine->Decode(hidden);
         // Decode token to text.
@@ -1101,6 +1102,13 @@ int RunPrompt(std::span<const char* const> args) {
           break;  // EOS
         output += piece;
         hidden = engine->Step(token);
+        const auto t_now = std::chrono::steady_clock::now();
+        const auto ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(t_now - t_tok)
+                .count();
+        t_tok = t_now;
+        if (opt.verbose)
+          std::cerr << "[tok " << i << "] " << ms << " ms\n";
       }
       if (opt.display_prompt) {
         std::cout << opt.prompt_text << '\n';

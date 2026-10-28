@@ -225,42 +225,70 @@ __global__ void CausalConv1dKernel(const float* __restrict__ input,
 __global__ void MatVecKernel(const float* __restrict__ W,
                              const float* __restrict__ x, float* __restrict__ y,
                              int m, int n) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < m) {
-    float acc = 0.0f;
-    const float* row = W + i * n;
-    for (int j = 0; j < n; ++j) {
-      acc += row[j] * x[j];
-    }
-    y[i] = acc;
+  // One workgroup per row; threads split the dot (serial per-row chains are
+  // latency-bound).
+  __shared__ float red[256];
+  const int row = blockIdx.x;
+  if (row >= m)
+    return;
+  float acc = 0.0f;
+  const float* wrow = W + row * n;
+  for (int j = threadIdx.x; j < n; j += blockDim.x)
+    acc += wrow[j] * x[j];
+  red[threadIdx.x] = acc;
+  __syncthreads();
+  // In-order reduction on one thread: summation order then matches the CPU
+  // oracle when a thread holds at most one term (a tree reduction can flip
+  // MoE top-k selection through rounding).
+  if (threadIdx.x == 0) {
+    float s = 0.0f;
+    for (int i = 0; i < blockDim.x; ++i)
+      s += red[i];
+    y[row] = s;
   }
 }
 
-/// Batched MatVec for [inner, T] output from [inner, H] @ [H, T].
+/// Batched MatVec for [m, T] output from [m, n] @ [n, T].
 __global__ void BatchedMatVecKernel(const float* __restrict__ W,
                                     const float* __restrict__ x,
                                     float* __restrict__ y, int m, int n,
                                     int T) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total = m * T;
-  if (idx >= total)
+  __shared__ float red[256];
+  const int row = blockIdx.x;
+  if (row >= m * T)
     return;
-  const int t = idx / m;
-  const int i = idx % m;
+  const int t = row / m;
+  const int i = row % m;
   float acc = 0.0f;
-  const float* row = W + i * n;
-  const float* x_col = x + t * n;
-  for (int j = 0; j < n; ++j) {
-    acc += row[j] * x_col[j];
+  const float* wrow = W + i * n;
+  const float* xcol = x + t * n;
+  for (int j = threadIdx.x; j < n; j += blockDim.x)
+    acc += wrow[j] * xcol[j];
+  red[threadIdx.x] = acc;
+  __syncthreads();
+  // In-order reduction on one thread: summation order then matches the CPU
+  // oracle when a thread holds at most one term (a tree reduction can flip
+  // MoE top-k selection through rounding).
+  if (threadIdx.x == 0) {
+    float s = 0.0f;
+    for (int i = 0; i < blockDim.x; ++i)
+      s += red[i];
+    y[row] = s;
   }
-  y[t * m + i] = acc;
 }
 
 }  // namespace
 
+std::size_t KdaScratchFloats(const KdaGpuGeometry& geom,
+                             std::uint32_t seq_len) {
+  const std::uint32_t inner = geom.num_heads * geom.head_dim;
+  return 12ULL * inner * seq_len + 2ULL * geom.num_heads * seq_len +
+         2ULL * geom.head_dim * seq_len;
+}
+
 bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
                    const float* input, float* state, float* out,
-                   std::uint32_t seq_len, hipStream_t stream) {
+                   std::uint32_t seq_len, float* scratch, hipStream_t stream) {
   const std::uint32_t H = geom.hidden_size;
   const std::uint32_t nh = geom.num_heads;
   const std::uint32_t dk = geom.head_dim;
@@ -269,27 +297,35 @@ bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
   const float lb = geom.gate_lower_bound;
   const int T = static_cast<int>(seq_len);
 
-  // Allocate device scratch.
-  float *wq, *wk, *wv, *q_c, *k_c, *v_c;
-  float *g1, *beta, *o, *g2, *normed;
-  float *fa_out, *fb_out, *ga_out, *gb_out;
+  // Device scratch (caller-owned when provided; bump-allocated).
+  float* owned = nullptr;
+  if (scratch == nullptr) {
+    HIP_CHECK(hipMalloc(&owned, KdaScratchFloats(geom, T) * sizeof(float)));
+    scratch = owned;
+  }
+  float* sp = scratch;
+  auto take = [&sp](std::size_t n) {
+    float* r = sp;
+    sp += n;
+    return r;
+  };
 
   const std::size_t inner_T = inner * T;
-  HIP_CHECK(hipMalloc(&wq, inner_T * sizeof(float)));
-  HIP_CHECK(hipMalloc(&wk, inner_T * sizeof(float)));
-  HIP_CHECK(hipMalloc(&wv, inner_T * sizeof(float)));
-  HIP_CHECK(hipMalloc(&q_c, inner_T * sizeof(float)));
-  HIP_CHECK(hipMalloc(&k_c, inner_T * sizeof(float)));
-  HIP_CHECK(hipMalloc(&v_c, inner_T * sizeof(float)));
-  HIP_CHECK(hipMalloc(&g1, inner_T * sizeof(float)));
-  HIP_CHECK(hipMalloc(&beta, nh * T * sizeof(float)));
-  HIP_CHECK(hipMalloc(&o, inner_T * sizeof(float)));
-  HIP_CHECK(hipMalloc(&g2, inner_T * sizeof(float)));
-  HIP_CHECK(hipMalloc(&normed, inner_T * sizeof(float)));
-  HIP_CHECK(hipMalloc(&fa_out, dk * T * sizeof(float)));
-  HIP_CHECK(hipMalloc(&fb_out, inner_T * sizeof(float)));
-  HIP_CHECK(hipMalloc(&ga_out, dk * T * sizeof(float)));
-  HIP_CHECK(hipMalloc(&gb_out, inner_T * sizeof(float)));
+  float* wq = take(inner_T);
+  float* wk = take(inner_T);
+  float* wv = take(inner_T);
+  float* q_c = take(inner_T);
+  float* k_c = take(inner_T);
+  float* v_c = take(inner_T);
+  float* g1 = take(inner_T);
+  float* beta = take(nh * T);
+  float* o = take(inner_T);
+  float* g2 = take(inner_T);
+  float* normed = take(inner_T);
+  float* fa_out = take(dk * T);
+  float* fb_out = take(inner_T);
+  float* ga_out = take(dk * T);
+  float* gb_out = take(inner_T);
 
   const int block = 256;
 
@@ -335,12 +371,10 @@ bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
   // 4. Decay gate.
   {
     // fa_out = f_a @ x  [dk, T].
-    const int grid_fa = (dk * T + block - 1) / block;
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(grid_fa), dim3(block), 0,
-                       stream, w.f_a, input, fa_out, dk, H, T);
+    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(dk * T), dim3(256), 0, stream,
+                       w.f_a, input, fa_out, dk, H, T);
     // fb_out = f_b @ fa_out  [inner, T].
-    const int grid_fb = (inner * T + block - 1) / block;
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(grid_fb), dim3(block), 0,
+    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(inner * T), dim3(256), 0,
                        stream, w.f_b, fa_out, fb_out, inner, dk, T);
     // g1 = lb * sigmoid(-(fb_out + dt_bias) * A).
     const int grid_g1 = (inner * T + block - 1) / block;
@@ -352,14 +386,11 @@ bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
   // 5. Beta.
   {
     // beta_out = ssm_beta @ x  [nh, T].
-    float* beta_out;
-    HIP_CHECK(hipMalloc(&beta_out, nh * T * sizeof(float)));
-    const int grid = (nh * T + block - 1) / block;
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(grid), dim3(block), 0, stream,
+    float* beta_out = take(nh * T);
+    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(nh * T), dim3(256), 0, stream,
                        w.ssm_beta, input, beta_out, nh, H, T);
-    hipLaunchKernelGGL(BetaKernel, dim3(grid), dim3(block), 0, stream, beta_out,
-                       beta, nh * T);
-    hipFree(beta_out);
+    hipLaunchKernelGGL(BetaKernel, dim3((nh * T + 255) / 256), dim3(256), 0,
+                       stream, beta_out, beta, nh * T);
   }
 
   // 6. Recurrent delta rule.
@@ -373,11 +404,9 @@ bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
 
   // 7. Output gate g2.
   {
-    const int grid_ga = (dk * T + block - 1) / block;
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(grid_ga), dim3(block), 0,
-                       stream, w.g_a, input, ga_out, dk, H, T);
-    const int grid_gb = (inner * T + block - 1) / block;
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(grid_gb), dim3(block), 0,
+    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(dk * T), dim3(256), 0, stream,
+                       w.g_a, input, ga_out, dk, H, T);
+    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(inner * T), dim3(256), 0,
                        stream, w.g_b, ga_out, gb_out, inner, dk, T);
   }
 
@@ -400,31 +429,16 @@ bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
   }
 
   // Cleanup.
-  hipFree(wq);
-  hipFree(wk);
-  hipFree(wv);
-  hipFree(q_c);
-  hipFree(k_c);
-  hipFree(v_c);
-  hipFree(g1);
-  hipFree(beta);
-  hipFree(o);
-  hipFree(g2);
-  hipFree(normed);
-  hipFree(fa_out);
-  hipFree(fb_out);
-  hipFree(ga_out);
-  hipFree(gb_out);
-
-  HIP_CHECK(hipStreamSynchronize(stream));
+  if (owned)
+    hipFree(owned);
   return true;
 }
 
 bool KdaDecodeGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
                   const float* token_input, float* state, float* out,
-                  hipStream_t stream) {
+                  float* scratch, hipStream_t stream) {
   // Single-token decode: same as prefill with T=1.
-  return KdaPrefillGpu(geom, w, token_input, state, out, 1, stream);
+  return KdaPrefillGpu(geom, w, token_input, state, out, 1, scratch, stream);
 }
 
 }  // namespace gufo::models::glm5_next::rocm

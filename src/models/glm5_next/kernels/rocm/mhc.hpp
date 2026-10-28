@@ -3,6 +3,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace gufo::models::glm5_next::rocm {
@@ -45,9 +46,15 @@ struct MhcGpuWeights {
 /// post: [hc, T] on device (output).
 /// comb: [hc*hc*T] on device (output, dst-major per token).
 /// Returns true on success.
+/// Device scratch floats MhcPreGpu needs for T tokens.
+[[nodiscard]] std::size_t MhcScratchFloats(const MhcGpuGeometry& geom,
+                                           std::uint32_t seq_len);
+
+/// scratch: MhcScratchFloats() floats of device memory, or nullptr to
+/// allocate internally (slow — tests only).
 bool MhcPreGpu(const MhcGpuGeometry& geom, const MhcGpuWeights& w,
                const float* residual, float* mixed, float* post, float* comb,
-               std::uint32_t seq_len, hipStream_t stream);
+               std::uint32_t seq_len, float* scratch, hipStream_t stream);
 
 /// Run mHC write half on GPU.
 /// block_out: [hidden, T] on device.

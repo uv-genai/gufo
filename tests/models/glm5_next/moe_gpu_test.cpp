@@ -173,7 +173,8 @@ void TestGpuMoeParity() {
   hipStream_t stream;
   HIP_CHECK(hipStreamCreate(&stream));
 
-  const bool ok = rocm::MoeForwardGpu(geom_gpu, w_gpu, d_input, d_out, stream);
+  const bool ok =
+      rocm::MoeForwardGpu(geom_gpu, w_gpu, d_input, d_out, nullptr, stream);
   Require(ok, "GPU MoE forward failed");
 
   // Copy back and compare.

@@ -121,44 +121,37 @@ DsaSelection DsaSelectPools(const MlaGeometry& geom, const MlaWeightsF32& w,
     return DsaSelection{};
   }
 
+  // ik[t] = layer_norm(idx_k @ cur_t, k_norm_w, k_norm_b)  [qd] and
+  // ig[t] = idx_gate @ cur_t  [qd] — precomputed for all visible tokens.
+  std::vector<float> ik_all(static_cast<std::size_t>(qd) * T);
+  std::vector<float> ig_all(static_cast<std::size_t>(qd) * T);
+  for (std::uint32_t tok = 0; tok < T; ++tok) {
+    MatVec(w.idx_k.data(), cur.data() + tok * H,
+           ik_all.data() + static_cast<std::size_t>(tok) * qd, qd, H);
+    LayerNorm(ik_all.data() + static_cast<std::size_t>(tok) * qd,
+              w.idx_k_norm_w.data(), w.idx_k_norm_b.data(), qd, geom.norm_eps);
+    MatVec(w.idx_gate.data(), cur.data() + tok * H,
+           ig_all.data() + static_cast<std::size_t>(tok) * qd, qd, H);
+  }
+
   // For each pool p, compute the pooled key.
+  // w = softmax(ig[:, members] + ape, axis=1) per key-dim element;
+  // pooled[:, p] = (ik[:, members] * w).sum(axis=1).
   std::vector<float> pooled(qd * n_vis, 0.0F);
   for (std::uint32_t p = 0; p < n_vis; ++p) {
-    // Compute softmax over members for each key-dim element.
-    // members = [p*kpool, (p+1)*kpool).
-    // w = softmax(ig[:, members] + ape, axis=1)  — per key-dim element.
-    // pooled[:, p] = (ik[:, members] * w).sum(axis=1).
     for (std::uint32_t d = 0; d < qd; ++d) {
       float member_logits[kpool];
       for (std::uint32_t m = 0; m < kpool; ++m) {
         const std::uint32_t tok = p * kpool + m;
-        // ig[d, tok] = idx_gate[d, :] @ cur[:, tok].
-        float ig = 0;
-        const float* g_row = w.idx_gate.data() + d * H;
-        for (std::uint32_t j = 0; j < H; ++j) {
-          ig += g_row[j] * cur[tok * H + j];
-        }
-        // ape[d, m].
-        const float ape = w.idx_ape[d * kpool + m];
-        member_logits[m] = ig + ape;
+        member_logits[m] = ig_all[static_cast<std::size_t>(tok) * qd + d] +
+                           w.idx_ape[static_cast<std::size_t>(d) * kpool + m];
       }
       Softmax(member_logits, kpool);
-      // Weighted average of ik[d, members].
       float acc = 0;
       for (std::uint32_t m = 0; m < kpool; ++m) {
         const std::uint32_t tok = p * kpool + m;
-        // ik[d, tok] = layer_norm(idx_k @ cur)[d].
-        // Precompute ik for this token (cached below would be better).
-        float ik_val = 0;
-        const float* k_row = w.idx_k.data() + d * H;
-        for (std::uint32_t j = 0; j < H; ++j) {
-          ik_val += k_row[j] * cur[tok * H + j];
-        }
-        // Apply layer norm (simplified: we need the full layer norm).
-        // For the oracle, compute ik with norm inline.
-        // Actually we need to compute layer_norm over the full idx_k @ cur
-        // vector. Let me restructure: compute ik for all tokens first.
-        acc += member_logits[m] * ik_val;
+        acc +=
+            member_logits[m] * ik_all[static_cast<std::size_t>(tok) * qd + d];
       }
       pooled[p * qd + d] = acc;
     }

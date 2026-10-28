@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "src/models/glm5_next/config.hpp"
+#include "src/models/glm5_next/kernels/rocm/mla.hpp"
 #include "src/models/glm5_next/weights.hpp"
 
 namespace gufo::models::glm5_next {
@@ -77,6 +78,11 @@ private:
   std::vector<float*> w_ptrs_;  ///< Per-tensor device pointers into arena.
   std::vector<int> w_types_;    ///< Device-side ggml type per slot (0=F32).
 
+  // Per-layer DSA state (caches + scratch), one entry per layer (unused for
+  // KDA layers), plus its shared geometry.
+  std::vector<rocm::MlaGpuState> mla_state_;
+  rocm::MlaGpuGeometry mla_geom_{};
+
   // State arena: residual + recurrent state + DSA buffers.
   float* state_{nullptr};
   std::uint64_t state_bytes_{0};
@@ -87,6 +93,9 @@ private:
   // Scratch arena: activations for one token.
   float* sc_{nullptr};
   std::uint64_t sc_bytes_{0};
+  // Shared kernel workspace (KDA/mHC/MoE scratch) — sized once at Create.
+  float* ws_{nullptr};
+  std::uint64_t ws_bytes_{0};
 
   // Embedded token lookup.
   float* token_embd_{nullptr};
