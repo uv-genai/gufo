@@ -20,6 +20,7 @@
 #include "src/core/image.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/glm5_next/chat_template.hpp"
 #include "src/models/glm5_next/engine.hpp"
 #include "src/models/glm5_next/gpu_engine.hpp"
 #include "src/models/qwen/chat_template.hpp"
@@ -1082,9 +1083,32 @@ int RunPrompt(std::span<const char* const> args) {
                 << " layers, hidden=" << cfg.hidden_size
                 << ", experts=" << cfg.num_experts << ")\n";
     }
-    // Encode prompt and run GPU inference.
-    const auto ids = tokenizer->Encode(opt.prompt_text);
+    // Encode prompt with the GGUF chat template framing — raw BPE of bare
+    // text is out of distribution for GLM-5 (every answer was wrong).
+    // Format matches the GGUF chat_template exactly:
+    // [gMASK]<sop><|system|>Reasoning Effort:
+    // Max<|user|>q<|assistant|><thinking>
+    std::vector<models::glm5_next::ChatMessage> msgs(1);
+    msgs[0].role = "user";
+    msgs[0].content = opt.prompt_text;
+    const std::string framed = models::glm5_next::RenderChat(
+        std::span<const models::glm5_next::ChatMessage>(msgs),
+        models::glm5_next::ChatTemplateOptions{});
+    if (opt.verbose) {
+      std::cerr << "[framed] " << framed << "\n" << std::hex;
+      for (unsigned char c : framed)
+        std::cerr << " " << (unsigned)c;
+      std::cerr << std::dec << "\n";
+    }
+    // TEMP: dump tokens for comparison with the pack tokenizer golden.
+    const auto ids = tokenizer->Encode(framed);
     std::vector<std::uint32_t> tokens(ids.begin(), ids.end());
+    if (opt.verbose) {
+      std::cerr << "[tokens]";
+      for (auto t : tokens)
+        std::cerr << " " << t;
+      std::cerr << "\n";
+    }
     try {
       auto hidden = engine->Prefill(tokens);
       // Generate tokens.

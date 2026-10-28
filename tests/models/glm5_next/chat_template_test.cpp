@@ -143,6 +143,47 @@ void TestMultiTurn() {
   std::cout << "TestMultiTurn: PASS\n";
 }
 
+// ---- GGUF-template goldens (token IDs verified against the pack tokenizer)
+// ----
+
+// The GGUF chat_template renders a single user turn with add_generation_prompt
+// as exactly this string (jinja `{%-` strips the inter-turn newlines). The
+// token IDs below come from the pack's own tokenizer (strata_tokenizer):
+//   [gMASK]=154822 <sop>=154824 <|system|>=154826 <|user|>=154827
+//   <|assistant|>=154828; "<thinking>" is BPE text -> [13699, 15724, 29].
+// Raw-BPE prompts without this framing were out of distribution: every
+// answer was wrong.
+void TestSingleUserPromptGolden() {
+  glm5::ChatMessage m;
+  m.role = "user";
+  m.content = "The capital of France is";
+  const std::string got = glm5::RenderChat(
+      std::span<const glm5::ChatMessage>(&m, 1), glm5::ChatTemplateOptions{});
+  const std::string want =
+      "[gMASK]<sop><|system|>Reasoning Effort: Max"
+      "<|user|>The capital of France is<|assistant|><thinking>";
+  Require(got == want,
+          ("single-user framing mismatch: " + got).c_str());
+  std::cout << "TestSingleUserPromptGolden: PASS\n";
+}
+
+void TestFramingHasNoStrayNewlines() {
+  glm5::ChatMessage u;
+  u.role = "user";
+  u.content = "hi";
+  glm5::ChatMessage a;
+  a.role = "assistant";
+  a.content = "hello";
+  const glm5::ChatMessage msgs[2] = {u, a};
+  const std::string got = glm5::RenderChat(
+      std::span<const glm5::ChatMessage>(msgs, 2), glm5::ChatTemplateOptions{});
+  Require(got ==
+              "[gMASK]<sop><|system|>Reasoning Effort: Max"
+              "<|user|>hi<|assistant|>hello<|assistant|><thinking>",
+          ("two-turn framing mismatch: " + got).c_str());
+  std::cout << "TestFramingHasNoStrayNewlines: PASS\n";
+}
+
 // ---- Tokenizer GLM4 pre-tokenizer tests ----
 
 // Build a small synthetic vocab for testing tokenizer behavior.
@@ -219,6 +260,8 @@ int main() {
     TestToolsRendering();
     TestToolCallInAssistant();
     TestMultiTurn();
+    TestSingleUserPromptGolden();
+    TestFramingHasNoStrayNewlines();
     TestTokenizerBasic();
     TestTokenizerMultiChar();
     std::cout << "All glm5_next chat template tests passed.\n";

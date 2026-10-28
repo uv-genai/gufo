@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -78,6 +80,26 @@ enum Slot : int {
 
 /// Decode-position cap for DSA latent caches (Maya's default context).
 constexpr std::uint32_t kMaxDsaPos = 32768;
+
+/// GLM_CB_DIR seam dump (same names as Maya's glm_model.cu cb_dump): one .f32
+/// file per seam, overwritten per token — the last prompt token's forward is
+/// what remains, exactly like Maya's runs.
+void DumpSeam(const char* name, const float* dev, std::size_t n,
+              hipStream_t stream) {
+  static const char* dir = std::getenv("GLM_CB_DIR");
+  if (!dir || !dir[0] || dev == nullptr || n == 0)
+    return;
+  std::vector<float> buf(n);
+  hipMemcpyAsync(buf.data(), dev, n * sizeof(float), hipMemcpyDeviceToHost,
+                 stream);
+  hipStreamSynchronize(stream);
+  std::FILE* f =
+      std::fopen((std::string(dir) + "/" + name + ".f32").c_str(), "wb");
+  if (f) {
+    std::fwrite(buf.data(), sizeof(float), n, f);
+    std::fclose(f);
+  }
+}
 
 std::uint64_t Align256(std::uint64_t n) {
   return (n + kArenaAlign - 1) & ~(kArenaAlign - 1);
@@ -575,9 +597,20 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
     if (!rocm::MhcPreGpu(mhc_geom, mhc_attn_w, R, mixed, post, comb, T, ws_,
                          stream))
       return false;
+    {
+      const std::string L = std::to_string(il);
+      DumpSeam(("hc_attn_pre-" + L + "-" + std::to_string(pos)).c_str(), mixed,
+               H_, stream);
+      DumpSeam(("hc_post-" + L + "-" + std::to_string(pos)).c_str(), post, hc_,
+               stream);
+      DumpSeam(("hc_comb-" + L + "-" + std::to_string(pos)).c_str(), comb,
+               hc_ * hc_, stream);
+    }
     // Maya: rms_norm(mixed, attn_norm) before the mixer.
     gpu::LaunchRmsNorm(mixed, w_ptrs_[base + kAttnNorm], H_,
                        config_.layer_norm_rms_eps, stream);
+    DumpSeam(("attn_norm-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
+               mixed, H_, stream);
 
     // 2. Attention (KDA mixer or NoPE-MLA + DSA indexer).
     if (config_.IsFullAttention(il)) {
@@ -650,11 +683,15 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
         return false;
     }
 
+    DumpSeam(("mixer-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
+             attn_out, H_, stream);
     // 3. mHC write (attn).
     float* R_new = state_ + hc_ * H_;
     if (!rocm::MhcPostGpu(mhc_geom, attn_out, R, post, comb, R_new, T, stream))
       return false;
     R = R_new;
+    DumpSeam(("hc_attn_post-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
+               R, hc_ * H_, stream);
 
     // 4. mHC read (FFN mixer) — uses the FFN mixer weights.
     rocm::MhcGpuWeights mhc_ffn_w;
@@ -664,9 +701,13 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
     if (!rocm::MhcPreGpu(mhc_geom, mhc_ffn_w, R, mixed, post, comb, T, ws_,
                          stream))
       return false;
+    DumpSeam(("hc_ffn_pre-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
+               mixed, H_, stream);
     // Maya: rms_norm(mixed, ffn_norm) before the FFN.
     gpu::LaunchRmsNorm(mixed, w_ptrs_[base + kFfnNorm], H_,
                        config_.layer_norm_rms_eps, stream);
+    DumpSeam(("ffn_norm-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
+               mixed, H_, stream);
 
     // 5. FFN (dense for leading layers, MoE otherwise).
     float* ffn_out = sc_ + H_ + hc_ + hc_ * hc_ + H_;
@@ -708,11 +749,15 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
         return false;
     }
 
+    DumpSeam(("ffn_out-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
+               ffn_out, H_, stream);
     // 6. mHC write (FFN).
     R_new = (R == state_) ? state_ + hc_ * H_ : state_;
     if (!rocm::MhcPostGpu(mhc_geom, ffn_out, R, post, comb, R_new, T, stream))
       return false;
     R = R_new;
+    DumpSeam(("l_out-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
+               R, hc_ * H_, stream);
   }
 
   return true;

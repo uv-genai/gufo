@@ -200,44 +200,88 @@ Our approach:
    `QuantEmbedLookup` on the quantized weights (no F32 head copy).
 5. Quant types come from the loaded tensors — never hardcoded.
 
-**STATUS 2026-10-28 (issue #19): model runs end-to-end, output is real text,
-117 ms/token (8.5 tok/s) vs Maya 43 ms (23 tok/s).** Acceptance = the real
-model run (exit 0) + `glm5_next_gpu_engine_e2e_test` (GPU engine ≡ CPU engine
-to 1e-9 over multi-token continuation).
+**STATUS 2026-10-28 late (issue #19): inputs now match Maya exactly; output
+is still wrong; ROOT CAUSE LOCALIZED to the KDA (and DSA) mixer math.**
+Do not trust "tests pass" — the gate is the real model answer. Reference:
+Maya greedy on the golden prompt says "Simple factual question, no need for
+extensive thinking. The answer is Paris." gufo says garbage.
 
-**Read this before trusting tests:** kernel-math tests call one op and sync —
-they cannot see integration bugs. The e2e engine test (multi-token, production
-async pattern) is the gate that catches workspace reuse, buffer lifetimes and
-stream ordering. Every real crash so far lived in that blind spot.
+### THE tool: seam diff vs Maya (use this first)
 
-Fixed this session (all found by the e2e test):
-- **Stream-ordering**: every engine/kernel `hipMemcpy` raced the non-blocking
-  engine stream (embed, hidden readback, argmax, mHC flat←residual, post-
-  Sinkhorn comb, KDA/MoE internals). Now `hipMemcpyAsync` on the stream with
-  explicit syncs at host boundaries. This was the systemic correctness bug.
-- **mHC residual chains between halves** (Maya ping-pongs `R`); CPU engine
-  used R0 for both halves.
-- **Input rms-norms**: `rms_norm(mixed, attn_norm/ffn_norm)` before each
-  mixer (Maya `step_layers`) — both engines were missing them.
-- **CPU engine wiring**: KDA from `L.kda.*` (not mla placeholders), conv1d_\*,
-  indexer tensors, separate `mhc_ffn` weights, dense-FFN branch.
-- Q8 scratch lifetime, per-slot-x quantize, MoE staging buffers, workspace
-  `top_k`, all-F32 packs at load.
+Maya's engine binary supports `GLM_CB_DIR` seam dumps ("so the python diff can
+bisect the first divergent component"). gufo's GpuEngine dumps the same seams
+per position (`<name>-<L>-<pos>.f32`). Workflow (verified this session):
 
-Perf facts (measured, for the next pass): GEMM already on the Q8_1/dp4a tier
-(Q6_K 8192x4096: 131 us, 210 GB/s). Per token: KDA 1.2 ms x34, MoE 1.0 ms x45,
-mHC pre 0.17 ms x90 (Sinkhorn is single-threaded), DSA 2.6 ms x12 @32K, head
-~2.5 ms. Load 65-81 s vs Maya 38 s.
+```sh
+# Maya reference (dumps = LAST prompt token's forward — verified: 1-vs-2-token
+# --spec-follow continuations give identical dumps):
+cd /home/ugo/software/project-maya && PYTHONPATH=tools .venv/bin/python -c "..."  # token ids
+GLM_CB_DIR=/tmp/maya-dump ./build-hip/maya --glm-pack .../pack \
+  --tokens "154822,154824,154826,25062,287,29905,371,25,7487,154827,785,6722,315,9621,374,154828,13699,15724,29" \
+  --max-context 512 --greedy --spec-follow <file-with-1-or-2-token-ids>
 
-### IMMEDIATE NEXT STEPS
+# gufo (compare against pos=18 = last prompt token):
+GLM_CB_DIR=/tmp/gufo-dump /tmp/gufo-glm5-smoke prompt --model .../...00001-of-00003.gguf \
+  --prompt "The capital of France is" --max-tokens 1
+# diff: load both .f32, max |a-b| / rms(a) per seam per layer.
+```
 
-1. **Perf to Maya level** (117 → ~43 ms/token): batch MoE launches further,
-   parallelize the Sinkhorn, shrink KDA's per-layer overhead, consider the
-   `qfn_mmq`/`native_mmvq` warp-row layout if the Q8 tier plateaus.
-2. **Quality vs Maya** (output is real text but says `"\" \"". Ple` instead of
-   "Paris"): compare logits against Maya (`--check-logits`); check DSA
-   selection depth, KDA conv/state details, swiglu clamp.
-3. Load-time path (65-81 s vs 38 s).
+**IMPORTANT: the Maya BINARY dumps a different seam set than the source tree on
+disk** (binary is newer). Actual files: `mixer-L`, `attn_norm-L`, `ffn_norm-L`,
+`ffn_out-L`, `hc_attn_post-L`, `l_out-L`, `dsa_q/dsa_qr/dsa_iq-L`,
+`pf_attn/pf_ctx-L` (11 DSA layers), `pf_shexp-L` (42 MoE layers). The
+`hc_pre/hc_comb/...` names in glm_model.cu are NOT what the binary writes.
+
+**Result so far (relative to rms):**
+- L0 `attn_norm` MATCHES (7e-4) — mHC pre + input rms_norm are correct.
+- L0 `mixer` (KDA output) DIVERGES (rel 3.7) — **root cause: KDA math**.
+- L0 `hc_attn_post`, `ffn_norm`, `ffn_out`, `l_out` all downstream-dirty.
+- L3 `mixer` (DSA) also diverges (rel 3.6) — DSA math also wrong.
+
+### Next steps (in order)
+
+1. **Fix the KDA math**: side-by-side `src/models/glm5_next/reference.cpp`
+   KdaPrefill (my oracle — wrong) vs Maya `src/core/glm_model.cu` step_layers
+   KDA block (~line 2245-2340) + `src/kernels/cuda/glm_kda.cu`. The
+   `mixer-0` seam is the acceptance check (rel → ~1e-3). Then
+   `kda_gpu_test` should compare against Maya-derived goldens, not just the
+   oracle.
+2. **Fix DSA/MLA** the same way (`dsa_q/qr/iq`, `pf_attn`, `pf_ctx` seams;
+   Maya `glm_dsa.cu`). DSA layers are 3,7,...,43 (11 in the trunk; blk.45 is
+   MTP drafter-only and skipped).
+3. Only then quality (expect "Paris") and speed (117 ms/token → Maya 43 ms).
+
+### What is verified correct (do not re-fix)
+
+- **Prompt framing + tokenization** — the critical fix of this session: the
+  CLI fed raw BPE (out of distribution; every answer wrong). Now
+  `[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>q<|assistant|><thinking>`
+  per the GGUF `tokenizer.chat_template` (jinja `{%-` strips inter-turn
+  newlines; `<thinking>` is BPE text, NOT a special token). gufo's token IDs
+  now match Maya's pack tokenizer EXACTLY
+  ([154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 785,
+  6722, 315, 9621, 374, 154828, 13699, 15724, 29] for "The capital of France
+  is"). Specials registered: [gMASK]=154822, <sop>=154824, <eop>, <|...|>
+  pattern. Golden tests in `chat_template_test.cpp`.
+- **Stream ordering** — every engine/kernel `hipMemcpy` raced the non-blocking
+  engine stream (the earlier garbage/NaN/wild-address class). All copies now
+  `hipMemcpyAsync` on `stream` with syncs at host boundaries.
+- **mHC residual chains** between halves (Maya ping-pongs R); input rms-norms
+  (`attn_norm`/`ffn_norm`) present — confirmed by the `attn_norm` seam match.
+- **CPU engine wiring** (KDA from L.kda.*, conv1d_*, indexer tensors, mhc_ffn
+  weights, dense-FFN branch).
+- GPU e2e (`gpu_engine_e2e_test`) ≡ CPU engine 1e-9 multi-token — but both
+  share the WRONG KDA oracle; it is a regression gate, not a correctness gate.
+- Quant GEMM parity (9 types) vs host dequant — kernel arithmetic is fine;
+  Q8_1/dp4a tier in place (Q6_K 8192x4096 = 131 us, 210 GB/s).
+
+### Measured
+
+- Real model: exit 0, 117 ms/token (8.5 tok/s), load 65-81 s. Maya: 43 ms
+  (23 tok/s), load 38 s.
+- Maya greedy reference output for the golden prompt:
+  "Simple factual question, no need for extensive thinking. The answer is
+  Paris.</thinking>" (tokens 16360, 59485, 3405, 11, 902, 1184, ...).
 
 ### Memory budget (Maya-S v2 on 124 GB GPU)
 

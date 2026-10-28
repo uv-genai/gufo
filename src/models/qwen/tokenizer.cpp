@@ -470,6 +470,7 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
         t == "<tts_text_bos_single>" || t == kObjectRefStart ||
         t == kObjectRefEnd || t == kVisionStart || t == kVisionEnd ||
         t == kImagePad || t == kVideoPad || t == kQuadStart || t == kQuadEnd ||
+        t == "[gMASK]" || t == "<sop>" || t == "<eop>" || t == "<eos>" ||
         (t.size() >= 4 && t.starts_with("<|") && t.ends_with("|>"))) {
       special_tokens[t] = static_cast<TokenId>(i);
     }

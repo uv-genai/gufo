@@ -126,9 +126,9 @@ std::string RenderChat(std::span<const ChatMessage> messages,
   for (std::size_t i = 0; i < messages.size(); ++i) {
     const auto& m = messages[i];
     if (m.role == "system") {
-      out += "<|system|>" + m.content + "\n";
+      out += "<|system|>" + m.content;
     } else if (m.role == "user") {
-      out += "<|user|>" + m.content + "\n";
+      out += "<|user|>" + m.content;
     } else if (m.role == "assistant") {
       out += "<|assistant|>";
       if (!m.reasoning_content.empty()) {
@@ -140,7 +140,6 @@ std::string RenderChat(std::span<const ChatMessage> messages,
       for (const auto& tc : m.tool_calls) {
         out += RenderToolCall(tc);
       }
-      out += "\n";
     } else if (m.role == "tool") {
       // Tool response wrapped in output...output.
       out += "output" + m.content + "output";
@@ -148,7 +147,7 @@ std::string RenderChat(std::span<const ChatMessage> messages,
   }
 
   // Generation prompt.
-  out += "<|assistant|></think>";
+  out += "<|assistant|><thinking>";
   return out;
 }
 
