@@ -7,6 +7,8 @@
 #include <cstring>
 #include <vector>
 
+#include "src/models/glm5_next/quant_gemv.hpp"
+
 namespace gufo::models::glm5_next::rocm {
 namespace {
 
@@ -291,15 +293,12 @@ bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
 
   const int block = 256;
 
-  // 1. Q/K/V projections.
-  {
-    const int grid = (inner * T + block - 1) / block;
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(grid), dim3(block), 0, stream,
-                       w.w_q, input, wq, inner, H, T);
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(grid), dim3(block), 0, stream,
-                       w.w_k, input, wk, inner, H, T);
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(grid), dim3(block), 0, stream,
-                       w.w_v, input, wv, inner, H, T);
+  // 1. Q/K/V projections (quantized GEMM per token).
+  for (std::uint32_t t = 0; t < T; ++t) {
+    const float* x = input + t * H;
+    gpu::QuantGemm(w.w_q, x, wq + t * inner, inner, H, w.w_q_type, stream);
+    gpu::QuantGemm(w.w_k, x, wk + t * inner, inner, H, w.w_k_type, stream);
+    gpu::QuantGemm(w.w_v, x, wv + t * inner, inner, H, w.w_v_type, stream);
   }
 
   // 2. Causal conv + SiLU.
@@ -390,11 +389,10 @@ bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
                        stream, normed, gb_out, inner_T);
   }
 
-  // 9. Output projection.
-  {
-    const int grid = (H * T + block - 1) / block;
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(grid), dim3(block), 0, stream,
-                       w.w_out, normed, out, H, inner, T);
+  // 9. Output projection (quantized GEMM per token).
+  for (std::uint32_t t = 0; t < T; ++t) {
+    gpu::QuantGemm(w.w_out, normed + t * inner, out + t * H, H, inner,
+                   w.w_out_type, stream);
   }
 
   // Cleanup.

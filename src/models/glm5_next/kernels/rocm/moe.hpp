@@ -34,14 +34,17 @@ struct MoeGpuGeometry {
 
 /// Device pointers for MoE weights.
 struct MoeGpuWeights {
-  const float* gate_inp;     ///< [num_experts, hidden]
-  const float* exp_probs_b;  ///< [num_experts]
-  const float* gate_exps;    ///< [num_experts, hidden, expert_ff]
-  const float* up_exps;      ///< [num_experts, hidden, expert_ff]
-  const float* down_exps;    ///< [num_experts, expert_ff, hidden]
-  const float* gate_shexp;   ///< [hidden, shared_ff]
-  const float* up_shexp;     ///< [hidden, shared_ff]
-  const float* down_shexp;   ///< [shared_ff, hidden]
+  const float* gate_inp;     ///< [num_experts, hidden] F32
+  const float* exp_probs_b;  ///< [num_experts] F32
+  const float* gate_exps;    ///< [num_experts, hidden, expert_ff] quantized
+  const float* up_exps;      ///< [num_experts, hidden, expert_ff] quantized
+  const float* down_exps;    ///< [num_experts, expert_ff, hidden] quantized
+  const float* gate_shexp;   ///< [hidden, shared_ff] F32
+  const float* up_shexp;     ///< [hidden, shared_ff] F32
+  const float* down_shexp;   ///< [shared_ff, hidden] F32
+  int gate_exps_type{0};     ///< ggml_type for gate_exps (0=F32, 16=IQ2_XXS)
+  int up_exps_type{0};       ///< ggml_type for up_exps
+  int down_exps_type{0};     ///< ggml_type for down_exps
 };
 
 /// Run MoE forward on GPU for one token.

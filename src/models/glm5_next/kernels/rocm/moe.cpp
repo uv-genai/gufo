@@ -7,6 +7,8 @@
 #include <cstring>
 #include <vector>
 
+#include "src/models/glm5_next/quant_gemv.hpp"
+
 namespace gufo::models::glm5_next::rocm {
 namespace {
 
@@ -175,19 +177,15 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
     const std::uint32_t e = indexed[idx].second;
     const float weight = weights[idx];
 
-    // gate = gate_exps[e] @ x  [I].
+    // gate = gate_exps[e] @ x  [I] (quantized GEMM).
     {
-      const int grid = (I + block - 1) / block;
       const float* gW = w.gate_exps + static_cast<std::size_t>(e) * H * I;
-      hipLaunchKernelGGL(MatVecKernel, dim3(grid), dim3(block), 0, stream, gW,
-                         token_input, gate, I, H);
+      gpu::QuantGemm(gW, token_input, gate, I, H, w.gate_exps_type, stream);
     }
-    // up = up_exps[e] @ x  [I].
+    // up = up_exps[e] @ x  [I] (quantized GEMM).
     {
-      const int grid = (I + block - 1) / block;
       const float* uW = w.up_exps + static_cast<std::size_t>(e) * H * I;
-      hipLaunchKernelGGL(MatVecKernel, dim3(grid), dim3(block), 0, stream, uW,
-                         token_input, up, I, H);
+      gpu::QuantGemm(uW, token_input, up, I, H, w.up_exps_type, stream);
     }
     // h = swiglu_clamp(gate, up).
     {
@@ -195,12 +193,10 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
       hipLaunchKernelGGL(SwigluClampKernel, dim3(grid), dim3(block), 0, stream,
                          gate, up, h, I, limit);
     }
-    // expert_out = down_exps[e] @ h  [H].
+    // expert_out = down_exps[e] @ h  [H] (quantized GEMM).
     {
-      const int grid = (H + block - 1) / block;
       const float* dW = w.down_exps + static_cast<std::size_t>(e) * I * H;
-      hipLaunchKernelGGL(MatVecKernel, dim3(grid), dim3(block), 0, stream, dW,
-                         h, expert_out, H, I);
+      gpu::QuantGemm(dW, h, expert_out, H, I, w.down_exps_type, stream);
     }
     // acc += weight * expert_out.
     {

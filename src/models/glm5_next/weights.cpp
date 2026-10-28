@@ -311,7 +311,15 @@ bool LoadWeights(const core::GgufReader& gguf, const Config& config,
           !Bind(gguf, config, prefix + "ssm_g_a.weight", H, kd, 1, &L.kda.g_a,
                 error_msg) ||
           !Bind(gguf, config, prefix + "ssm_g_b.weight", kd, inner, 1,
-                &L.kda.g_b, error_msg)) {
+                &L.kda.g_b, error_msg) ||
+          !Bind(gguf, config, prefix + "attn_q.weight", H, inner, 1,
+                &L.kda.attn_q, error_msg) ||
+          !Bind(gguf, config, prefix + "attn_k.weight", H, inner, 1,
+                &L.kda.attn_k, error_msg) ||
+          !Bind(gguf, config, prefix + "attn_v.weight", H, inner, 1,
+                &L.kda.attn_v, error_msg) ||
+          !Bind(gguf, config, prefix + "attn_output.weight", inner, H, 1,
+                &L.kda.attn_out, error_msg)) {
         return false;
       }
     }

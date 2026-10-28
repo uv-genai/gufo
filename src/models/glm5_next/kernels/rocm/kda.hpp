@@ -47,6 +47,11 @@ struct KdaGpuWeights {
   const float* g_a;
   const float* g_b;
   const float* ssm_norm;
+  // Quant types for attention weights (0=F32, 14=Q6_K, etc.)
+  int w_q_type{0};
+  int w_k_type{0};
+  int w_v_type{0};
+  int w_out_type{0};
 };
 
 /// Run KDA prefill on GPU for a chunk of tokens.

@@ -20,6 +20,8 @@
 #include "src/core/image.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/glm5_next/engine.hpp"
+#include "src/models/glm5_next/gpu_engine.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
@@ -1052,6 +1054,63 @@ int RunPrompt(std::span<const char* const> args) {
   };
 
 #if defined(ENGINE_ENABLE_HIP)
+  if (reader->GetMetadataString("general.architecture") == "glm5-next") {
+    // GLM-5.3-Flash GPU inference path.
+    auto model = models::glm5_next::Model::Load(
+        opt.model_path, models::glm5_next::ModelOptions{}, &err);
+    if (!model) {
+      std::cerr << "GLM-5.3-Flash load failed: " << err << '\n';
+      return 1;
+    }
+    // Create tokenizer from GGUF.
+    auto tokenizer = tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+    if (!tokenizer) {
+      std::cerr << "GLM-5.3-Flash tokenizer failed: " << err << '\n';
+      return 1;
+    }
+    auto engine = models::glm5_next::GpuEngine::Create(
+        model->GetConfig(), model->GetWeights(), &err);
+    if (!engine) {
+      std::cerr << "GLM-5.3-Flash GPU engine failed: " << err << '\n';
+      return 1;
+    }
+    PrintModelLoadTime(model_load_start);
+    if (opt.verbose) {
+      const auto& cfg = model->GetConfig();
+      std::cout << "[Engine]: GLM-5.3-Flash GPU (gfx1151)\n"
+                << "Model: " << cfg.architecture << " (" << cfg.num_layers
+                << " layers, hidden=" << cfg.hidden_size
+                << ", experts=" << cfg.num_experts << ")\n";
+    }
+    // Encode prompt and run GPU inference.
+    const auto ids = tokenizer->Encode(opt.prompt_text);
+    std::vector<std::uint32_t> tokens(ids.begin(), ids.end());
+    try {
+      auto hidden = engine->Prefill(tokens);
+      // Generate tokens.
+      const int max_tokens =
+          opt.max_tokens > 0 ? static_cast<int>(opt.max_tokens) : 128;
+      std::string output;
+      for (int i = 0; i < max_tokens; ++i) {
+        const auto token = engine->Decode(hidden);
+        // Decode token to text.
+        const std::vector<tokenization::TokenId> tok_ids = {
+            static_cast<tokenization::TokenId>(token)};
+        const std::string piece = tokenizer->Decode(tok_ids);
+        if (token == 154820)
+          break;  // EOS
+        output += piece;
+      }
+      if (opt.display_prompt) {
+        std::cout << opt.prompt_text << '\n';
+      }
+      std::cout << output << '\n';
+      return 0;
+    } catch (const std::exception& e) {
+      std::cerr << "GLM-5.3-Flash inference failed: " << e.what() << '\n';
+      return 1;
+    }
+  }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     auto model = LoadFlashNextModel(opt, *reader, model_load_start);
     if (!model)

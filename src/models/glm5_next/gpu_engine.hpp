@@ -14,8 +14,19 @@
 
 namespace gufo::models::glm5_next {
 
-/// GPU inference engine. 100% GPU execution — no CPU inference path.
-/// Manages device memory and runs the full forward pass using GPU kernels.
+/// GPU inference engine matching Maya's Glm5Model architecture.
+///
+/// Arenas (all device memory, contiguous):
+///   w_arena_   — all F32 weights, 256-byte aligned per tensor
+///   state_     — residual streams R (2*hc_dim), KDA state, conv state,
+///                DSA latents/indexer buffers
+///   sc_        — scratch activations (one token at a time)
+///
+/// Forward pass (per token, matching Maya step_layers):
+///   for each layer:
+///     glm_hc_pre → rms_norm → KDA|DSA mixer → glm_hc_post
+///     glm_hc_pre → rms_norm → MoE → glm_hc_post
+///   final rms_norm + output GEMV + argmax
 class GpuEngine {
 public:
   ~GpuEngine();
@@ -25,70 +36,62 @@ public:
   GpuEngine(GpuEngine&&) = delete;
   GpuEngine& operator=(GpuEngine&&) = delete;
 
-  /// Create GPU engine and upload all weights to device.
   [[nodiscard]] static std::shared_ptr<GpuEngine> Create(
       const Config& config, const ModelWeights& weights,
       std::string* error_msg = nullptr);
 
-  /// Prefill a prompt on GPU. Returns hidden state [hidden_size] on host.
+  /// Prefill prompt tokens on GPU. Returns final hidden state.
   [[nodiscard]] std::vector<float> Prefill(
       std::span<const std::uint32_t> tokens);
 
-  /// Decode one token on GPU from hidden state. Returns token ID.
+  /// Decode one token on GPU. Returns token ID.
   [[nodiscard]] std::uint32_t Decode(const std::vector<float>& hidden);
 
   [[nodiscard]] const Config& GetConfig() const noexcept { return config_; }
-  [[nodiscard]] std::uint64_t DeviceBytes() const noexcept;
+  [[nodiscard]] std::uint64_t WeightBytes() const noexcept {
+    return w_arena_bytes_;
+  }
+  [[nodiscard]] std::uint64_t StateBytes() const noexcept {
+    return state_bytes_;
+  }
 
 private:
   GpuEngine() = default;
 
+  /// Run one token through all layers (Maya step_layers).
+  bool StepLayers(std::uint32_t pos, hipStream_t stream);
+
   Config config_;
   hipStream_t stream_{nullptr};
 
-  // Device weight pointers (one per tensor category).
-  struct DeviceLayer {
-    float* w_q{nullptr};
-    float* w_k{nullptr};
-    float* w_v{nullptr};
-    float* w_out{nullptr};
-    float* conv_q{nullptr};
-    float* conv_k{nullptr};
-    float* conv_v{nullptr};
-    float* f_a{nullptr};
-    float* f_b{nullptr};
-    float* dt_bias{nullptr};
-    float* ssm_a{nullptr};
-    float* ssm_beta{nullptr};
-    float* g_a{nullptr};
-    float* g_b{nullptr};
-    float* ssm_norm{nullptr};
-    // mHC
-    float* hc_attn_fn{nullptr};
-    float* hc_attn_scale{nullptr};
-    float* hc_attn_base{nullptr};
-    // MoE
-    float* gate_inp{nullptr};
-    float* exp_probs_b{nullptr};
-    float* gate_exps{nullptr};
-    float* up_exps{nullptr};
-    float* down_exps{nullptr};
-    float* gate_shexp{nullptr};
-    float* up_shexp{nullptr};
-    float* down_shexp{nullptr};
-  };
-  std::vector<DeviceLayer> layers_;
+  // Weight arena: contiguous device buffer, 256-byte aligned per tensor.
+  void* w_arena_{nullptr};
+  std::uint64_t w_arena_bytes_{0};
+  std::vector<float*> w_ptrs_;  ///< Per-tensor device pointers into arena.
 
-  // Embeddings / output head.
+  // State arena: residual + recurrent state + DSA buffers.
+  float* state_{nullptr};
+  std::uint64_t state_bytes_{0};
+  std::vector<std::int64_t> kda_S_off_;     ///< KDA state offsets per layer.
+  std::vector<std::int64_t> kda_conv_off_;  ///< KDA conv state offsets.
+  std::vector<std::int64_t> dsa_lat_off_;   ///< DSA latent offsets.
+
+  // Scratch arena: activations for one token.
+  float* sc_{nullptr};
+  std::uint64_t sc_bytes_{0};
+
+  // Embedded token lookup.
   float* token_embd_{nullptr};
   float* output_head_{nullptr};
+  float* output_head_f32_{nullptr};  ///< Dequantized F32 for GEMM.
   float* output_norm_{nullptr};
 
-  // Device scratch buffers.
-  float* d_input_{nullptr};
-  float* d_output_{nullptr};
-  float* d_hidden_{nullptr};
-  std::size_t scratch_bytes_{0};
+  // Geometry shortcuts.
+  std::uint32_t H_{0};      ///< hidden_size
+  std::uint32_t hc_{0};     ///< hc_count
+  std::uint32_t nh_{0};     ///< num_heads
+  std::uint32_t dk_{0};     ///< kda_head_dim
+  std::uint32_t inner_{0};  ///< d_inner = nh * dk
 };
 
 }  // namespace gufo::models::glm5_next

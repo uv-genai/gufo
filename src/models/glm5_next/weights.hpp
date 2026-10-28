@@ -63,6 +63,11 @@ struct KdaWeights {
   TensorRef f_b;       ///< [128, 8192] Q8_0
   TensorRef g_a;       ///< [4096, 128] Q8_0
   TensorRef g_b;       ///< [128, 8192] Q8_0
+  // Q/K/V projections (attention).
+  TensorRef attn_q;    ///< [4096, 8192] Q6_K
+  TensorRef attn_k;    ///< [4096, 8192] Q6_K
+  TensorRef attn_v;    ///< [4096, 8192] Q6_K
+  TensorRef attn_out;  ///< [8192, 4096] Q6_K
 };
 
 /// MLA attention weights (full-attention / DSA layers).

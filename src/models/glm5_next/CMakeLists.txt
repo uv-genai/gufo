@@ -33,9 +33,20 @@ add_library(gufo_glm5_next STATIC
   reference.cpp
   weights.cpp)
 
+if(ENGINE_ENABLE_HIP)
+  target_sources(gufo_glm5_next PRIVATE gpu_kernels.hip.cpp quant_gemv.hip.cpp)
+  set_source_files_properties(gpu_kernels.hip.cpp PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(quant_gemv.hip.cpp PROPERTIES LANGUAGE HIP)
+  target_link_libraries(gufo_glm5_next PUBLIC hip::host)
+endif()
+
 target_include_directories(gufo_glm5_next PUBLIC
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/src/models/glm5_next)
 
 target_link_libraries(gufo_glm5_next PUBLIC
   gufo_core)
+
+if(ENGINE_ENABLE_HIP)
+  target_link_libraries(gufo_glm5_next PUBLIC gufo_glm5_next_kernels)
+endif()

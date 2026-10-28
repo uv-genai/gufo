@@ -31,8 +31,10 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
 
   auto model = std::shared_ptr<Model>(new Model());
   model->config_ = std::move(*config);
+  model->reader_ = std::move(reader);  // Keep GGUF mapping alive.
 
-  if (!LoadWeights(*reader, model->config_, &model->weights_, &local_error)) {
+  if (!LoadWeights(*model->reader_, model->config_, &model->weights_,
+                   &local_error)) {
     if (error_msg)
       *error_msg = "weight bind failed: " + local_error;
     return nullptr;

@@ -31,6 +31,9 @@ public:
       std::string* error_msg = nullptr);
 
   [[nodiscard]] const Config& GetConfig() const noexcept { return config_; }
+  [[nodiscard]] const ModelWeights& GetWeights() const noexcept {
+    return weights_;
+  }
   [[nodiscard]] std::uint64_t ResidentBytes() const noexcept {
     return weights_.ResidentBytes();
   }
@@ -38,6 +41,8 @@ public:
 protected:
   Model() = default;
 
+  /// Keep the GGUF reader alive — TensorRef.data points into its mapping.
+  std::shared_ptr<const core::GgufReader> reader_;
   Config config_;
   ModelWeights weights_;
 };
