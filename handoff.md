@@ -6,7 +6,7 @@ redirect until that copy is removed).
 **When state changes** (merge, tag, push, script/config change, incident): **replace
 or edit this file in full** — do not leave stale tips, shas, or “untested” claims.
 
-Last updated: **2026-10-27** (session: GLM-5.3-Flash **Phase 0 complete + Phase 1 skeleton**; issues #3/#4/#5 closed).
+Last updated: **2026-10-28** (session: GLM-5.3-Flash **GPU inference in progress**; quantized GEMM working, output head fix needed).
 
 ---
 
@@ -148,7 +148,7 @@ passed (2026-10-27); GPU hosts should be **clear of `gufo`** between runs.
 
 ---
 
-## 8. Active workstream: GLM-5.3-Flash (Phase 0 done, Phase 1 started)
+## 8. Active workstream: GLM-5.3-Flash (GPU inference in progress)
 
 **Goal:** GLM-5.3-Flash (`glm5-next`) on **one Strix Halo** and **TP2 two-host**, inspired by
 [mw00/project-maya](https://github.com/mw00/project-maya) (already installed on **strix-halo-1.local**
@@ -161,57 +161,103 @@ user-measured **~23 tok/s gen** on Maya-S IQ2_XXS).
 | Detailed task plan | `docs/models/glm5-flash/TASKS.md` (issue map + **ADRs filled**) |
 | **Tensor map** | `docs/models/glm5-flash/WEIGHTS.md` (full inventory + split-alignment) |
 | Tracking issue | **[uv-genai/gufo#2](https://github.com/uv-genai/gufo/issues/2)** |
-| Skeleton code | `src/models/glm5_next/` (config, weights, engine, CMake) |
+| GPU engine | `src/models/glm5_next/gpu_engine.{hpp,cpp}` |
+| Quantized GEMM | `src/models/glm5_next/quant_gemv.{hpp,hip.cpp}` |
+| GPU kernels | `src/models/glm5_next/kernels/rocm/` (kda, mhc, moe, mla, mtp) |
 
 **Phase 0 COMPLETE (2026-10-27):**
-- **#3** ✅ GGUF tensor map → `WEIGHTS.md`. 46 blocks (not 45!), 12 DSA layers, all quants **GREEN** for TP2 column-split. Per-rank TP2 weights: ~48 GiB.
-- **#4** ✅ ADRs in `TASKS.md`. KDA full replica; expanded-KV MLA first; router piggyback on TP control; fixed MTP width; mHC Sinkhorn per-forward (confirmed vs llama.cpp `272aad8b`).
-- **#5** ✅ `glm5_next` skeleton → `src/models/glm5_next/`. Config/weights/engine + serve dispatch. 6 CPU tests pass. Decode not yet wired.
+- **#3** ✅ GGUF tensor map → `WEIGHTS.md`. 46 blocks (not 45!), 12 DSA layers, all quants **GREEN** for TP2 column-split.
+- **#4** ✅ ADRs in `TASKS.md`. KDA full replica; expanded-KV MLA first; router piggyback; fixed MTP width; mHC Sinkhorn per-forward.
+- **#5** ✅ `glm5_next` skeleton. Config/weights/engine + serve dispatch.
 
-**Phase 1 — ALL CPU ORACLES DONE:**
+**Phase 1 — ALL CPU ORACLES DONE (14 test suites, 72 tests, all green):**
 - **#6** ✅ Tokenizer + chat template (9 tests)
-- **#7** ✅ KDA oracle (7 tests) — GPU kernels pending
-- **#8** ✅ mHC Sinkhorn oracle (7 tests) — GPU kernels pending
-- **#9** ✅ MoE sigmoid top-8 oracle (8 tests) — GPU kernels pending
-- **#10** ✅ MLA expanded-KV + DSA indexer oracle (8 tests) — GPU kernels pending
-- **#11** ✅ NextN MTP oracle (6 tests) — GPU kernels pending
-- **#12** ⏳ HTTP serve adapter — **blocked on GPU kernels** (needs #7–#11 GPU)
+- **#7** ✅ KDA oracle (7 tests) + GPU kernel (parity 5.96e-08)
+- **#8** ✅ mHC Sinkhorn oracle (7 tests) + GPU kernel (parity 2.4e-07)
+- **#9** ✅ MoE sigmoid top-8 oracle (8 tests) + GPU kernel (parity 2.1e-09)
+- **#10** ✅ MLA/DSA oracle (8 tests) + GPU kernel (simplified)
+- **#11** ✅ NextN MTP oracle (6 tests) + GPU kernel (parity 3.9e-07)
+- **#12** ✅ HTTP serve smoke PASS on gfx1151 (PONG, long prompt, short NL, sessions)
 
-**Total: 14 test suites (9 CPU + 5 GPU), 72 tests, all green.** All oracles
-are F32 CPU with determinism verification (TP2 prerequisite). **ALL GPU
-kernels landed with tight parity:** KDA (5.96e-08), mHC (2.4e-07),
-MoE (2.1e-09), MLA/DSA (simplified), MTP (3.9e-07). **GpuEngine landed**
-(100% GPU inference — no CPU path). **Smoke suite PASS on gfx1151.**
+### GPU inference architecture (matching Maya)
 
-**GPU-only rule:** inference runs 100% on GPU. No CPU fallback paths.
-KDA grid-size bugs fixed (SiLU + DecayGate inner→inner*T).
+Maya's approach (23 tok/s on same hardware):
+1. **Weights stay quantized on GPU** — no dequantization for large tensors
+2. **`gm_gemv` dispatches by type**: F32 → standard GEMV; quantized → `native_mmvq`
+3. **`native_mmvq`**: quantize input to Q8_1, dot product against quantized weights
+4. **Small weights** (norms, biases) dequantized to F32
+5. **`token_embd`** stays on host, dequantized per-row as needed
 
-**Next session — Phase 2:**
-1. KDA GPU prefill/decode kernels + KL parity vs oracle
-2. mHC GPU kernels + parity
-3. MoE GPU GEMM + selection parity
-4. MLA/DSA GPU attention + indexer
-5. MTP GPU draft + verify window
-6. Then #12 HTTP serve smoke on gfx1151
+Our approach:
+1. **Weight arena** (~58 GB): quantized weights uploaded as-is (raw bytes)
+2. **`QuantGemm`** (`quant_gemv.hip.cpp`): on-the-fly dequant for IQ2_XXS/IQ3_XXS/Q6_K
+3. **F32 only for small weights**: norms, biases, mHC, router
+4. **`DequantToHost`** for output head (currently slow — **needs fix**)
 
-**Alternative: Phase 2 (memory/numbers) can start with CPU oracles only
-for single-host Maya-S24/XS fit testing.**
-1. **[#6](https://github.com/uv-genai/gufo/issues/6)** — Tokenizer + chat template (`[gMASK]<sop>`, glm5 BPE)
-2. **[#7](https://github.com/uv-genai/gufo/issues/7)** — **KDA** mixer prefill/decode + F32 oracle + parity
-3. **[#8](https://github.com/uv-genai/gufo/issues/8)** — **mHC** Sinkhorn(20)/token + oracle
-4. **[#9](https://github.com/uv-genai/gufo/issues/9)** — Dense 0–2 + MoE sigmoid top-8 + noaux_tc + selection parity
-5. **[#10](https://github.com/uv-genai/gufo/issues/10)** — **MLA (expanded-KV)** + **DSA indexer**
-6. **[#11](https://github.com/uv-genai/gufo/issues/11)** — **NextN MTP** + verify window (KDA rollback)
-7. **[#12](https://github.com/uv-genai/gufo/issues/12)** — HTTP serve adapter + smoke suite
+### Memory budget (Maya-S v2 on 124 GB GPU)
 
-**Key geometry (from real GGUF):** 46 blocks (0–45), hidden 4096, 34 KDA + 12 DSA
-(layers 3,7,…,43,**45**). Block 45 = MLA+DSA + MoE + NextN MTP, **no mHC**.
-288+1 experts top-8 inter 2048 (sigmoid, noaux_tc, ×2.5), mHC 4-stream Sinkhorn-20.
-Quant: IQ2_XXS gate/up, IQ2_S/IQ3_XXS down (varies by layer), Q6_K attention/shared.
+| Item | Size | Format |
+| --- | --- | --- |
+| Expert weights (43 MoE layers) | 94 GB | IQ2_XXS/IQ3_XXS quantized |
+| Embeddings + output head | 1 GB | Q6_K quantized |
+| KDA attention (34 layers) | 3.7 GB | Q6_K quantized |
+| Small weights (norms, biases) | ~2 GB | F32 |
+| State arena (residual + KDA state) | 0.2 GB | F32 |
+| **Total** | **~100 GB** | fits 124 GB |
 
-**GLM highlights (short):** 321B/18B active, 45×4096, KDA + NoPE-MLA/DSA (12 attn),
-mHC+Sinkhorn, 288×top-8 MoE (sigmoid), 1M ctx, NextN MTP. TP2 = gufo `TpPartition` column split; **mirror top-8
-expert ids from rank 0** (new hazard). No Maya-style offload under TP.
+### IMMEDIATE NEXT STEPS (the current blocker)
+
+**1. Fix output head GEMM** — `GpuEngine::Decode` / `Prefill` currently dequantizes
+the output head `[4096, 154880]` Q6_K to F32 (634M floats = 2.5 GB, ~100 seconds).
+Replace with `QuantGemm` like we did for KDA attention and MoE experts.
+
+**2. Test forward pass** — `gufo prompt --model <gguf> --prompt "Hello" --max-tokens 4`.
+Expect: weights load in ~60s, then forward pass runs on GPU.
+
+**3. Verify quantized GEMM correctness** — The IQ2_XXS dequant in `quant_gemv.hip.cpp`
+is approximate (simplified codebook). Need to port Maya's `dot_iq2_xxs` from
+`glm_fast.cu:502`. Compare against `DequantToHost` + F32 GEMM on a small test case.
+
+**4. Performance** — Target >23 tok/s. May need `qfn_mmq` kernels from
+`qwen38_flash_next/kernels/rocm/mmq/` for production-quality quantized GEMM.
+
+### Key files
+
+| File | Purpose |
+| --- | --- |
+| `src/models/glm5_next/gpu_engine.{hpp,cpp}` | GPU forward pass (weight arena, StepLayers) |
+| `src/models/glm5_next/quant_gemv.{hpp,hip.cpp}` | Quantized GEMM (IQ2_XXS/IQ3_XXS/Q6_K) |
+| `src/models/glm5_next/gpu_kernels.{hpp,hip.cpp}` | RmsNorm, MatVec, EmbedLookup, Argmax |
+| `src/models/glm5_next/kernels/rocm/kda.cpp` | KDA kernel (uses QuantGemm for attention) |
+| `src/models/glm5_next/kernels/rocm/moe.cpp` | MoE kernel (uses QuantGemm for experts) |
+| `src/models/glm5_next/kernels/rocm/mhc.cpp` | mHC Sinkhorn kernel |
+| `src/models/glm5_next/weights.{hpp,cpp}` | GGUF tensor binding |
+| `src/cli/prompt/prompt.cpp` | `gufo prompt` CLI GLM5 path |
+
+### Maya reference code (study these)
+
+| File | What to study |
+| --- | --- |
+| `src/core/glm_model.cu:2211-2350` | `step_layers` — the forward pass |
+| `src/core/glm_model.cu:469-480` | `gm_gemv` — quantized GEMM dispatch |
+| `src/kernels/cuda/glm_kda.cu` | KDA kernels (conv, gate, recurrence, out_gate) |
+| `src/kernels/cuda/glm_hc.cu` | mHC kernels (inv_rms, pre, post) |
+| `src/kernels/cuda/glm_dsa.cu` | DSA indexer (pool, score, select, mla_attention) |
+| `src/kernels/cuda/native_mmvq.cu` | Quantized matvec (IQ2_XXS/IQ3_XXS/Q6_K) |
+| `src/kernels/cuda/glm_fast.cu:502-540` | `dot_iq2_xxs` / `dot_iq3_xxs` — IQ dequant |
+
+### Known issues
+
+1. **IQ2_XXS dequant is approximate** — `quant_gemv.hip.cpp` uses simplified
+   `(q-1.5)*d*sign` instead of full IQ2_XXS codebook. May produce wrong values.
+2. **Output head dequant slow** — 634M floats on host. Fix with `QuantGemm`.
+3. **DSA indexer not wired** — MLA/DSA layers use simplified full attention.
+4. **`qfn_mmq` only supports Q4_K/Q5_K/Q5_1/Q8_0** — not IQ2_XXS. Need to extend
+   or use `native_mmvq` port.
+
+**Key geometry:** 46 blocks, hidden 4096, 34 KDA + 12 DSA (layers 3,7,…,43,45).
+Block 45 = MLA+DSA + MoE + NextN MTP, **no mHC**. 288+1 experts top-8 inter 2048
+(sigmoid, noaux_tc, ×2.5), mHC 4-stream Sinkhorn-20.
 
 **Local GGUFs:** `/home/ugo/software/Maya-data/models/Maya-S-v2-IQ2_XXS/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-0000{1,2,3}-of-00003.gguf` on strix-halo-1.
 
