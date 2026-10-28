@@ -200,53 +200,44 @@ Our approach:
    `QuantEmbedLookup` on the quantized weights (no F32 head copy).
 5. Quant types come from the loaded tensors — never hardcoded.
 
-**STATUS 2026-10-28 (issue #19): GPU inference runs end-to-end with real
-MLA/DSA attention; 285 ms/token (3.5 tok/s) vs Maya 43 ms (23 tok/s).**
-`gufo prompt --prompt "The capital of France is" --max-tokens 16 --verbose`
-exits 0 with language-like continuations and prints per-token ms.
+**STATUS 2026-10-28 (issue #19): model runs end-to-end, output is real text,
+117 ms/token (8.5 tok/s) vs Maya 43 ms (23 tok/s).** Acceptance = the real
+model run (exit 0) + `glm5_next_gpu_engine_e2e_test` (GPU engine ≡ CPU engine
+to 1e-9 over multi-token continuation).
 
-This session's correctness work (all GPU kernels use the loaded model's
-quantization):
-- **DSA/MLA real attention** — `MlaStepGpu` with incremental latent/ik/ig
-  caches (pool scoring, top-k selection, selected-cell softmax, v_b/wo).
-  GPU↔oracle parity 2e-7 (`mla_gpu_test`). The oracle now includes the
-  indexer `k_norm` on ik (it was skipped).
-- **mHC FFN mixer uses hc_ffn_\*** (was reusing attn mixer weights).
-- All quant types exact (Q2_K/Q3_K/Q6_K/IQ2_XXS/IQ3_XXS/IQ2_S/Q8_0/F32/F16),
-  per-tensor types plumbed from the pack; output head + embed lookup
-  quantized; expert byte-strides; blk.45 drafter-only.
+**Read this before trusting tests:** kernel-math tests call one op and sync —
+they cannot see integration bugs. The e2e engine test (multi-token, production
+async pattern) is the gate that catches workspace reuse, buffer lifetimes and
+stream ordering. Every real crash so far lived in that blind spot.
 
-This session's speed work (520 → 285 ms/token):
-- Persistent kernel workspaces (was ~1600 hipMalloc/free per token).
-- Block-per-row matvecs (thread-per-row serial chains were latency-bound;
-  mHC fn matvec alone was 0.78 ms/call → 0.016 ms).
-- Fused mHC Sinkhorn (39 launches → 1).
-- In-order reductions (tree reduction flipped MoE top-k via rounding).
+Fixed this session (all found by the e2e test):
+- **Stream-ordering**: every engine/kernel `hipMemcpy` raced the non-blocking
+  engine stream (embed, hidden readback, argmax, mHC flat←residual, post-
+  Sinkhorn comb, KDA/MoE internals). Now `hipMemcpyAsync` on the stream with
+  explicit syncs at host boundaries. This was the systemic correctness bug.
+- **mHC residual chains between halves** (Maya ping-pongs `R`); CPU engine
+  used R0 for both halves.
+- **Input rms-norms**: `rms_norm(mixed, attn_norm/ffn_norm)` before each
+  mixer (Maya `step_layers`) — both engines were missing them.
+- **CPU engine wiring**: KDA from `L.kda.*` (not mla placeholders), conv1d_\*,
+  indexer tensors, separate `mhc_ffn` weights, dense-FFN branch.
+- Q8 scratch lifetime, per-slot-x quantize, MoE staging buffers, workspace
+  `top_k`, all-F32 packs at load.
 
-Measured profile per token (bench: `qbench2` harness):
-| component | time | x count | total |
-| --- | --- | --- | --- |
-| KDA layer (4x Q6_K GEMM 8192x4096 @ 920 us) | 4.4 ms | 34 | 150 ms |
-| MoE layer | 1.44 ms | 45 | 65 ms |
-| DSA step @ 32K ctx | 5.4 ms | 12 | 65 ms |
-| mHC pre/post | 0.26/0.003 ms | 90 | 24 ms |
+Perf facts (measured, for the next pass): GEMM already on the Q8_1/dp4a tier
+(Q6_K 8192x4096: 131 us, 210 GB/s). Per token: KDA 1.2 ms x34, MoE 1.0 ms x45,
+mHC pre 0.17 ms x90 (Sinkhorn is single-threaded), DSA 2.6 ms x12 @32K, head
+~2.5 ms. Load 65-81 s vs Maya 38 s.
 
 ### IMMEDIATE NEXT STEPS
 
-1. **QuantGemm Q8_1/dp4a tier** — the fused dequant-dot achieves ~30 GB/s vs
-   the ~150 GB/s effective Maya's `native_mmvq` hits. Port
-   `vec_dot_{q6_K,iq2_xxs,iq3_xxs}_q8_1` (vendored in
-   `qwen38_flash_next/kernels/rocm/mmq/vecdotq.hpp`) + a real
-   `QuantizeQ81`. Expected 285 → ~60-80 ms/token. Tried: templated kernels
-   (no change), word-load Q6_K (no change), dual-stream accumulators
-   (worse, reverted) — the win is in integer dp4a dots, not layout tweaks.
-2. **Quality vs Maya** — output is language-like but below Maya: check KDA
-   conv/state details, swiglu clamp (`swiglu_clamp_exp` config), and
-   compare logits against Maya (`maya --check-logits`).
-3. **Load time 69-81 s vs Maya 38 s** — per-tensor timings print to stderr;
-   likely host-side dequant + memcpy order.
-4. mHC Sinkhorn is single-threaded (0.12 ms/call); parallelize per column.
-5. MTP draft wiring (blk.45); expert top-k on GPU (still host D2H per layer).
+1. **Perf to Maya level** (117 → ~43 ms/token): batch MoE launches further,
+   parallelize the Sinkhorn, shrink KDA's per-layer overhead, consider the
+   `qfn_mmq`/`native_mmvq` warp-row layout if the Q8 tier plateaus.
+2. **Quality vs Maya** (output is real text but says `"\" \"". Ple` instead of
+   "Paris"): compare logits against Maya (`--check-logits`); check DSA
+   selection depth, KDA conv/state details, swiglu clamp.
+3. Load-time path (65-81 s vs 38 s).
 
 ### Memory budget (Maya-S v2 on 124 GB GPU)
 
@@ -302,16 +293,13 @@ Measured profile per token (bench: `qbench2` harness):
 
 ### Known issues
 
-1. **Quality below Maya** — text is language-like but garbled; remaining gaps
-   in KDA conv/state details and swiglu clamp params (see next steps).
-2. **QuantGemm tier is dequant-dot (~30 GB/s)** — the Q8_1/dp4a port is the
-   identified path to Maya-level tok/s.
-3. **Load 69-81 s vs Maya 38 s**; per-tensor load timings print to stderr.
-4. **DSA caches capped at 32K positions** (`kMaxDsaPos`) — 1M-context needs
-   KV streaming (issue #18).
-5. Expert routing top-k runs on host (2 small D2H syncs per MoE layer);
-   DSA pool selection does one D2H sync per full-attention layer.
-6. mHC Sinkhorn kernel is single-threaded per token.
+1. **Quality below Maya** — text is language-like but the completion is
+   off (see next steps 2).
+2. **Speed 117 ms/token vs 43 ms** — profile table above; GEMMs are no
+   longer the bottleneck.
+3. **DSA caches capped at 32K positions** (`kMaxDsaPos`).
+4. Expert top-k and DSA pool selection do small D2H syncs per layer.
+5. mHC Sinkhorn kernel is single-threaded per token (0.12 ms/call).
 
 **Key geometry:** 46 blocks, hidden 4096, 34 KDA + 12 DSA (layers 3,7,…,43,45).
 Block 45 = MLA+DSA + MoE + NextN MTP, **no mHC**. 288+1 experts top-8 inter 2048
