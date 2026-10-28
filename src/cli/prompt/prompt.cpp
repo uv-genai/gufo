@@ -1100,6 +1100,7 @@ int RunPrompt(std::span<const char* const> args) {
         if (token == 154820)
           break;  // EOS
         output += piece;
+        hidden = engine->Step(token);
       }
       if (opt.display_prompt) {
         std::cout << opt.prompt_text << '\n';

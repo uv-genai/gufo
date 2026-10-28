@@ -55,10 +55,12 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
                    const float* token_input, float* out, hipStream_t stream);
 
 /// Run dense FFN forward on GPU for one token.
-/// gate/up: [hidden, inter], down: [inter, hidden] on device.
+/// gate/up: [inter, hidden], down: [hidden, inter] on device, each stored in
+/// its ggml quant type (0=F32); the GEMMs dequantize on-the-fly.
 /// out: [hidden] on device (output).
 bool DenseFfnForwardGpu(std::uint32_t hidden, std::uint32_t inter, float limit,
                         const float* gate, const float* up, const float* down,
+                        int gate_type, int up_type, int down_type,
                         const float* token_input, float* out,
                         hipStream_t stream);
 

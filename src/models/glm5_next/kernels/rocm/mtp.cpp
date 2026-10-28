@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstring>
 
+#include "src/models/glm5_next/quant_gemv.hpp"
+
 namespace gufo::models::glm5_next::rocm {
 namespace {
 
@@ -113,12 +115,10 @@ bool MtpDraftGpu(const MtpGpuGeometry& geom, const MtpGpuWeights& w,
   hipLaunchKernelGGL(RmsNormKernel, dim3(1), dim3(block), 0, stream, normed,
                      w.shared_head_norm, H, geom.norm_eps);
 
-  // 6. logits = output_head @ normed  [vocab].
-  {
-    const int grid = (geom.vocab_size + block - 1) / block;
-    hipLaunchKernelGGL(MatVecKernel, dim3(grid), dim3(block), 0, stream,
-                       w.output_head, normed, out_logits, geom.vocab_size, H);
-  }
+  // 6. logits = output_head @ normed  [vocab] (quantized on-the-fly).
+  if (!gpu::QuantGemm(w.output_head, normed, out_logits, geom.vocab_size, H,
+                      w.output_head_type, stream))
+    return false;
 
   // Cleanup.
   HIP_CHECK(hipFree(en));

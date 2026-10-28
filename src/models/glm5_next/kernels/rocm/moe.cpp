@@ -172,6 +172,14 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
   // 6. Zero accumulator.
   HIP_CHECK(hipMemset(acc, 0, H * sizeof(float)));
 
+  // Byte stride between expert matrices of a quantized 3D tensor.
+  const std::size_t gate_stride = gpu::QuantMatrixBytes(I, H, w.gate_exps_type);
+  const std::size_t up_stride = gpu::QuantMatrixBytes(I, H, w.up_exps_type);
+  const std::size_t down_stride = gpu::QuantMatrixBytes(H, I, w.down_exps_type);
+  if (gate_stride == 0 || up_stride == 0 || down_stride == 0) {
+    return false;
+  }
+
   // 7. Routed experts.
   for (std::uint32_t idx = 0; idx < k; ++idx) {
     const std::uint32_t e = indexed[idx].second;
@@ -179,13 +187,20 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
 
     // gate = gate_exps[e] @ x  [I] (quantized GEMM).
     {
-      const float* gW = w.gate_exps + static_cast<std::size_t>(e) * H * I;
-      gpu::QuantGemm(gW, token_input, gate, I, H, w.gate_exps_type, stream);
+      const auto* gW = reinterpret_cast<const void*>(
+          reinterpret_cast<const std::uint8_t*>(w.gate_exps) +
+          static_cast<std::size_t>(e) * gate_stride);
+      if (!gpu::QuantGemm(gW, token_input, gate, I, H, w.gate_exps_type,
+                          stream))
+        return false;
     }
     // up = up_exps[e] @ x  [I] (quantized GEMM).
     {
-      const float* uW = w.up_exps + static_cast<std::size_t>(e) * H * I;
-      gpu::QuantGemm(uW, token_input, up, I, H, w.up_exps_type, stream);
+      const auto* uW = reinterpret_cast<const void*>(
+          reinterpret_cast<const std::uint8_t*>(w.up_exps) +
+          static_cast<std::size_t>(e) * up_stride);
+      if (!gpu::QuantGemm(uW, token_input, up, I, H, w.up_exps_type, stream))
+        return false;
     }
     // h = swiglu_clamp(gate, up).
     {
@@ -195,8 +210,11 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
     }
     // expert_out = down_exps[e] @ h  [H] (quantized GEMM).
     {
-      const float* dW = w.down_exps + static_cast<std::size_t>(e) * I * H;
-      gpu::QuantGemm(dW, h, expert_out, H, I, w.down_exps_type, stream);
+      const auto* dW = reinterpret_cast<const void*>(
+          reinterpret_cast<const std::uint8_t*>(w.down_exps) +
+          static_cast<std::size_t>(e) * down_stride);
+      if (!gpu::QuantGemm(dW, h, expert_out, H, I, w.down_exps_type, stream))
+        return false;
     }
     // acc += weight * expert_out.
     {
@@ -247,6 +265,7 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
 
 bool DenseFfnForwardGpu(std::uint32_t hidden, std::uint32_t inter, float limit,
                         const float* gate, const float* up, const float* down,
+                        int gate_type, int up_type, int down_type,
                         const float* token_input, float* out,
                         hipStream_t stream) {
   float *g, *u, *h;
@@ -256,29 +275,29 @@ bool DenseFfnForwardGpu(std::uint32_t hidden, std::uint32_t inter, float limit,
 
   const int block = 256;
 
-  // gate = gate @ x, up = up @ x.
+  // gate = gate @ x, up = up @ x (quantized on-the-fly).
+  if (!gpu::QuantGemm(gate, token_input, g, inter, hidden, gate_type, stream) ||
+      !gpu::QuantGemm(up, token_input, u, inter, hidden, up_type, stream)) {
+    HIP_CHECK(hipFree(g));
+    HIP_CHECK(hipFree(u));
+    HIP_CHECK(hipFree(h));
+    return false;
+  }
   {
     const int grid = (inter + block - 1) / block;
-    hipLaunchKernelGGL(MatVecKernel, dim3(grid), dim3(block), 0, stream, gate,
-                       token_input, g, inter, hidden);
-    hipLaunchKernelGGL(MatVecKernel, dim3(grid), dim3(block), 0, stream, up,
-                       token_input, u, inter, hidden);
     hipLaunchKernelGGL(SwigluClampKernel, dim3(grid), dim3(block), 0, stream, g,
                        u, h, inter, limit);
   }
 
   // out = down @ h.
-  {
-    const int grid = (hidden + block - 1) / block;
-    hipLaunchKernelGGL(MatVecKernel, dim3(grid), dim3(block), 0, stream, down,
-                       h, out, hidden, inter);
-  }
+  const bool ok =
+      gpu::QuantGemm(down, h, out, hidden, inter, down_type, stream);
 
   HIP_CHECK(hipFree(g));
   HIP_CHECK(hipFree(u));
   HIP_CHECK(hipFree(h));
   HIP_CHECK(hipStreamSynchronize(stream));
-  return true;
+  return ok;
 }
 
 }  // namespace gufo::models::glm5_next::rocm

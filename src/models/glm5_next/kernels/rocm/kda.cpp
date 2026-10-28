@@ -296,9 +296,12 @@ bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
   // 1. Q/K/V projections (quantized GEMM per token).
   for (std::uint32_t t = 0; t < T; ++t) {
     const float* x = input + t * H;
-    gpu::QuantGemm(w.w_q, x, wq + t * inner, inner, H, w.w_q_type, stream);
-    gpu::QuantGemm(w.w_k, x, wk + t * inner, inner, H, w.w_k_type, stream);
-    gpu::QuantGemm(w.w_v, x, wv + t * inner, inner, H, w.w_v_type, stream);
+    if (!gpu::QuantGemm(w.w_q, x, wq + t * inner, inner, H, w.w_q_type,
+                        stream) ||
+        !gpu::QuantGemm(w.w_k, x, wk + t * inner, inner, H, w.w_k_type,
+                        stream) ||
+        !gpu::QuantGemm(w.w_v, x, wv + t * inner, inner, H, w.w_v_type, stream))
+      return false;
   }
 
   // 2. Causal conv + SiLU.
@@ -391,8 +394,9 @@ bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
 
   // 9. Output projection (quantized GEMM per token).
   for (std::uint32_t t = 0; t < T; ++t) {
-    gpu::QuantGemm(w.w_out, normed + t * inner, out + t * H, H, inner,
-                   w.w_out_type, stream);
+    if (!gpu::QuantGemm(w.w_out, normed + t * inner, out + t * H, H, inner,
+                        w.w_out_type, stream))
+      return false;
   }
 
   // Cleanup.

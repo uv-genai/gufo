@@ -189,49 +189,77 @@ Maya's approach (23 tok/s on same hardware):
 5. **`token_embd`** stays on host, dequantized per-row as needed
 
 Our approach:
-1. **Weight arena** (~58 GB): quantized weights uploaded as-is (raw bytes)
-2. **`QuantGemm`** (`quant_gemv.hip.cpp`): on-the-fly dequant for IQ2_XXS/IQ3_XXS/Q6_K
-3. **F32 only for small weights**: norms, biases, mHC, router
-4. **`DequantToHost`** for output head (currently slow — **needs fix**)
+1. **Weight arena** (~87 GB): quantized weights uploaded as-is (raw bytes),
+   uploads staged through a pinned buffer (direct pageable H2D from the GGUF
+   mapping stalls for tens of seconds per tensor).
+2. **`QuantGemm`** (`quant_gemv.hip.cpp`): fused on-the-fly dequant for
+   **F32/F16/Q8_0/Q2_K/Q3_K/Q6_K/IQ2_XXS/IQ3_XXS/IQ2_S** — exact llama.cpp
+   `dequantize_row_*` semantics (parity-tested vs host `quant::Dot`).
+3. **F32 only for small weights**: norms, biases, mHC, router.
+4. **Output head + embedding rows** run through `QuantGemm` /
+   `QuantEmbedLookup` on the quantized weights (no F32 head copy).
+5. Quant types come from the loaded tensors — never hardcoded.
+
+**STATUS 2026-10-28 (issue #19): forward pass runs end-to-end on gfx1151.**
+`gufo prompt --model <gguf> --prompt "Hello" --max-tokens 4` exits 0;
+load 81.7 s. Generated text is still degenerate ("!!!!") because DSA layers
+use the simplified copy path (see Known issues).
+
+Fixed on the way (all were silent-failure traps):
+- `SizeBytes()` returned 0 for IQ3_XXS/IQ2_S → whole tensors silently skipped
+  → MoE down_projections ran on NULL bases. Size table now covers
+  IQ2_XS/IQ2_S/IQ3_XXS/IQ1_S/IQ1_M; zero-size uploads hard-fail.
+- IQ3_XXS device dequant was zero-filled; IQ2_XXS codebook was approximate;
+  Q6_K scale indexing was wrong. All re-ported from llama.cpp and pinned by
+  `tests/models/glm5_next/quant_gemv_gpu_test.cpp` (9 types × shapes, MoE,
+  embed, golden blocks; host reference in `src/core/quant/ggml_dequant.*`,
+  codebooks in `src/core/quant/iq_grids.hpp`).
+- blk.45 (NextN draft block) ran in the trunk and dereferenced its absent mHC
+  weights; it is drafter-only (`num_layers - nextn`) and now skipped.
+- Arena budget over-advanced for F32 uploads (OOM risk); embed lookup copied
+  quantized bytes as F32; expert strides used element math on quantized
+  tensors. All fixed.
+- `Decode`/`Prefill` contract matches CPU engine again (Prefill returns raw
+  hidden; `Step(token)` advances state; CLI loop no longer re-decodes one
+  hidden).
 
 ### Memory budget (Maya-S v2 on 124 GB GPU)
 
 | Item | Size | Format |
 | --- | --- | --- |
-| Expert weights (43 MoE layers) | 94 GB | IQ2_XXS/IQ3_XXS quantized |
-| Embeddings + output head | 1 GB | Q6_K quantized |
-| KDA attention (34 layers) | 3.7 GB | Q6_K quantized |
-| Small weights (norms, biases) | ~2 GB | F32 |
-| State arena (residual + KDA state) | 0.2 GB | F32 |
-| **Total** | **~100 GB** | fits 124 GB |
+| Expert weights (43 MoE layers) | ~87 GB arena | IQ2_XXS/IQ2_S/IQ3_XXS/Q2_K/Q3_K |
+| Embeddings + output head | (in arena) | Q6_K |
+| KDA attention (34 layers) | (in arena) | Q6_K |
+| Small weights (norms, biases, mHC) | ~2 GB | F32 (separate allocs) |
+| State + scratch arenas | <1 GB | F32 |
+| **Total** | **~90 GB** | fits 124 GB |
 
-### IMMEDIATE NEXT STEPS (the current blocker)
+### IMMEDIATE NEXT STEPS
 
-**1. Fix output head GEMM** — `GpuEngine::Decode` / `Prefill` currently dequantizes
-the output head `[4096, 154880]` Q6_K to F32 (634M floats = 2.5 GB, ~100 seconds).
-Replace with `QuantGemm` like we did for KDA attention and MoE experts.
-
-**2. Test forward pass** — `gufo prompt --model <gguf> --prompt "Hello" --max-tokens 4`.
-Expect: weights load in ~60s, then forward pass runs on GPU.
-
-**3. Verify quantized GEMM correctness** — The IQ2_XXS dequant in `quant_gemv.hip.cpp`
-is approximate (simplified codebook). Need to port Maya's `dot_iq2_xxs` from
-`glm_fast.cu:502`. Compare against `DequantToHost` + F32 GEMM on a small test case.
-
-**4. Performance** — Target >23 tok/s. May need `qfn_mmq` kernels from
-`qwen38_flash_next/kernels/rocm/mmq/` for production-quality quantized GEMM.
+1. **Wire real DSA/MLA attention** in `StepLayers` (layers 3,7,…,43 currently
+   copy `mixed → attn_out`; kernels exist in `kernels/rocm/mla.cpp`). This is
+   why output text is degenerate. Parity oracles exist (`mla_oracle_test`).
+2. **Load time 81 s vs Maya 38 s** — profile the load path (`[glm5_gpu]`
+   per-tensor timings are printed); likely host-side dequant and memcpy order.
+3. **Performance**: target >23 tok/s (Maya baseline; measured 17.5 tok/s with
+   MTP spec on a short prompt). Consider the `qfn_mmq` Q8_1/dp4a tier or
+   Maya's `native_mmvq` port for the GEMM hot path.
+4. **MTP draft wiring** for blk.45 (single-host only; fixed width).
 
 ### Key files
 
 | File | Purpose |
 | --- | --- |
 | `src/models/glm5_next/gpu_engine.{hpp,cpp}` | GPU forward pass (weight arena, StepLayers) |
-| `src/models/glm5_next/quant_gemv.{hpp,hip.cpp}` | Quantized GEMM (IQ2_XXS/IQ3_XXS/Q6_K) |
+| `src/models/glm5_next/quant_gemv.{hpp,hip.cpp}` | Quantized GEMM (all pack types) |
 | `src/models/glm5_next/gpu_kernels.{hpp,hip.cpp}` | RmsNorm, MatVec, EmbedLookup, Argmax |
+| `src/core/quant/{ggml_dequant,ggml_gemm,iq_grids}.*` | Host dequant/dot + codebooks (parity reference) |
 | `src/models/glm5_next/kernels/rocm/kda.cpp` | KDA kernel (uses QuantGemm for attention) |
-| `src/models/glm5_next/kernels/rocm/moe.cpp` | MoE kernel (uses QuantGemm for experts) |
+| `src/models/glm5_next/kernels/rocm/moe.cpp` | MoE + dense FFN (uses QuantGemm) |
 | `src/models/glm5_next/kernels/rocm/mhc.cpp` | mHC Sinkhorn kernel |
-| `src/models/glm5_next/weights.{hpp,cpp}` | GGUF tensor binding |
+| `src/models/glm5_next/kernels/rocm/mla.cpp` | MLA/DSA kernels (not yet wired into StepLayers) |
+| `tests/models/glm5_next/quant_gemv_gpu_test.cpp` | GPU/host quant parity suite |
+| `src/models/glm5_next/weights.{hpp,cpp}` | GGUF tensor binding (block sizes!) |
 | `src/cli/prompt/prompt.cpp` | `gufo prompt` CLI GLM5 path |
 
 ### Maya reference code (study these)
@@ -245,15 +273,19 @@ is approximate (simplified codebook). Need to port Maya's `dot_iq2_xxs` from
 | `src/kernels/cuda/glm_dsa.cu` | DSA indexer (pool, score, select, mla_attention) |
 | `src/kernels/cuda/native_mmvq.cu` | Quantized matvec (IQ2_XXS/IQ3_XXS/Q6_K) |
 | `src/kernels/cuda/glm_fast.cu:502-540` | `dot_iq2_xxs` / `dot_iq3_xxs` — IQ dequant |
+| third_party/llama.cpp `ggml-quants.c` | dequantize_row_* (format ground truth) |
 
 ### Known issues
 
-1. **IQ2_XXS dequant is approximate** — `quant_gemv.hip.cpp` uses simplified
-   `(q-1.5)*d*sign` instead of full IQ2_XXS codebook. May produce wrong values.
-2. **Output head dequant slow** — 634M floats on host. Fix with `QuantGemm`.
-3. **DSA indexer not wired** — MLA/DSA layers use simplified full attention.
-4. **`qfn_mmq` only supports Q4_K/Q5_K/Q5_1/Q8_0** — not IQ2_XXS. Need to extend
-   or use `native_mmvq` port.
+1. **DSA/MLA attention is a copy-through stub** in `StepLayers` — DSA layers
+   (3,7,…,43) don't attend. Main quality gap.
+2. **Generated text is degenerate** ("!!!!") until (1) lands; the pipeline
+   itself (load, embed, KDA, MoE, mHC, head, step) runs on GPU.
+3. **Load 81 s vs Maya 38 s**; per-tensor load timings print to stderr.
+4. **mHC FFN mixer reuses the attn-mixer weights** (hc_ffn_* are bound but not
+   uploaded — GPU engine has 3 hc slots, model has 6).
+5. **MTP (blk.45) drafter not wired** (engine skips the block entirely).
+6. Expert routing top-k runs on host (copy of scores per token).
 
 **Key geometry:** 46 blocks, hidden 4096, 34 KDA + 12 DSA (layers 3,7,…,43,45).
 Block 45 = MLA+DSA + MoE + NextN MTP, **no mHC**. 288+1 experts top-8 inter 2048

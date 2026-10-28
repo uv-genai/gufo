@@ -32,6 +32,9 @@ struct MtpGpuWeights {
   const float* eh_proj;
   const float* shared_head_norm;
   const float* output_head;
+  /// ggml type of the device-side output_head bytes (0=F32; the shared
+  /// output head is quantized in real packs).
+  int output_head_type{0};
 };
 
 /// Run MTP draft generation on GPU for one step.

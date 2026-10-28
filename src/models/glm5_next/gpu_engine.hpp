@@ -40,11 +40,14 @@ public:
       const Config& config, const ModelWeights& weights,
       std::string* error_msg = nullptr);
 
-  /// Prefill prompt tokens on GPU. Returns final hidden state.
+  /// Prefill prompt tokens on GPU. Returns the final hidden state (pre-norm).
   [[nodiscard]] std::vector<float> Prefill(
       std::span<const std::uint32_t> tokens);
 
-  /// Decode one token on GPU. Returns token ID.
+  /// Advance one token through the layers. Returns the new hidden state.
+  [[nodiscard]] std::vector<float> Step(std::uint32_t token);
+
+  /// Run the output head on a hidden state. Returns token ID.
   [[nodiscard]] std::uint32_t Decode(const std::vector<float>& hidden);
 
   [[nodiscard]] const Config& GetConfig() const noexcept { return config_; }
@@ -58,6 +61,10 @@ public:
 private:
   GpuEngine() = default;
 
+  /// Embed one token and run it through all layers; returns the new hidden.
+  [[nodiscard]] std::vector<float> RunToken(std::uint32_t token,
+                                            std::uint32_t pos);
+
   /// Run one token through all layers (Maya step_layers).
   bool StepLayers(std::uint32_t pos, hipStream_t stream);
 
@@ -68,6 +75,7 @@ private:
   void* w_arena_{nullptr};
   std::uint64_t w_arena_bytes_{0};
   std::vector<float*> w_ptrs_;  ///< Per-tensor device pointers into arena.
+  std::vector<int> w_types_;    ///< Device-side ggml type per slot (0=F32).
 
   // State arena: residual + recurrent state + DSA buffers.
   float* state_{nullptr};
@@ -82,8 +90,9 @@ private:
 
   // Embedded token lookup.
   float* token_embd_{nullptr};
+  int token_embd_type_{0};
   float* output_head_{nullptr};
-  float* output_head_f32_{nullptr};  ///< Dequantized F32 for GEMM.
+  int output_head_type_{0};
   float* output_norm_{nullptr};
 
   // Geometry shortcuts.
@@ -92,6 +101,7 @@ private:
   std::uint32_t nh_{0};     ///< num_heads
   std::uint32_t dk_{0};     ///< kda_head_dim
   std::uint32_t inner_{0};  ///< d_inner = nh * dk
+  std::uint32_t pos_{0};    ///< next token position
 };
 
 }  // namespace gufo::models::glm5_next

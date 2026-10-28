@@ -3,9 +3,11 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 #include "src/models/glm5_next/gpu_kernels.hpp"
@@ -87,7 +89,6 @@ GpuEngine::~GpuEngine() {
   hipFree(w_arena_);
   hipFree(state_);
   hipFree(sc_);
-  hipFree(output_head_f32_);
   if (stream_)
     hipStreamDestroy(stream_);
 }
@@ -112,41 +113,62 @@ std::shared_ptr<GpuEngine> GpuEngine::Create(const Config& config,
     return nullptr;
   }
 
-  // ---- Weight arena: upload weights. Small weights (norms, biases) are
-  // dequantized to F32. Large quantized weights (experts, attention) are
-  // uploaded as-is (kernels handle quantized data or dequantize on-the-fly).
-  // This keeps the arena within GPU memory (~90GB for Maya-S).
-  std::uint64_t arena_bytes = 0;
+  // ---- Weight arena: quantized weights upload as raw bytes and are
+  // dequantized on-the-fly by the GPU kernels; small weights (norms,
+  // biases, routers) upload as F32. This keeps the arena within GPU memory
+  // (~90GB for Maya-S).
 
-  auto measure_raw = [&](const TensorRef& t) -> std::uint64_t {
-    if (t.empty() || t.data == nullptr)
-      return 0;
-    return Align256(t.SizeBytes());  // Raw quantized bytes.
+  // Tensors uploaded as raw quantized bytes share one arena allocation;
+  // tensors uploaded as F32 (small weights, dense packs) get their own
+  // allocation and do not consume arena space.
+  auto is_f32_upload = [](const TensorRef& t, bool force_f32) {
+    return force_f32 || t.type == core::GgmlType::kF32 ||
+           t.type == core::GgmlType::kF16 || t.type == core::GgmlType::kBF16;
   };
 
-  // Only measure quantized tensors for the arena. F32 tensors get
-  // separate allocations (see upload lambda).
-  arena_bytes += measure_raw(weights.token_embd);
-  arena_bytes += measure_raw(weights.output);
-  arena_bytes += measure_raw(weights.output_norm);
-
+  struct SlotSpec {
+    const TensorRef* t;
+    bool force_f32;
+  };
+  std::vector<SlotSpec> flat;
+  flat.push_back({&weights.token_embd, false});
+  flat.push_back({&weights.output, false});
+  flat.push_back({&weights.output_norm, true});
   const std::uint32_t n_layers = config.num_layers;
   for (std::uint32_t i = 0; i < n_layers && i < weights.layers.size(); ++i) {
     const auto& W = weights.layers[i];
-    for (const auto* t :
-         {&W.kda.attn_q,   &W.kda.attn_k,      &W.kda.attn_v,
-          &W.kda.attn_out, &W.kda.conv1d_q,    &W.kda.conv1d_k,
-          &W.kda.conv1d_v, &W.kda.a,           &W.kda.dt_bias,
-          &W.kda.f_a,      &W.kda.f_b,         &W.kda.beta,
-          &W.kda.g_a,      &W.kda.g_b,         &W.kda.norm,
-          &W.hc.attn_fn,   &W.hc.attn_scale,   &W.hc.attn_base,
-          &W.moe.gate_inp, &W.moe.exp_probs_b, &W.moe.gate_exps,
-          &W.moe.up_exps,  &W.moe.down_exps,   &W.moe.gate_shexp,
-          &W.moe.up_shexp, &W.moe.down_shexp,  &W.attn_norm,
-          &W.ffn_norm,     &W.mla.q_a,         &W.mla.q_a_norm,
-          &W.mla.q_b,      &W.mla.kv_a_mqa}) {
-      arena_bytes += measure_raw(*t);
-    }
+    // KDA attention weights (quantized) + small F32 mixer weights,
+    // mHC, MoE (experts quantized, router/shared F32), norms, MLA,
+    // dense FFN (leading layers only; quantized).
+    const SlotSpec specs[35] = {
+        {&W.kda.attn_q, false},    {&W.kda.attn_k, false},
+        {&W.kda.attn_v, false},    {&W.kda.attn_out, false},
+        {&W.kda.conv1d_q, true},   {&W.kda.conv1d_k, true},
+        {&W.kda.conv1d_v, true},   {&W.kda.a, true},
+        {&W.kda.dt_bias, true},    {&W.kda.f_a, true},
+        {&W.kda.f_b, true},        {&W.kda.beta, true},
+        {&W.kda.g_a, true},        {&W.kda.g_b, true},
+        {&W.kda.norm, true},       {&W.hc.attn_fn, true},
+        {&W.hc.attn_scale, true},  {&W.hc.attn_base, true},
+        {&W.moe.gate_inp, true},   {&W.moe.exp_probs_b, true},
+        {&W.moe.gate_exps, false}, {&W.moe.up_exps, false},
+        {&W.moe.down_exps, false}, {&W.moe.gate_shexp, true},
+        {&W.moe.up_shexp, true},   {&W.moe.down_shexp, true},
+        {&W.attn_norm, true},      {&W.ffn_norm, true},
+        {&W.mla.q_a, true},        {&W.mla.q_a_norm, true},
+        {&W.mla.q_b, true},        {&W.mla.kv_a_mqa, true},
+        {&W.dense.gate, false},    {&W.dense.up, false},
+        {&W.dense.down, false},
+    };
+    flat.insert(flat.end(), std::begin(specs), std::end(specs));
+  }
+
+  std::uint64_t arena_bytes = 0;
+  for (const SlotSpec& s : flat) {
+    if (s.t->empty() || s.t->data == nullptr ||
+        is_f32_upload(*s.t, s.force_f32))
+      continue;
+    arena_bytes += Align256(s.t->SizeBytes());
   }
 
   if (arena_bytes == 0) {
@@ -174,98 +196,123 @@ std::shared_ptr<GpuEngine> GpuEngine::Create(const Config& config,
   }
   engine->w_arena_bytes_ = arena_bytes;
 
-  // Upload tensors directly (raw bytes for quantized, dequantized for F32).
+  // Upload tensors (raw quantized bytes into the arena; F32 from dense
+  // or forced dequant into individual allocations). The returned type is the
+  // device-side ggml type (0 = F32) — what the GPU kernels must dispatch on.
+  //
+  // Copies go through a pinned staging buffer: direct pageable H2D copies
+  // from the GGUF file mapping into the huge arena stall for tens of seconds
+  // at a time, while mmap->pinned memcpy plus pinned DMA stays at disk speed.
+  constexpr std::uint64_t kStagingBytes = 256ULL << 20;
+  void* staging = nullptr;
+  if (hipHostMalloc(&staging, kStagingBytes, hipHostMallocDefault) !=
+      hipSuccess) {
+    if (error_msg)
+      *error_msg = "pinned staging alloc failed";
+    return nullptr;
+  }
   std::uint64_t arena_off = 0;
-  std::vector<float> tmp;
 
-  auto upload = [&](const TensorRef& t, bool force_f32 = false) -> float* {
-    if (t.empty() || t.data == nullptr)
-      return nullptr;
+  auto upload_bytes = [&](float* dev, const void* src, std::uint64_t bytes) {
+    const auto* s = static_cast<const char*>(src);
+    auto* d = reinterpret_cast<char*>(dev);
+    std::uint64_t off = 0;
+    while (off < bytes) {
+      const std::uint64_t chunk =
+          std::min<std::uint64_t>(kStagingBytes, bytes - off);
+      std::memcpy(staging, s + off, chunk);
+      hipMemcpy(d + off, staging, chunk, hipMemcpyHostToDevice);
+      off += chunk;
+    }
+  };
+
+  auto upload = [&](const TensorRef& t,
+                    bool force_f32) -> std::pair<float*, int> {
+    if (t.empty() || t.data == nullptr) {
+      fprintf(stderr, "[glm5_gpu] upload %s EMPTY\n",
+              std::string(t.name).c_str());
+      return {nullptr, 0};
+    }
     const std::uint64_t bytes = t.SizeBytes();
-    if (bytes == 0)
-      return nullptr;
+    if (bytes == 0) {
+      // Non-empty tensor with unknown block geometry is a wiring bug — never
+      // silently skip it (the kernels would run with a null/garbage pointer).
+      fprintf(stderr, "[glm5_gpu] upload %s UNSUPPORTED TYPE %d\n",
+              std::string(t.name).c_str(), static_cast<int>(t.type));
+      return {nullptr, -1};
+    }
     fprintf(stderr, "[glm5_gpu] upload %s bytes=%lu force_f32=%d\n",
             std::string(t.name).c_str(), (unsigned long)bytes, (int)force_f32);
     float* dev = nullptr;
 
-    if (force_f32 || t.type == core::GgmlType::kF32 ||
-        t.type == core::GgmlType::kF16 || t.type == core::GgmlType::kBF16) {
-      // Upload as F32 (dequantize if needed).
+    if (is_f32_upload(t, force_f32)) {
+      // Upload as F32 (dequantize if needed). Own allocation: no arena space.
+      const auto t0 = std::chrono::steady_clock::now();
       std::vector<float> f32;
       DequantToHost(t, f32);
+      const auto t1 = std::chrono::steady_clock::now();
       const std::uint64_t f32_bytes = f32.size() * sizeof(float);
-      fprintf(stderr, "[glm5_gpu]   dequantized to %lu floats\n",
-              (unsigned long)f32.size());
       hipMalloc(&dev, f32_bytes);
-      hipMemcpy(dev, f32.data(), f32_bytes, hipMemcpyHostToDevice);
-      arena_off += Align256(f32_bytes);
-    } else {
-      // Upload raw quantized bytes — kernels dequantize on-the-fly.
-      dev = reinterpret_cast<float*>(reinterpret_cast<char*>(engine->w_arena_) +
-                                     arena_off);
-      hipMemcpy(dev, t.data, bytes, hipMemcpyHostToDevice);
-      arena_off += Align256(bytes);
+      const auto t2 = std::chrono::steady_clock::now();
+      upload_bytes(dev, f32.data(), f32_bytes);
+      const auto t3 = std::chrono::steady_clock::now();
+      auto ms = [](auto a, auto b) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(b - a)
+            .count();
+      };
+      fprintf(stderr,
+              "[glm5_gpu]   f32 dev=%p deq=%ldms malloc=%ldms copy=%ldms\n",
+              (void*)dev, ms(t0, t1), ms(t1, t2), ms(t2, t3));
+      return {dev, 0};
     }
-    return dev;
+    // Raw quantized bytes — kernels dequantize on-the-fly.
+    const auto t0 = std::chrono::steady_clock::now();
+    dev = reinterpret_cast<float*>(reinterpret_cast<char*>(engine->w_arena_) +
+                                   arena_off);
+    upload_bytes(dev, t.data, bytes);
+    const auto t1 = std::chrono::steady_clock::now();
+    arena_off += Align256(bytes);
+    fprintf(
+        stderr, "[glm5_gpu]   raw dev=%p type=%d copy=%ldms\n", (void*)dev,
+        static_cast<int>(t.type),
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    return {dev, static_cast<int>(t.type)};
   };
 
-  engine->token_embd_ = upload(weights.token_embd);
-  fprintf(stderr, "[glm5_gpu] token_embd done\n");
-  engine->output_head_ = upload(weights.output);
-  fprintf(stderr, "[glm5_gpu] output_head done\n");
-  engine->output_norm_ = upload(weights.output_norm);
-  fprintf(stderr, "[glm5_gpu] output_norm done\n");
+  std::vector<float*> flat_dev(flat.size(), nullptr);
+  std::vector<int> flat_type(flat.size(), 0);
+  for (std::size_t i = 0; i < flat.size(); ++i) {
+    std::tie(flat_dev[i], flat_type[i]) = upload(*flat[i].t, flat[i].force_f32);
+    if (flat_type[i] == -1) {
+      if (error_msg)
+        *error_msg = "unsupported quant type in weight tensor";
+      return nullptr;
+    }
+  }
+  engine->token_embd_ = flat_dev[0];
+  engine->token_embd_type_ = flat_type[0];
+  engine->output_head_ = flat_dev[1];
+  engine->output_head_type_ = flat_type[1];
+  engine->output_norm_ = flat_dev[2];
+  fprintf(stderr,
+          "[glm5_gpu] arena=%p token_embd=%p(output type %d) output_head=%p"
+          " (type %d) output_norm=%p\n",
+          (void*)engine->w_arena_, (void*)engine->token_embd_,
+          engine->token_embd_type_, (void*)engine->output_head_,
+          engine->output_head_type_, (void*)engine->output_norm_);
 
-  std::vector<float*> layer_ptr(n_layers * 32, nullptr);
+  std::vector<float*> layer_ptr(n_layers * 35, nullptr);
+  std::vector<int> layer_type(n_layers * 35, 0);
   for (std::uint32_t i = 0; i < n_layers && i < weights.layers.size(); ++i) {
-    const auto& W = weights.layers[i];
-    std::size_t base = i * 32;
-    // KDA attention weights need F32 for the kernel.
-    layer_ptr[base + 0] = upload(W.kda.attn_q);    // quantized (Q6_K)
-    layer_ptr[base + 1] = upload(W.kda.attn_k);    // quantized (Q6_K)
-    layer_ptr[base + 2] = upload(W.kda.attn_v);    // quantized (Q6_K)
-    layer_ptr[base + 3] = upload(W.kda.attn_out);  // quantized (Q6_K)
-    // KDA mixer weights (small, F32 is fine).
-    layer_ptr[base + 4] = upload(W.kda.conv1d_q, true);
-    layer_ptr[base + 5] = upload(W.kda.conv1d_k, true);
-    layer_ptr[base + 6] = upload(W.kda.conv1d_v, true);
-    layer_ptr[base + 7] = upload(W.kda.a, true);
-    layer_ptr[base + 8] = upload(W.kda.dt_bias, true);
-    layer_ptr[base + 9] = upload(W.kda.f_a, true);
-    layer_ptr[base + 10] = upload(W.kda.f_b, true);
-    layer_ptr[base + 11] = upload(W.kda.beta, true);
-    layer_ptr[base + 12] = upload(W.kda.g_a, true);
-    layer_ptr[base + 13] = upload(W.kda.g_b, true);
-    layer_ptr[base + 14] = upload(W.kda.norm, true);
-    // mHC weights (small, F32).
-    layer_ptr[base + 15] = upload(W.hc.attn_fn, true);
-    layer_ptr[base + 16] = upload(W.hc.attn_scale, true);
-    layer_ptr[base + 17] = upload(W.hc.attn_base, true);
-    // MoE weights — keep quantized (large).
-    layer_ptr[base + 18] = upload(W.moe.gate_inp, true);  // F32 router
-    layer_ptr[base + 19] = upload(W.moe.exp_probs_b, true);
-    layer_ptr[base + 20] = upload(W.moe.gate_exps);  // quantized
-    layer_ptr[base + 21] = upload(W.moe.up_exps);    // quantized
-    layer_ptr[base + 22] = upload(W.moe.down_exps);  // quantized
-    layer_ptr[base + 23] = upload(W.moe.gate_shexp, true);
-    layer_ptr[base + 24] = upload(W.moe.up_shexp, true);
-    layer_ptr[base + 25] = upload(W.moe.down_shexp, true);
-    layer_ptr[base + 26] = upload(W.attn_norm, true);
-    layer_ptr[base + 27] = upload(W.ffn_norm, true);
-    layer_ptr[base + 28] = upload(W.mla.q_a, true);
-    layer_ptr[base + 29] = upload(W.mla.q_a_norm, true);
-    layer_ptr[base + 30] = upload(W.mla.q_b, true);
-    layer_ptr[base + 31] = upload(W.mla.kv_a_mqa, true);
+    for (int k = 0; k < 35; ++k) {
+      const std::size_t src = 3 + i * 35 + k;
+      layer_ptr[i * 35 + k] = flat_dev[src];
+      layer_type[i * 35 + k] = flat_type[src];
+    }
   }
   engine->w_ptrs_ = std::move(layer_ptr);
-
-  fprintf(stderr,
-          "[glm5_gpu] arena=%p token_embd=%p output_head=%p output_norm=%p\n",
-          (void*)engine->w_arena_, (void*)engine->token_embd_,
-          (void*)engine->output_head_, (void*)engine->output_norm_);
-  fprintf(stderr, "[glm5_gpu] w_ptrs[0]=%p w_ptrs[1]=%p w_ptrs[2]=%p\n",
-          (void*)engine->w_ptrs_[0], (void*)engine->w_ptrs_[1],
-          (void*)engine->w_ptrs_[2]);
+  engine->w_types_ = std::move(layer_type);
+  hipHostFree(staging);
 
   // ---- State arena: residual + KDA state + DSA buffers.
   const std::uint64_t hc_dim =
@@ -314,24 +361,6 @@ std::shared_ptr<GpuEngine> GpuEngine::Create(const Config& config,
   }
   fprintf(stderr, "[glm5_gpu] scratch arena done\n");
 
-  // ---- Dequantize output head to F32 (needed for GEMM).
-  {
-    fprintf(stderr, "[glm5_gpu] dequantizing output head...\n");
-    std::vector<float> f32;
-    DequantToHost(weights.output, f32);
-    fprintf(stderr, "[glm5_gpu] output head: %lu floats\n",
-            (unsigned long)f32.size());
-    if (hipMalloc(&engine->output_head_f32_, f32.size() * sizeof(float)) !=
-        hipSuccess) {
-      if (error_msg)
-        *error_msg = "output_head F32 alloc failed";
-      return nullptr;
-    }
-    hipMemcpy(engine->output_head_f32_, f32.data(), f32.size() * sizeof(float),
-              hipMemcpyHostToDevice);
-    fprintf(stderr, "[glm5_gpu] output head done\n");
-  }
-
   fprintf(stderr, "[glm5_gpu] Create complete\n");
   return engine;
 }
@@ -343,7 +372,10 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
   const std::uint32_t T = 1;  // one token at a time.
 
   for (std::uint32_t il = 0; il < config_.num_layers; ++il) {
-    const std::size_t base = il * 32;
+    // The NextN draft block is drafter-only (Maya runs the trunk without it).
+    if (config_.IsMtpLayer(il))
+      continue;
+    const std::size_t base = il * 35;
 
     // 1. mHC read (attn mixer).
     rocm::MhcGpuGeometry mhc_geom;
@@ -386,11 +418,11 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
       kda_w.w_k = w_ptrs_[base + 1];
       kda_w.w_v = w_ptrs_[base + 2];
       kda_w.w_out = w_ptrs_[base + 3];
-      // Quant types: attention weights are Q6_K(14).
-      kda_w.w_q_type = 14;
-      kda_w.w_k_type = 14;
-      kda_w.w_v_type = 14;
-      kda_w.w_out_type = 14;
+      // Quant types come from the loaded tensors, not hardcoded constants.
+      kda_w.w_q_type = w_types_[base + 0];
+      kda_w.w_k_type = w_types_[base + 1];
+      kda_w.w_v_type = w_types_[base + 2];
+      kda_w.w_out_type = w_types_[base + 3];
       kda_w.conv_q = w_ptrs_[base + 4];
       kda_w.conv_k = w_ptrs_[base + 5];
       kda_w.conv_v = w_ptrs_[base + 6];
@@ -420,35 +452,44 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
     if (!rocm::MhcPreGpu(mhc_geom, mhc_w, R, mixed, post, comb, T, stream))
       return false;
 
-    // 5. FFN (MoE).
-    rocm::MoeGpuGeometry moe_geom;
-    moe_geom.hidden_size = H_;
-    moe_geom.num_experts = config_.num_experts;
-    moe_geom.top_k = config_.num_experts_used;
-    moe_geom.expert_ff = config_.expert_ff;
-    moe_geom.shared_ff = config_.shared_expert_ff;
-    moe_geom.expert_weights_scale = config_.expert_weights_scale;
-    moe_geom.expert_weights_norm = config_.expert_weights_norm;
-    moe_geom.swiglu_limit = 10.0f;
-    moe_geom.renorm_clamp = 6.103515625e-5f;
-
-    rocm::MoeGpuWeights moe_w;
-    moe_w.gate_inp = w_ptrs_[base + 18];
-    moe_w.exp_probs_b = w_ptrs_[base + 19];
-    moe_w.gate_exps = w_ptrs_[base + 20];
-    moe_w.up_exps = w_ptrs_[base + 21];
-    moe_w.down_exps = w_ptrs_[base + 22];
-    moe_w.gate_shexp = w_ptrs_[base + 23];
-    moe_w.up_shexp = w_ptrs_[base + 24];
-    moe_w.down_shexp = w_ptrs_[base + 25];
-    // Quant types: gate/up=IQ2_XXS(16), down=IQ3_XXS(18), shared=Q6_K(14).
-    moe_w.gate_exps_type = 16;
-    moe_w.up_exps_type = 16;
-    moe_w.down_exps_type = 18;
-
+    // 5. FFN (dense for leading layers, MoE otherwise).
     float* ffn_out = sc_ + H_ + hc_ + hc_ * hc_ + H_;
-    if (!rocm::MoeForwardGpu(moe_geom, moe_w, mixed, ffn_out, stream))
-      return false;
+    if (config_.IsDenseFfn(il)) {
+      if (!rocm::DenseFfnForwardGpu(
+              H_, config_.dense_ff, 10.0f, w_ptrs_[base + 32],
+              w_ptrs_[base + 33], w_ptrs_[base + 34], w_types_[base + 32],
+              w_types_[base + 33], w_types_[base + 34], mixed, ffn_out, stream))
+        return false;
+    } else {
+      rocm::MoeGpuGeometry moe_geom;
+      moe_geom.hidden_size = H_;
+      moe_geom.num_experts = config_.num_experts;
+      moe_geom.top_k = config_.num_experts_used;
+      moe_geom.expert_ff = config_.expert_ff;
+      moe_geom.shared_ff = config_.shared_expert_ff;
+      moe_geom.expert_weights_scale = config_.expert_weights_scale;
+      moe_geom.expert_weights_norm = config_.expert_weights_norm;
+      moe_geom.swiglu_limit = 10.0f;
+      moe_geom.renorm_clamp = 6.103515625e-5f;
+
+      rocm::MoeGpuWeights moe_w;
+      moe_w.gate_inp = w_ptrs_[base + 18];
+      moe_w.exp_probs_b = w_ptrs_[base + 19];
+      moe_w.gate_exps = w_ptrs_[base + 20];
+      moe_w.up_exps = w_ptrs_[base + 21];
+      moe_w.down_exps = w_ptrs_[base + 22];
+      moe_w.gate_shexp = w_ptrs_[base + 23];
+      moe_w.up_shexp = w_ptrs_[base + 24];
+      moe_w.down_shexp = w_ptrs_[base + 25];
+      // Quant types come from the loaded tensors (Maya-S: IQ2_XXS gate/up,
+      // IQ3_XXS down — but never hardcoded here).
+      moe_w.gate_exps_type = w_types_[base + 20];
+      moe_w.up_exps_type = w_types_[base + 21];
+      moe_w.down_exps_type = w_types_[base + 22];
+
+      if (!rocm::MoeForwardGpu(moe_geom, moe_w, mixed, ffn_out, stream))
+        return false;
+    }
 
     // 6. mHC write (FFN).
     R_new = (R == state_) ? state_ + hc_ * H_ : state_;
@@ -460,54 +501,61 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
   return true;
 }
 
-std::vector<float> GpuEngine::Prefill(std::span<const std::uint32_t> tokens) {
-  const std::uint32_t T = static_cast<std::uint32_t>(tokens.size());
-  if (T == 0)
-    return std::vector<float>(H_, 0.0f);
-
-  // For each token: embed → step_layers.
-  for (std::uint32_t t = 0; t < T; ++t) {
-    // Embedding lookup: copy row from token_embd to residual.
-    float* R = state_;
-    const std::uint32_t tok = tokens[t];
-    if (token_embd_ && tok < config_.vocab_size) {
-      hipMemcpy(R, token_embd_ + static_cast<std::size_t>(tok) * H_,
+std::vector<float> GpuEngine::RunToken(std::uint32_t token, std::uint32_t pos) {
+  // Embedding lookup: dequantize row `token` of token_embd to residual,
+  // then copy to every hyper-connection stream.
+  float* R = state_;
+  if (token_embd_ && token < config_.vocab_size) {
+    if (token_embd_type_ == 0) {
+      hipMemcpy(R, token_embd_ + static_cast<std::size_t>(token) * H_,
                 H_ * sizeof(float), hipMemcpyDeviceToDevice);
-      // Initialize all hc streams.
-      for (std::uint32_t s = 1; s < hc_; ++s) {
-        hipMemcpy(R + s * H_, R, H_ * sizeof(float), hipMemcpyDeviceToDevice);
-      }
+    } else if (!gpu::QuantEmbedLookup(token_embd_, R, H_, token,
+                                      token_embd_type_, stream_)) {
+      return std::vector<float>(H_, 0.0F);
     }
-
-    // Run layers.
-    if (!StepLayers(t, stream_)) {
-      return std::vector<float>(H_, 0.0f);
+    for (std::uint32_t s = 1; s < hc_; ++s) {
+      hipMemcpy(R + s * H_, R, H_ * sizeof(float), hipMemcpyDeviceToDevice);
     }
   }
-
-  // Final RMS norm + output head + argmax.
-  // R is now at the last position in the residual arena.
-  float* final_hidden = state_;  // Simplified: use first stream.
-  gpu::LaunchRmsNorm(final_hidden, output_norm_, H_, config_.layer_norm_rms_eps,
-                     stream_);
-  gpu::LaunchMatVec(output_head_f32_, final_hidden, sc_, config_.vocab_size, H_,
-                    stream_);
-  int token_id = 0;
-  gpu::LaunchArgmax(sc_, config_.vocab_size, &token_id, stream_);
-
+  if (!StepLayers(pos, stream_)) {
+    return std::vector<float>(H_, 0.0F);
+  }
+  // After an even number of mHC writes (2 per layer) the residual is back at
+  // the head of the state arena.
   std::vector<float> hidden(H_);
-  hipMemcpy(hidden.data(), final_hidden, H_ * sizeof(float),
-            hipMemcpyDeviceToHost);
+  hipMemcpy(hidden.data(), state_, H_ * sizeof(float), hipMemcpyDeviceToHost);
   return hidden;
 }
 
+std::vector<float> GpuEngine::Prefill(std::span<const std::uint32_t> tokens) {
+  if (tokens.empty())
+    return std::vector<float>(H_, 0.0F);
+  std::vector<float> hidden;
+  for (std::uint32_t t = 0; t < tokens.size(); ++t) {
+    hidden = RunToken(tokens[t], t);
+    if (hidden.empty())
+      return std::vector<float>(H_, 0.0F);
+  }
+  pos_ = static_cast<std::uint32_t>(tokens.size());
+  return hidden;
+}
+
+std::vector<float> GpuEngine::Step(std::uint32_t token) {
+  return RunToken(token, pos_++);
+}
+
 std::uint32_t GpuEngine::Decode(const std::vector<float>& hidden) {
-  // Copy hidden to state arena, run output head.
+  // RMS norm + output head + greedy argmax. The head stays quantized on the
+  // GPU (QuantGemm dequantizes on-the-fly) — no F32 copy of [vocab, hidden].
   hipMemcpy(state_, hidden.data(), H_ * sizeof(float), hipMemcpyHostToDevice);
   gpu::LaunchRmsNorm(state_, output_norm_, H_, config_.layer_norm_rms_eps,
                      stream_);
-  gpu::LaunchMatVec(output_head_f32_, state_, sc_, config_.vocab_size, H_,
-                    stream_);
+  if (!gpu::QuantGemm(output_head_, state_, sc_, config_.vocab_size, H_,
+                      output_head_type_, stream_)) {
+    fprintf(stderr, "[glm5_gpu] output head GEMM failed (type %d)\n",
+            output_head_type_);
+    return 0;
+  }
   int token_id = 0;
   gpu::LaunchArgmax(sc_, config_.vocab_size, &token_id, stream_);
   return static_cast<std::uint32_t>(token_id);

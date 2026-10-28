@@ -41,6 +41,16 @@ constexpr BlockGeom GetBlockGeom(core::GgmlType type) noexcept {
       return {256, 292};
     case core::GgmlType::kIQ2_XXS:
       return {256, 66};
+    case core::GgmlType::kIQ2_XS:
+      return {256, 74};
+    case core::GgmlType::kIQ2_S:
+      return {256, 82};
+    case core::GgmlType::kIQ3_XXS:
+      return {256, 98};
+    case core::GgmlType::kIQ1_S:
+      return {256, 50};
+    case core::GgmlType::kIQ1_M:
+      return {256, 56};
     case core::GgmlType::kIQ3_S:
       return {256, 110};
     case core::GgmlType::kIQ4_XS:

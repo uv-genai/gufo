@@ -88,6 +88,42 @@ struct block_iq3_s {
   std::uint8_t signs[32];
   std::uint8_t scales[4];
 };
+
+// IQ2_XXS: super-block of 256, ~2.06 bpw. Each group of 8 elements is a byte
+// index into the 256-entry kIq2xxsGrid codebook; the sign bit-stream and the
+// 4-bit sub-block scales share the high bytes of the 64-byte qs payload (see
+// dequantize_row_iq2_xxs).
+struct block_iq2_xxs {
+  std::uint16_t d;
+  std::uint16_t qs[32];
+};
+
+// IQ2_S: super-block of 256, ~2.5625 bpw. qs[0..31] holds 8-bit codebook
+// indices (9-bit with qh) into kIq2sGrid; qs[32..63] carries per-group sign
+// bytes; scales holds 8 packed 4-bit sub-block scales.
+struct block_iq2_s {
+  std::uint16_t d;
+  std::uint8_t qs[64];
+  std::uint8_t qh[8];
+  std::uint8_t scales[8];
+};
+
+// Q2_K: super-block of 256, 3.4375... (2-bit quants + packed 4-bit scales
+// and mins with f16 super-scales d/dmin).
+struct block_q2_K {
+  std::uint8_t scales[16];
+  std::uint8_t qs[64];
+  std::uint16_t d;
+  std::uint16_t dmin;
+};
+
+// IQ3_XXS: super-block of 256, ~3.3 bpw. qs[0..63] holds 2-bit codebook
+// indices packed as bytes indexing kIq3xxsGrid (4 values each); qs[64..95]
+// carries the per-32 sign bit-stream plus 4-bit sub-block scales.
+struct block_iq3_xxs {
+  std::uint16_t d;
+  std::uint8_t qs[96];
+};
 #pragma pack(pop)
 
 static_assert(sizeof(block_q4_K) == 144, "block_q4_K must be 144 bytes");
@@ -99,6 +135,10 @@ static_assert(sizeof(block_q8_0) == 34, "block_q8_0 must be 34 bytes");
 static_assert(sizeof(block_iq4_nl) == 18, "block_iq4_nl must be 18 bytes");
 static_assert(sizeof(block_iq4_xs) == 136, "block_iq4_xs must be 136 bytes");
 static_assert(sizeof(block_iq3_s) == 110, "block_iq3_s must be 110 bytes");
+static_assert(sizeof(block_iq2_xxs) == 66, "block_iq2_xxs must be 66 bytes");
+static_assert(sizeof(block_iq2_s) == 82, "block_iq2_s must be 82 bytes");
+static_assert(sizeof(block_q2_K) == 84, "block_q2_K must be 84 bytes");
+static_assert(sizeof(block_iq3_xxs) == 98, "block_iq3_xxs must be 98 bytes");
 
 /// Non-linear 4-bit codebook shared by IQ4_NL and IQ4_XS.
 inline constexpr std::int8_t kValuesIq4Nl[16] = {
@@ -190,6 +230,18 @@ void DequantizeIQ4_XS(const void* src, float* dst, std::size_t k);
 // Dequantize row of IQ3_S to float
 void DequantizeIQ3_S(const void* src, float* dst, std::size_t k);
 
+// Dequantize row of IQ2_XXS to float
+void DequantizeIQ2_XXS(const void* src, float* dst, std::size_t k);
+
+// Dequantize row of IQ3_XXS to float
+void DequantizeIQ3_XXS(const void* src, float* dst, std::size_t k);
+
+// Dequantize row of IQ2_S to float
+void DequantizeIQ2_S(const void* src, float* dst, std::size_t k);
+
+// Dequantize row of Q2_K to float
+void DequantizeQ2_K(const void* src, float* dst, std::size_t k);
+
 // Compute dot product of IQ4_NL quantized row with FP32 vector
 float DotProductIQ4_NL(const void* row_data, std::span<const float> vec,
                        std::size_t k);
@@ -199,6 +251,18 @@ float DotProductIQ4_XS(const void* row_data, std::span<const float> vec,
 // Compute dot product of IQ3_S quantized row with FP32 vector
 float DotProductIQ3_S(const void* row_data, std::span<const float> vec,
                       std::size_t k);
+// Compute dot product of IQ2_XXS quantized row with FP32 vector
+float DotProductIQ2_XXS(const void* row_data, std::span<const float> vec,
+                        std::size_t k);
+// Compute dot product of IQ3_XXS quantized row with FP32 vector
+float DotProductIQ3_XXS(const void* row_data, std::span<const float> vec,
+                        std::size_t k);
+// Compute dot product of IQ2_S quantized row with FP32 vector
+float DotProductIQ2_S(const void* row_data, std::span<const float> vec,
+                      std::size_t k);
+// Compute dot product of Q2_K quantized row with FP32 vector
+float DotProductQ2_K(const void* row_data, std::span<const float> vec,
+                     std::size_t k);
 
 /// Returns the 512-entry IQ3_S grid table (each entry packs four uint8
 /// magnitudes).
