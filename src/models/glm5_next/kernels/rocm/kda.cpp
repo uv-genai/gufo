@@ -65,25 +65,27 @@ __global__ void L2NormKernel(float* __restrict__ x, int head_dim, int num_heads,
 }
 
 /// Decay gate kernel: g1 = lb * sigmoid(-(fb_out + dt_bias) * A).
+/// Processes all inner*T elements (batched over tokens).
 __global__ void DecayGateKernel(const float* __restrict__ fb_out,
                                 const float* __restrict__ dt_bias,
                                 const float* __restrict__ ssm_a,
                                 float* __restrict__ g1, int inner, int head_dim,
-                                int num_heads, float lb) {
+                                int num_heads, int total, float lb) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < inner) {
-    const int h = i / head_dim;
+  if (i < total) {
+    const int c = i % inner;  // channel index within token
+    const int h = c / head_dim;
     const float a = ssm_a[h];
-    const float arg = -(fb_out[i] + dt_bias[i]) * a;
+    const float arg = -(fb_out[i] + dt_bias[c]) * a;
     g1[i] = lb / (1.0f + expf(-arg));
   }
 }
 
-/// Beta kernel: beta = sigmoid(ssm_beta @ x).
+/// Beta kernel: beta = sigmoid(ssm_beta @ x). Batched over tokens.
 __global__ void BetaKernel(const float* __restrict__ beta_out,
-                           float* __restrict__ beta, int num_heads) {
+                           float* __restrict__ beta, int total) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < num_heads) {
+  if (i < total) {
     beta[i] = 1.0f / (1.0f + expf(-beta_out[i]));
   }
 }
@@ -302,19 +304,21 @@ bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
 
   // 2. Causal conv + SiLU.
   {
-    const int grid = (inner + block - 1) / block;
-    hipLaunchKernelGGL(CausalConv1dKernel, dim3(grid), dim3(block), 0, stream,
-                       wq, w.conv_q, q_c, inner, T, K);
-    hipLaunchKernelGGL(CausalConv1dKernel, dim3(grid), dim3(block), 0, stream,
-                       wk, w.conv_k, k_c, inner, T, K);
-    hipLaunchKernelGGL(CausalConv1dKernel, dim3(grid), dim3(block), 0, stream,
-                       wv, w.conv_v, v_c, inner, T, K);
-    hipLaunchKernelGGL(SiluKernel, dim3(grid), dim3(block), 0, stream, q_c, q_c,
-                       inner_T);
-    hipLaunchKernelGGL(SiluKernel, dim3(grid), dim3(block), 0, stream, k_c, k_c,
-                       inner_T);
-    hipLaunchKernelGGL(SiluKernel, dim3(grid), dim3(block), 0, stream, v_c, v_c,
-                       inner_T);
+    const int grid_conv = (inner + block - 1) / block;
+    hipLaunchKernelGGL(CausalConv1dKernel, dim3(grid_conv), dim3(block), 0,
+                       stream, wq, w.conv_q, q_c, inner, T, K);
+    hipLaunchKernelGGL(CausalConv1dKernel, dim3(grid_conv), dim3(block), 0,
+                       stream, wk, w.conv_k, k_c, inner, T, K);
+    hipLaunchKernelGGL(CausalConv1dKernel, dim3(grid_conv), dim3(block), 0,
+                       stream, wv, w.conv_v, v_c, inner, T, K);
+    // SiLU must cover all inner*T elements, not just inner.
+    const int grid_act = (inner_T + block - 1) / block;
+    hipLaunchKernelGGL(SiluKernel, dim3(grid_act), dim3(block), 0, stream, q_c,
+                       q_c, inner_T);
+    hipLaunchKernelGGL(SiluKernel, dim3(grid_act), dim3(block), 0, stream, k_c,
+                       k_c, inner_T);
+    hipLaunchKernelGGL(SiluKernel, dim3(grid_act), dim3(block), 0, stream, v_c,
+                       v_c, inner_T);
   }
 
   // 3. L2 norm q, k per head.
@@ -339,7 +343,8 @@ bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
     // g1 = lb * sigmoid(-(fb_out + dt_bias) * A).
     const int grid_g1 = (inner * T + block - 1) / block;
     hipLaunchKernelGGL(DecayGateKernel, dim3(grid_g1), dim3(block), 0, stream,
-                       fb_out, w.dt_bias, w.ssm_a, g1, inner, dk, nh, lb);
+                       fb_out, w.dt_bias, w.ssm_a, g1, inner, dk, nh, inner * T,
+                       lb);
   }
 
   // 5. Beta.
