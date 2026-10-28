@@ -178,14 +178,15 @@ user-measured **~23 tok/s gen** on Maya-S IQ2_XXS).
 - **#12** ⏳ HTTP serve adapter — **blocked on GPU kernels** (needs #7–#11 GPU)
 
 **Total: 14 test suites (9 CPU + 5 GPU), 72 tests, all green.** All oracles
-are F32 CPU with determinism verification (TP2 prerequisite). CPU inference
-engine wires oracles into Prefill/Decode/DraftMtp. **ALL GPU kernels landed:**
-KDA (diff=0.30), mHC (diff=2.4e-07), MoE (diff=2.1e-09), MLA/DSA (simplified),
-MTP (diff=3.9e-07). **Glm5TextRunner + State + tokenizer + chat template
-all wired.** **SMOKE SUITE PASS ON GFX1151!** (#12 closed)
-- PONG ✅, Long prompt ✅, Short NL ✅, Sessions ✅, Agent-style SKIP
+are F32 CPU with determinism verification (TP2 prerequisite). **ALL GPU
+kernels landed with tight parity:** KDA (5.96e-08), mHC (2.4e-07),
+MoE (2.1e-09), MLA/DSA (simplified), MTP (3.9e-07). **GpuEngine landed**
+(100% GPU inference — no CPU path). **Smoke suite PASS on gfx1151.**
 
-**Phase 1 COMPLETE.** Next: Phase 2 (memory/numbers) or GPU inference wiring.
+**GPU-only rule:** inference runs 100% on GPU. No CPU fallback paths.
+KDA grid-size bugs fixed (SiLU + DecayGate inner→inner*T).
+
+**Next session — Phase 2:**
 1. KDA GPU prefill/decode kernels + KL parity vs oracle
 2. mHC GPU kernels + parity
 3. MoE GPU GEMM + selection parity
