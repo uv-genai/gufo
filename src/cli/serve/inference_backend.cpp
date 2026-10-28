@@ -47,8 +47,8 @@
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/glm5_next/chat_template.hpp"
-#include "src/models/glm5_next/cpu_engine.hpp"
 #include "src/models/glm5_next/engine.hpp"
+#include "src/models/glm5_next/gpu_engine.hpp"
 #include "src/models/qwen/continuation_adapter.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
@@ -3356,21 +3356,21 @@ public:
     Logger::Info("glm5", "event=runner_constructor_done");
   }
 
-  // Lazy CpuEngine creation.
-  [[nodiscard]] std::shared_ptr<models::glm5_next::CpuEngine> GetCpuEngine()
+  // Lazy GPU engine creation — 100% GPU inference.
+  [[nodiscard]] std::shared_ptr<models::glm5_next::GpuEngine> GetGpuEngine()
       const {
-    if (!cpu_engine_) {
-      Logger::Info("glm5", "event=lazy_cpu_engine_create");
+    if (!gpu_engine_) {
+      Logger::Info("glm5", "event=lazy_gpu_engine_create");
       try {
-        cpu_engine_ = models::glm5_next::CpuEngine::Create(
+        gpu_engine_ = models::glm5_next::GpuEngine::Create(
             model_->GetConfig(), model_->GetWeights());
-        Logger::Info("glm5", "event=lazy_cpu_engine_done");
+        Logger::Info("glm5", "event=lazy_gpu_engine_done");
       } catch (const std::exception& e) {
         Logger::Warn("glm5",
-                     std::string("CpuEngine create failed: ") + e.what());
+                     std::string("GpuEngine create failed: ") + e.what());
       }
     }
-    return cpu_engine_;
+    return gpu_engine_;
   }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
@@ -3492,7 +3492,16 @@ public:
     std::vector<std::uint32_t> tokens(prompt.begin(), prompt.end());
     s.set_tokens(tokens);
     s.set_position(prompt.size());
-    // TODO: Wire CpuEngine/GPU inference. For now, accept prefill.
+    // Run prefill on GPU (100% GPU inference).
+    auto engine = GetGpuEngine();
+    if (engine) {
+      try {
+        auto hidden = engine->Prefill(tokens);
+        s.set_hidden_state(std::move(hidden));
+      } catch (const std::exception& e) {
+        Logger::Warn("glm5", std::string("Prefill failed: ") + e.what());
+      }
+    }
     return TextPrefillStep{.consumed_tokens = prompt.size(),
                            .decode_ready = true};
   }
@@ -3500,9 +3509,24 @@ public:
   [[nodiscard]] TextDecodeSelection SelectNext(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
     auto& s = dynamic_cast<Glm5TextRunnerState&>(state);
-    // TODO: Wire CpuEngine/GPU inference. For now, return a placeholder token.
     (void)sampler;
-    const std::uint32_t token = 154820;  // EOS token ID.
+    // Run decode on GPU (100% GPU inference).
+    auto engine = GetGpuEngine();
+    if (engine && !s.hidden_state().empty()) {
+      try {
+        const auto token = engine->Decode(s.hidden_state());
+        const std::vector<tokenization::TokenId> ids = {
+            static_cast<tokenization::TokenId>(token)};
+        const std::string piece =
+            tokenizer_ ? tokenizer_->Decode(ids) : std::string{};
+        return TextDecodeSelection{
+            .stop = false, .token = token, .piece = piece};
+      } catch (const std::exception& e) {
+        Logger::Warn("glm5", std::string("Decode failed: ") + e.what());
+      }
+    }
+    // Fallback: return EOS token.
+    const std::uint32_t token = 154820;
     const std::vector<tokenization::TokenId> ids = {
         static_cast<tokenization::TokenId>(token)};
     const std::string piece =
@@ -3525,7 +3549,7 @@ private:
   std::shared_ptr<models::glm5_next::Model> model_;
   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::uint32_t max_context_;
-  mutable std::shared_ptr<models::glm5_next::CpuEngine> cpu_engine_;
+  mutable std::shared_ptr<models::glm5_next::GpuEngine> gpu_engine_;
 };
 
 }  // namespace

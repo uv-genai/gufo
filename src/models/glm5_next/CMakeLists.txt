@@ -25,6 +25,7 @@ add_library(gufo_glm5_next STATIC
   config.cpp
   cpu_engine.cpp
   engine.cpp
+  gpu_engine.cpp
   mhc_reference.cpp
   mla_reference.cpp
   moe_reference.cpp
