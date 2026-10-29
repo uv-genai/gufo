@@ -6,7 +6,7 @@ redirect until that copy is removed).
 **When state changes** (merge, tag, push, script/config change, incident): **replace
 or edit this file in full** — do not leave stale tips, shas, or “untested” claims.
 
-Last updated: **2026-10-29** (session: **v0.26.0 merged** at `9b0aabc2`; format + release build done; **not** TP2-smoked, **not** tagged/pushed).
+Last updated: **2026-10-29** (session: **v0.26.0 merged**; tip **`9c7c7274`**; format + release build done; **not** TP2-smoked, **not** tagged/pushed).
 
 ---
 
@@ -30,7 +30,7 @@ Historical dated handoffs in `~/gufo-merge-handoff/HANDOFF-*.md` are **archive o
 | Branch | **`main`** |
 | Push | **`uv-genai` only** → https://github.com/uv-genai/gufo.git |
 | Upstream | `origin` → gufo-org/gufo; local track **`gufo-org`** — **never push** |
-| Tip | **`9b0aabc2`** = merge `v0.26.0` into `main` (**ahead of** `uv-genai/main` by handoff+merge commits; **do not push** until TP2 smoke) |
+| Tip | **`9c7c7274`** (merge + docs; **ahead of** `uv-genai/main`; **do not push** until TP2 smoke) |
 | Upstream merged through | **v0.26.0** (`78d74185`); README tracks through v0.26.0 |
 
 **Non-negotiables:** `grep -ci nix AGENTS.md` → **0**; never run that package
@@ -44,7 +44,7 @@ manager; Conventional Commits; ask before any GPU launch.
 | --- | --- |
 | Path | `build/release/gufo` on **both** hosts |
 | sha256 | **`7b9c4e482ceb22dcd2e639f7a336f347d3985935dd46c2d2793025199d1e7ecf`** |
-| Built from | tip **`9b0aabc2`** (v0.26.0 merge); format clean; **not** TP2-smoked; **not** shipped to strix-halo-1 |
+| Built from | tip **`9c7c7274`** lineage (v0.26.0 merge; binary built before README tip bump — same code tree as merge `9b0aabc2`); format clean; **not** TP2-smoked; **not** shipped to strix-halo-1 |
 | Configure | three host flags in `AGENTS.md` (HIP compiler + `-include format`) |
 
 **TP2 serve defaults** (all four `tools/tp2/rank{0,1}-{q4,q8}.sh`):
