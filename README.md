@@ -220,14 +220,16 @@ Reasoning tokens count toward that response limit.
 
 ## Build from source
 
-Linux x86-64 on AMD Strix Halo (`gfx1151`) is the supported target. CMake owns
-one production configuration for ordinary Linux builds. Tests, profilers, tuning
-executables and Python reference runners are not installed with the production
-package. No `build.sh` wrapper is needed.
+Production packages target Linux x86-64 on AMD Strix Halo (`gfx1151`).
+Windows x86-64 is a supported native build target for development; see
+[BUILD-WINDOWS.md](BUILD-WINDOWS.md). CMake owns
+one production configuration for ordinary Linux builds. Tests, profilers,
+tuning executables and Python reference runners are not installed with the
+production package. No `build.sh` wrapper is needed.
 
 Install a C++20 compiler, CMake 3.21+, Ninja, pkg-config and the
-following development libraries. The currently qualified toolchain is GCC
-15.3 and ROCm 7.2.3. Attention and audio convolution kernels are compiled
+following development libraries. The pinned Nix toolchain uses GCC
+16.2 and ROCm 10.1.0 (HIP Clang 24). Attention and audio convolution kernels are compiled
 directly from HIP. Python, Triton/AOTriton, Composable Kernel and MIOpen are
 not production build or runtime requirements.
 Optional: apply the upstream ROCr 7.2.3 queue-memory
@@ -241,6 +243,7 @@ limits disallow those pins. Gufo leaves `HSA_USERPTR_FOR_PAGED_MEM` unchanged.
 | ROCm HIP compiler/runtime, hipBLAS, hipBLASLt, rocBLAS | GPU execution and matrix multiplication |
 | hipCUB, rocPRIM, rocWMMA headers | Compiled GPU kernels |
 | ICU, libcurl, OpenSSL, libpng, libjpeg, libwebp | Tokenization, HTTPS, hashing and images |
+| libsndfile, libsoxr | Audio decoding and reference-compatible resampling |
 | FFmpeg and ffprobe | Video/audio output; invoked as separate executables |
 | libibverbs (rdma-core) | Optional TP2 two-host path (`-DGUFO_ENABLE_TP2_RDMA=ON`) |
 
@@ -252,7 +255,7 @@ For example, on Debian/Ubuntu the ordinary system libraries are:
 
 ```sh
 sudo apt install build-essential cmake ninja-build pkg-config \
-  libicu-dev libcurl4-openssl-dev libssl-dev libpng-dev libjpeg-dev libwebp-dev ffmpeg
+  libicu-dev libcurl4-openssl-dev libssl-dev libpng-dev libjpeg-dev libwebp-dev libsndfile1-dev libsoxr-dev ffmpeg
 
 # ROCm libraries from the table, named as AMD's repository ships them.
 sudo apt install hipblas-dev hipblaslt-dev rocblas-dev \

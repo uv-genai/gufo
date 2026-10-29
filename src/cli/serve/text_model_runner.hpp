@@ -54,7 +54,15 @@ struct TextRunnerRamCacheOptions {
   /// Explicit limits may exceed that budget up to the model's ceiling, which
   /// keeps kHostSnapshotHeadroomBytes of host RAM free.
   std::size_t capacity_bytes{0};
+  /// False keeps no RAM checkpoints and reserves no RAM-cache backing, and
+  /// capacity_bytes is ignored. Sessions still reuse their own live state.
+  bool enabled{true};
 };
+
+/// Parses a --cache-ram-bytes value: "off", or a byte count where 0 selects
+/// the automatic budget. Returns nullopt and sets `error` for anything else.
+[[nodiscard]] std::optional<TextRunnerRamCacheOptions> ParseRamCacheOption(
+    std::string_view text, std::string* error);
 
 struct TextRunnerDiskCacheOptions {
   static constexpr std::size_t kDefaultCapacityBytes =
@@ -369,6 +377,12 @@ public:
     if (!prompt)
       return std::nullopt;
     return prompt->tokens.size();
+  }
+  /// The text RenderAndTokenize tokenizes, or empty when the runner cannot
+  /// render its template as text.
+  [[nodiscard]] virtual std::optional<std::string> RenderPrompt(
+      const ChatRequest&) const {
+    return std::nullopt;
   }
   /// Called before cache restoration, prefill or selection, including
   /// a complete prefix hit. Must replace, never inherit, the previous request.

@@ -4,12 +4,13 @@
   pkgs,
   releaseVersion ? null,
   revision,
+  rocmPackages,
 }:
 
 lib.makeScope newScope (self: {
-  gufo = self.callPackage ./package.nix { inherit releaseVersion revision; };
+  gufo = self.callPackage ./package.nix { inherit releaseVersion revision rocmPackages; };
   tp2-rdma = self.callPackage ./package.nix {
-    inherit releaseVersion revision;
+    inherit releaseVersion revision rocmPackages;
     enableTp2Rdma = true;
     rdma-core = pkgs.rdma-core;
   };

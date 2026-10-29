@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from gufo.serving_bench import source_identity
@@ -118,11 +119,17 @@ def cmd_run(config: BenchConfig, args: argparse.Namespace) -> int:
     root = config.root
     gufo_binary = args.gufo if args.gufo.is_absolute() else (root / args.gufo)
     if not gufo_binary.exists():
-        raise SystemExit(f"Gufo binary not found: {gufo_binary} (run `nix build`)")
+        raise SystemExit(f"Gufo binary not found: {gufo_binary} (run `nix build`, or on Windows build the windows-release preset)")
     reference_binary = args.reference_binary or config.data["reference"]["server"]
     revision, dirty = source_identity(root)
     document = config.benchmarks_path.read_text(encoding="utf-8") if config.benchmarks_path.exists() else ""
-    build_mode = "container-gpu-tp2" if args.target == "gufo" and config.data.get("gufo", {}).get("tp2") else "nix-release"
+    build_mode = (
+        "container-gpu-tp2"
+        if args.target == "gufo" and config.data.get("gufo", {}).get("tp2")
+        else "windows-release"
+        if sys.platform == "win32"
+        else "nix-release"
+    )
     session = llm.Session(
         config, args.target, gufo_binary=gufo_binary, reference_binary=reference_binary,
         source={"revision": revision, "dirty": dirty, "buildMode": build_mode},
