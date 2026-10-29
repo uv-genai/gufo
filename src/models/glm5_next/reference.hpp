@@ -39,7 +39,8 @@ struct KdaWeightsF32 {
   std::vector<float> w_v;
   std::vector<float> w_out;  ///< [inner, hidden]
 
-  // Causal conv [conv_kernel, inner] per stream.
+  // Causal conv per stream. GGUF (d_conv, 1, inner) layout: tap fastest,
+  // element (tap, c) at tap + K*c, tap 0 = oldest (Maya glm_kda_conv).
   std::vector<float> conv_q;  ///< [conv_kernel * inner]
   std::vector<float> conv_k;
   std::vector<float> conv_v;

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "src/models/glm5_next/quant_gemv.hpp"
+#include "strata/kernels/glm_dsa.hpp"
 
 namespace gufo::models::glm5_next::rocm {
 namespace {
@@ -133,7 +134,12 @@ __global__ void AttnScoreKernel(const float* __restrict__ q_abs,
   if (i >= n_cells)
     return;
   const float* qa = q_abs + static_cast<std::size_t>(h) * kv;
-  const float* lat = latents + static_cast<std::size_t>(cells[i]) * kv;
+  const int cell = cells[i];
+  if (cell < 0) {
+    scores[static_cast<std::size_t>(h) * n_cells + i] = -INFINITY;
+    return;
+  }
+  const float* lat = latents + static_cast<std::size_t>(cell) * kv;
   float dot = 0.0f;
   for (int j = 0; j < kv; ++j)
     dot += qa[j] * lat[j];
@@ -186,7 +192,10 @@ __global__ void AttnCtxKernel(float* __restrict__ scores,
   for (int j = threadIdx.x; j < kv; j += blockDim.x) {
     float acc = 0.0f;
     for (int i = 0; i < n_cells; ++i) {
-      acc += sc[i] * latents[static_cast<std::size_t>(cells[i]) * kv + j];
+      const int cell = cells[i];
+      if (cell < 0)
+        continue;
+      acc += sc[i] * latents[static_cast<std::size_t>(cell) * kv + j];
     }
     ctx_h[j] = acc / s_sum;
   }
@@ -268,6 +277,8 @@ bool MlaStepGpu(const MlaGpuGeometry& geom, const MlaGpuWeights& w,
   off += max_pools;
   auto* cells_dev = reinterpret_cast<std::int32_t*>(state.scratch + off);
   off += max_cells;
+  auto* d_pos = reinterpret_cast<std::int32_t*>(state.scratch + off);
+  off += 1;
   float* q_abs = state.scratch + off;
   off += static_cast<std::size_t>(nh) * kv;
   float* attn_scores = state.scratch + off;
@@ -318,70 +329,43 @@ bool MlaStepGpu(const MlaGpuGeometry& geom, const MlaGpuWeights& w,
     hipLaunchKernelGGL(ScaleKernel, dim3(1), dim3(qh), 0, stream, w8, qh, s);
   }
 
-  // 6. DSA pool selection (host top-k over GPU-computed scores).
-  std::vector<std::int32_t> cells_host;
+  // 6-8. Maya glm_dsa: pool / score / select / absorbed MLA (copied kernels).
   const std::uint32_t n_vis = (pos + 1) / kpool;
-  if (n_vis == 0) {
-    if (geom.idx_kpool_select_tail) {
-      for (std::uint32_t tok = 0; tok <= pos; ++tok)
-        cells_host.push_back(static_cast<std::int32_t>(tok));
-    }
-  } else {
-    {
-      const int block = 256;
-      const int total = static_cast<int>(n_vis) * ikd;
-      hipLaunchKernelGGL(PoolKernel, dim3((total + block - 1) / block),
-                         dim3(block), 0, stream, state.idx_ig, state.idx_ik,
-                         w.idx_ape, pooled, ikd, kpool, n_vis);
-      hipLaunchKernelGGL(
-          ScoreKernel, dim3((static_cast<int>(n_vis) + block - 1) / block),
-          dim3(block), 0, stream, iq, pooled, w8, scores_dev, qh, ikd, n_vis);
-    }
-    std::vector<float> scores_host(n_vis);
-    HIP_CHECK(hipMemcpyAsync(scores_host.data(), scores_dev,
-                             n_vis * sizeof(float), hipMemcpyDeviceToHost,
-                             stream));
-    HIP_CHECK(hipStreamSynchronize(stream));
-    const std::uint32_t n_top_pool = std::min(n_vis, geom.idx_top_k / kpool);
-    const auto sel_pools = TopKDesc(scores_host, n_top_pool);
-    for (const std::uint32_t p : sel_pools) {
-      for (std::uint32_t m = 0; m < kpool; ++m) {
-        cells_host.push_back(static_cast<std::int32_t>(p * kpool + m));
-      }
-    }
-    if (geom.idx_kpool_select_tail) {
-      for (std::uint32_t tok = n_vis * kpool; tok <= pos; ++tok)
-        cells_host.push_back(static_cast<std::int32_t>(tok));
-    }
-  }
-  const std::uint32_t n_cells = static_cast<std::uint32_t>(cells_host.size());
-  if (n_cells > max_cells)
-    return false;
-  if (n_cells > 0) {
-    // Persistent staging: cells_host is a function-local and must not die
-    // while the stream still reads it.
-    static std::vector<std::int32_t> s_cells_host;
-    s_cells_host = cells_host;
-    HIP_CHECK(hipMemcpyAsync(cells_dev, s_cells_host.data(),
-                             n_cells * sizeof(std::int32_t),
-                             hipMemcpyHostToDevice, stream));
-  }
-
-  // 7. q_abs[h] = k_b[h] @ q[:, h].
-  if (!gpu::QuantGemmGroups(w.k_b, q_flat, q_abs, nh, kv, qd, w.k_b_type,
-                            stream))
-    return false;
-
-  // 8. Attention over the selected cells, then oh[h] = v_b[h] @ ctx[h].
-  if (n_cells == 0) {
+  const std::uint32_t top_pools =
+      std::min<std::uint32_t>(n_vis, geom.idx_top_k / kpool);
+  const int select_tail = geom.idx_kpool_select_tail ? 1 : 0;
+  const int n_sel =
+      static_cast<int>(kpool * top_pools + (select_tail ? kpool - 1 : 0));
+  if (n_sel <= 0 || n_sel > static_cast<int>(max_cells)) {
     HIP_CHECK(hipMemsetAsync(
         oh, 0, static_cast<std::size_t>(nh) * vd * sizeof(float), stream));
   } else {
-    hipLaunchKernelGGL(AttnScoreKernel, dim3(nh), dim3(nh > 0 ? 256 : 1), 0,
-                       stream, q_abs, state.latents, cells_dev, attn_scores, kv,
-                       n_cells, kq_scale);
-    hipLaunchKernelGGL(AttnCtxKernel, dim3(nh), dim3(256), 0, stream,
-                       attn_scores, state.latents, cells_dev, ctx, kv, n_cells);
+    if (n_vis > 0) {
+      strata::kernels::glm_dsa_pool(state.idx_ig, state.idx_ik, w.idx_ape,
+                                    (int)ikd, (int)kpool, (int)n_vis, pooled,
+                                    stream);
+      strata::kernels::glm_dsa_score(iq, pooled, w8, (int)ikd, (int)qh, 1,
+                                     (int)n_vis, scores_dev, stream);
+    }
+    const int p32 = static_cast<int>(pos);
+    HIP_CHECK(hipMemcpyAsync(d_pos, &p32, sizeof(int), hipMemcpyHostToDevice,
+                             stream));
+    strata::kernels::glm_dsa_select(scores_dev, (int)n_vis, (int)kpool,
+                                    (int)top_pools, select_tail, 1, n_sel,
+                                    d_pos, cells_dev, stream);
+    if (!gpu::QuantGemmGroups(w.k_b, q_flat, q_abs, nh, kv, qd, w.k_b_type,
+                              stream))
+      return false;
+    // Absorbed MLA score/softmax/ctx (Maya); v_b stays quantized → GEMM.
+    // Reuse Maya cell layout (n_sel, -1 pad) with existing score/ctx kernels
+    // then v_b @ ctx.
+    {
+      hipLaunchKernelGGL(AttnScoreKernel, dim3(nh), dim3(nh > 0 ? 256 : 1), 0,
+                         stream, q_abs, state.latents, cells_dev, attn_scores,
+                         kv, n_sel, 1.0f / sqrtf((float)qd));
+      hipLaunchKernelGGL(AttnCtxKernel, dim3(nh), dim3(256), 0, stream,
+                         attn_scores, state.latents, cells_dev, ctx, kv, n_sel);
+    }
     if (!gpu::QuantGemmGroups(w.v_b, ctx, oh, nh, vd, kv, w.v_b_type, stream))
       return false;
   }

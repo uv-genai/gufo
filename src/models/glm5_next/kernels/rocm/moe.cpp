@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "src/models/glm5_next/quant_gemv.hpp"
+#include "strata/kernels/glm_ffn.hpp"
+#include "strata/kernels/router_sigmoid.hpp"
 
 namespace gufo::models::glm5_next::rocm {
 namespace {
@@ -163,51 +165,32 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
                        token_input, logits, E, H);
   }
 
-  // 2. probs = sigmoid(logits).
-  {
-    const int grid = (E + block - 1) / block;
-    hipLaunchKernelGGL(SigmoidKernel, dim3(grid), dim3(block), 0, stream,
-                       logits, probs, E);
-  }
-
-  // 3. sel_scores = probs + bias.
-  {
-    const int grid = (E + block - 1) / block;
-    hipLaunchKernelGGL(AddBiasKernel, dim3(grid), dim3(block), 0, stream, probs,
-                       w.exp_probs_b, sel_scores, E);
-  }
-
-  // 4. Top-k selection (on host for simplicity — would be on GPU in
-  // production). Copy sel_scores back to host for selection.
-  std::vector<float> sel_scores_host(E);
-  std::vector<float> probs_host(E);
-  HIP_CHECK(hipMemcpyAsync(sel_scores_host.data(), sel_scores,
-                           E * sizeof(float), hipMemcpyDeviceToHost, stream));
-  HIP_CHECK(hipMemcpyAsync(probs_host.data(), probs, E * sizeof(float),
-                           hipMemcpyDeviceToHost, stream));
-  HIP_CHECK(hipStreamSynchronize(stream));
-
-  // Top-k descending.
-  std::vector<std::pair<float, std::uint32_t>> indexed(E);
-  for (std::uint32_t i = 0; i < E; ++i) {
-    indexed[i] = {-sel_scores_host[i], i};
-  }
-  std::stable_sort(indexed.begin(), indexed.end());
-
-  // 5. Weights from unbiased probs, renorm + scale.
+  // 2-5. Maya router_sigmoid (copied): top-k ids + renormed weights.
+  std::vector<std::uint32_t> expert_ids(k);
   std::vector<float> weights(k);
-  float w_sum = 0.0f;
-  for (std::uint32_t i = 0; i < k; ++i) {
-    weights[i] = probs_host[indexed[i].second];
-    w_sum += weights[i];
+  {
+    int* d_ids = nullptr;
+    float* d_rw = nullptr;
+    if (hipMalloc(&d_ids, k * sizeof(int)) != hipSuccess)
+      return false;
+    if (hipMalloc(&d_rw, k * sizeof(float)) != hipSuccess) {
+      hipFree(d_ids);
+      return false;
+    }
+    strata::kernels::router_sigmoid(
+        logits, w.exp_probs_b, 1, (int)E, (int)k, geom.expert_weights_scale,
+        geom.expert_weights_norm, d_ids, d_rw, stream);
+    std::vector<int> ids_host(k);
+    HIP_CHECK(hipMemcpyAsync(ids_host.data(), d_ids, k * sizeof(int),
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipMemcpyAsync(weights.data(), d_rw, k * sizeof(float),
+                             hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipStreamSynchronize(stream));
+    hipFree(d_ids);
+    hipFree(d_rw);
+    for (std::uint32_t i = 0; i < k; ++i)
+      expert_ids[i] = static_cast<std::uint32_t>(ids_host[i]);
   }
-  if (geom.expert_weights_norm) {
-    const float inv = 1.0f / fmaxf(w_sum, geom.renorm_clamp);
-    for (auto& v : weights)
-      v *= inv;
-  }
-  for (auto& v : weights)
-    v *= geom.expert_weights_scale;
 
   // 6. Zero accumulator.
   HIP_CHECK(hipMemset(acc, 0, H * sizeof(float)));
@@ -233,7 +216,7 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
   s_ids_host.resize(k);
   s_weights_host = weights;
   for (std::uint32_t i = 0; i < k; ++i)
-    s_ids_host[i] = static_cast<std::int32_t>(indexed[i].second);
+    s_ids_host[i] = static_cast<std::int32_t>(expert_ids[i]);
   HIP_CHECK(hipMemcpyAsync(ids_dev, s_ids_host.data(), k * sizeof(std::int32_t),
                            hipMemcpyHostToDevice, stream));
   HIP_CHECK(hipMemcpyAsync(w_dev, s_weights_host.data(), k * sizeof(float),
@@ -247,8 +230,8 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
   {
     const int total = static_cast<int>(k) * I;
     const int grid = (total + block - 1) / block;
-    hipLaunchKernelGGL(SwigluClampKernel, dim3(grid), dim3(block), 0, stream,
-                       gate_all, up_all, h_all, total, limit);
+    strata::kernels::glm_swiglu_clamp(gate_all, up_all, limit, total, h_all,
+                                      stream);
   }
   if (!gpu::QuantGemmMoe(w.down_exps, h_all, ids_dev, down_all, H, I, E, k,
                          w.down_exps_type, stream, H))
@@ -266,8 +249,7 @@ bool MoeForwardGpu(const MoeGpuGeometry& geom, const MoeGpuWeights& w,
                        w.gate_shexp, token_input, gate_s, SI, H);
     hipLaunchKernelGGL(MatVecKernel, dim3(SI), dim3(256), 0, stream, w.up_shexp,
                        token_input, up_s, SI, H);
-    hipLaunchKernelGGL(SwigluClampKernel, dim3(grid), dim3(block), 0, stream,
-                       gate_s, up_s, h_s, SI, limit);
+    strata::kernels::glm_swiglu_clamp(gate_s, up_s, limit, SI, h_s, stream);
     hipLaunchKernelGGL(MatVecKernel, dim3(H), dim3(256), 0, stream,
                        w.down_shexp, h_s, shexp, H, SI);
   }
@@ -315,8 +297,7 @@ bool DenseFfnForwardGpu(std::uint32_t hidden, std::uint32_t inter, float limit,
   }
   {
     const int grid = (inter + block - 1) / block;
-    hipLaunchKernelGGL(SwigluClampKernel, dim3(grid), dim3(block), 0, stream, g,
-                       u, h, inter, limit);
+    strata::kernels::glm_swiglu_clamp(g, u, limit, inter, h, stream);
   }
 
   // out = down @ h.

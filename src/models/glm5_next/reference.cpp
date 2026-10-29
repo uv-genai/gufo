@@ -50,16 +50,22 @@ void MatVec(const float* W, const float* x, float* y, std::size_t m,
   }
 }
 
-/// Causal conv1d: out[t] = sum_{k=0}^{K-1} conv[k] @ input[t-k] for t >= 0.
-/// input is [inner, T], conv is [K, inner], output is [inner, T].
+/// Causal conv1d matching Maya `glm_kda_conv` (SiLU applied separately).
+/// conv is GGUF (d_conv, 1, inner): element (tap, c) at tap + K*c, tap 0 =
+/// oldest. out[t] = sum_tap conv[tap + K*c] * x[t - (K-1) + tap]; taps before
+/// 0 are zero (fresh sequence). input/output are [inner, T].
 void CausalConv1d(const float* input, const float* conv, float* output,
                   std::uint32_t inner, std::uint32_t T, std::uint32_t K) {
+  const std::uint32_t hist = K - 1;
   for (std::uint32_t t = 0; t < T; ++t) {
     for (std::uint32_t c = 0; c < inner; ++c) {
       float acc = 0;
-      for (std::uint32_t k = 0; k < K; ++k) {
-        if (t >= k) {
-          acc += conv[k * inner + c] * input[(t - k) * inner + c];
+      for (std::uint32_t tap = 0; tap < K; ++tap) {
+        const int src = static_cast<int>(t) - static_cast<int>(hist) +
+                        static_cast<int>(tap);
+        if (src >= 0) {
+          acc += conv[tap + K * c] *
+                 input[static_cast<std::uint32_t>(src) * inner + c];
         }
       }
       output[t * inner + c] = acc;

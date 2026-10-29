@@ -720,17 +720,38 @@ struct block_q8_1 {
   std::int8_t qs[32];
 };
 
+// Maya glm_fast.cu warp_sum / warp_max — RDNA3 DPP lane path on GFX11
+// (bit-identical to __shfl_xor_sync per Maya's comments).
+template<int Ctrl>
+__device__ __forceinline__ float LaneDpp(float v) {
+  return __builtin_bit_cast(
+      float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), Ctrl,
+                                         0xf, 0xf, false));
+}
+
+__device__ __forceinline__ float LaneXor16(float v) {
+  const int i = __builtin_bit_cast(int, v);
+  return __builtin_bit_cast(
+      float,
+      __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+}
+
 __device__ __forceinline__ float WarpSum32(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1)
-    v += __shfl_xor(v, o, 32);
+  // Maya glm_fast.cu warp_sum_lanes (GFX11 / Strix Halo).
+  v += LaneXor16(v);
+  v += LaneDpp<0x168>(v);
+  v += LaneDpp<0x164>(v);
+  v += LaneDpp<0x162>(v);
+  v += LaneDpp<0x161>(v);
   return v;
 }
 
 __device__ __forceinline__ float WarpMax32(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1)
-    v = fmaxf(v, __shfl_xor(v, o, 32));
+  v = fmaxf(v, LaneXor16(v));
+  v = fmaxf(v, LaneDpp<0x168>(v));
+  v = fmaxf(v, LaneDpp<0x164>(v));
+  v = fmaxf(v, LaneDpp<0x162>(v));
+  v = fmaxf(v, LaneDpp<0x161>(v));
   return v;
 }
 

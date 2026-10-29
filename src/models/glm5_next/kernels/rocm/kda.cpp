@@ -1,13 +1,27 @@
+// Carbon copy of Maya `src/kernels/cuda/glm_kda.cu` + the KDA block of
+// `step_layers` (`src/core/glm_model.cu` ~2243-2278).  HIP-ported with the
+// same thread maps, phase order, fast-math, and indexing.  GEMMs go through
+// QuantGemm (Maya `gm_gemv` / `native_mmvq`).
+//
+// Five kernels (names match Maya):
+//   conv + conv_slide | gate | recurrence | out_gate
+// plus `l2_heads_kernel` from glm_model.cu.
+
 #include "src/models/glm5_next/kernels/rocm/kda.hpp"
 
 #include <hip/hip_runtime.h>
-#include <hipblaslt/hipblaslt.h>
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
+// Maya GLM kernels (copied, HIP via hip_compat) — do not reimplement.
 #include "src/models/glm5_next/quant_gemv.hpp"
+#include "strata/kernels/glm_kda.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 
 namespace gufo::models::glm5_next::rocm {
 namespace {
@@ -20,275 +34,349 @@ namespace {
     }                              \
   } while (0)
 
-/// Sigmoid activation kernel.
-__global__ void SigmoidKernel(const float* __restrict__ x,
-                              float* __restrict__ y, int n) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) {
-    y[i] = 1.0f / (1.0f + expf(-x[i]));
-  }
+constexpr int KD_THREADS = 256;
+constexpr int KD_MAX_D_CONV = 16;  // the slide's register staging
+
+__device__ __forceinline__ float dsigmoid(float x) {
+  return 1.0f / (1.0f + __expf(-x));
 }
 
-/// SiLU (swish) activation kernel.
-__global__ void SiluKernel(const float* __restrict__ x, float* __restrict__ y,
-                           int n) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) {
-    y[i] = x[i] / (1.0f + expf(-x[i]));
-  }
-}
+// ---- Maya glm_kda.cu (literal) -------------------------------------------
 
-/// L2 normalize per head: x[i] /= sqrt(sum(x[i]^2) + eps).
-__global__ void L2NormKernel(float* __restrict__ x, int head_dim, int num_heads,
-                             int seq_len, float eps) {
-  const int h = blockIdx.x;
-  const int t = blockIdx.y;
-  if (h >= num_heads || t >= seq_len)
+__global__ void glm_kda_conv_kernel(const float* __restrict__ x_proj,
+                                    const float* __restrict__ conv_w,
+                                    const float* __restrict__ conv_state,
+                                    int d_inner, int d_conv, int T,
+                                    float* __restrict__ out) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = d_inner * T;
+  if (idx >= total)
     return;
+  const int c = idx % d_inner;  // ggml order: features fastest
+  const int t = idx / d_inner;
+  const int hist = d_conv - 1;
 
-  float* head = x + (t * num_heads + h) * head_dim;
-  float sum = 0.0f;
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    sum += head[i] * head[i];
+  float acc = 0.0f;
+  for (int tap = 0; tap < d_conv; ++tap) {
+    const int src = t - hist + tap;
+    const float x = src >= 0
+                        ? x_proj[(size_t)src * d_inner + c]
+                        : conv_state[(size_t)(src + hist) + (size_t)hist * c];
+    acc += conv_w[(size_t)tap + (size_t)d_conv * c] * x;
   }
-  // Block-level reduction.
-  __shared__ float sdata[256];
-  sdata[threadIdx.x] = sum;
-  __syncthreads();
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (threadIdx.x < s)
-      sdata[threadIdx.x] += sdata[threadIdx.x + s];
-    __syncthreads();
-  }
-  const float inv = rsqrtf(sdata[0] + eps);
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    head[i] *= inv;
-  }
+  out[(size_t)t * d_inner + c] = acc / (1.0f + __expf(-acc));  // silu
 }
 
-/// Decay gate kernel: g1 = lb * sigmoid(-(fb_out + dt_bias) * A).
-/// Processes all inner*T elements (batched over tokens).
-__global__ void DecayGateKernel(const float* __restrict__ fb_out,
-                                const float* __restrict__ dt_bias,
-                                const float* __restrict__ ssm_a,
-                                float* __restrict__ g1, int inner, int head_dim,
-                                int num_heads, int total, float lb) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < total) {
-    const int c = i % inner;  // channel index within token
-    const int h = c / head_dim;
-    const float a = ssm_a[h];
-    const float arg = -(fb_out[i] + dt_bias[c]) * a;
-    g1[i] = lb / (1.0f + expf(-arg));
-  }
-}
-
-/// Beta kernel: beta = sigmoid(ssm_beta @ x). Batched over tokens.
-__global__ void BetaKernel(const float* __restrict__ beta_out,
-                           float* __restrict__ beta, int total) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < total) {
-    beta[i] = 1.0f / (1.0f + expf(-beta_out[i]));
-  }
-}
-
-/// Recurrent state update kernel (per head).
-/// S = diag(exp(g1)) @ S; S += outer(k, delta) where delta = beta * (v - S^T
-/// k).
-__global__ void StateUpdateKernel(float* __restrict__ state,
-                                  const float* __restrict__ k,
-                                  const float* __restrict__ v,
-                                  const float* __restrict__ g1,
-                                  const float* __restrict__ beta, int head_dim,
-                                  int num_heads, int t, int inner) {
-  const int h = blockIdx.x;
-  if (h >= num_heads)
-    return;
-
-  float* S = state + h * head_dim * head_dim;
-  const float* kt = k + t * inner + h * head_dim;
-  const float* vt = v + t * inner + h * head_dim;
-  const float* g1t = g1 + t * inner + h * head_dim;
-  const float bt = beta[t * num_heads + h];
-
-  // S = diag(exp(g1)) @ S  (scale rows).
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    const float g = expf(g1t[i]);
-    for (int j = 0; j < head_dim; ++j) {
-      S[i * head_dim + j] *= g;
-    }
-  }
-  __syncthreads();
-
-  // Compute S^T @ k (column j of S dotted with k).
-  __shared__ float stk[256];
-  for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
-    float acc = 0.0f;
-    for (int i = 0; i < head_dim; ++i) {
-      acc += S[i * head_dim + j] * kt[i];
-    }
-    stk[j] = acc;
-  }
-  __syncthreads();
-
-  // S += outer(k, delta) where delta = beta * (v - stk).
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    for (int j = 0; j < head_dim; ++j) {
-      const float delta = bt * (vt[j] - stk[j]);
-      S[i * head_dim + j] += kt[i] * delta;
-    }
-  }
-}
-
-/// Output computation kernel: o = (1/sqrt(dk)) * S^T @ q.
-__global__ void OutputKernel(const float* __restrict__ state,
-                             const float* __restrict__ q, float* __restrict__ o,
-                             int head_dim, int num_heads, int t, int inner,
-                             float scale) {
-  const int h = blockIdx.x;
-  if (h >= num_heads)
-    return;
-
-  const float* S = state + h * head_dim * head_dim;
-  const float* qt = q + t * inner + h * head_dim;
-  float* ot = o + t * inner + h * head_dim;
-
-  for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
-    float acc = 0.0f;
-    for (int i = 0; i < head_dim; ++i) {
-      acc += S[i * head_dim + j] * qt[i];
-    }
-    ot[j] = acc * scale;
-  }
-}
-
-/// RMS norm kernel (per head).
-__global__ void RmsNormKernel(float* __restrict__ x,
-                              const float* __restrict__ gamma, int head_dim,
-                              int num_heads, int seq_len, float eps) {
-  const int h = blockIdx.x;
-  const int t = blockIdx.y;
-  if (h >= num_heads || t >= seq_len)
-    return;
-
-  float* head = x + (t * num_heads + h) * head_dim;
-  float ms = 0.0f;
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    ms += head[i] * head[i];
-  }
-  __shared__ float sdata[256];
-  sdata[threadIdx.x] = ms;
-  __syncthreads();
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (threadIdx.x < s)
-      sdata[threadIdx.x] += sdata[threadIdx.x + s];
-    __syncthreads();
-  }
-  const float inv_rms = rsqrtf(sdata[0] / head_dim + eps);
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    head[i] = head[i] * inv_rms * gamma[i];
-  }
-}
-
-/// Output gate kernel: out = normed * sigmoid(g2).
-__global__ void OutputGateKernel(float* __restrict__ normed,
-                                 const float* __restrict__ g2_out, int n) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) {
-    const float g2 = 1.0f / (1.0f + expf(-g2_out[i]));
-    normed[i] *= g2;
-  }
-}
-
-/// Causal conv1d kernel (per channel).
-__global__ void CausalConv1dKernel(const float* __restrict__ input,
-                                   const float* __restrict__ conv,
-                                   float* __restrict__ output, int inner, int T,
-                                   int K) {
+__global__ void glm_kda_conv_slide_kernel(const float* __restrict__ x_proj,
+                                          float* __restrict__ conv_state,
+                                          int d_inner, int d_conv, int T) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= inner)
+  if (c >= d_inner)
     return;
+  const int hist = d_conv - 1;
+  float nv[KD_MAX_D_CONV];
+  for (int j = 0; j < hist; ++j) {
+    const int src = T - hist + j;
+    nv[j] = src >= 0 ? x_proj[(size_t)src * d_inner + c]
+                     : conv_state[(size_t)(src + hist) + (size_t)hist * c];
+  }
+  for (int j = 0; j < hist; ++j)
+    conv_state[(size_t)j + (size_t)hist * c] = nv[j];
+}
+
+__global__ void glm_kda_gate_kernel(const float* __restrict__ g,
+                                    const float* __restrict__ ssm_a,
+                                    float lower_bound, int head_dim, int n_head,
+                                    int T, float* __restrict__ g1) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = head_dim * n_head * T;
+  if (idx >= total)
+    return;
+  const int e = idx % head_dim;
+  const int h = (idx / head_dim) % n_head;
+  const int t = idx / (head_dim * n_head);
+  const float v = g[(size_t)(e + head_dim * h) + (size_t)t * head_dim * n_head];
+  g1[idx] = lower_bound * dsigmoid(-v * ssm_a[h]);
+}
+
+__global__ void glm_kda_recurrence_kernel(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g1,
+    const float* __restrict__ beta, float* __restrict__ state, int n_head,
+    int head_dim, int T, float* __restrict__ out) {
+  const int h = blockIdx.x;
+  if (h >= n_head)
+    return;
+  const int dk = head_dim;
+  const int tid = threadIdx.x;
+  const int nt = blockDim.x;
+  const float scale = rsqrtf((float)dk);
+
+  float* S = state + (size_t)h * dk * dk;
+  extern __shared__ float smem[];
+  float* s_u = smem;
+  float* s_delta = smem + dk;
 
   for (int t = 0; t < T; ++t) {
-    float acc = 0.0f;
-    for (int k = 0; k < K; ++k) {
-      if (t >= k) {
-        acc += conv[k * inner + c] * input[(t - k) * inner + c];
-      }
+    const float* qt = q + ((size_t)t * n_head + h) * dk;
+    const float* kt = k + ((size_t)t * n_head + h) * dk;
+    const float* vt = v + ((size_t)t * n_head + h) * dk;
+    const float* gt = g1 + ((size_t)t * n_head + h) * dk;
+    const float b = beta[(size_t)t * n_head + h];
+
+    for (int i = tid; i < dk; i += nt) {
+      const float decay = __expf(gt[i]);
+      for (int j = 0; j < dk; ++j)
+        S[(size_t)i * dk + j] *= decay;
     }
-    output[t * inner + c] = acc;
+    __syncthreads();
+
+    for (int j = tid; j < dk; j += nt) {
+      float acc = 0.0f;
+      for (int i = 0; i < dk; ++i)
+        acc += S[(size_t)i * dk + j] * kt[i];
+      s_u[j] = acc;
+    }
+    __syncthreads();
+
+    for (int j = tid; j < dk; j += nt)
+      s_delta[j] = b * (vt[j] - s_u[j]);
+    __syncthreads();
+
+    for (int idx = tid; idx < dk * dk; idx += nt) {
+      const int i = idx / dk, j = idx % dk;
+      S[(size_t)i * dk + j] += kt[i] * s_delta[j];
+    }
+    __syncthreads();
+
+    for (int j = tid; j < dk; j += nt) {
+      float acc = 0.0f;
+      for (int i = 0; i < dk; ++i)
+        acc += S[(size_t)i * dk + j] * qt[i];
+      out[((size_t)t * n_head + h) * dk + j] = acc * scale;
+    }
+    __syncthreads();
   }
 }
 
-/// Simple GEMM: y[m] = W[m,n] @ x[n] (row-major W).
-/// Uses one thread per output element.
-__global__ void MatVecKernel(const float* __restrict__ W,
-                             const float* __restrict__ x, float* __restrict__ y,
-                             int m, int n) {
-  // One workgroup per row; threads split the dot (serial per-row chains are
-  // latency-bound).
-  __shared__ float red[256];
-  const int row = blockIdx.x;
-  if (row >= m)
+__global__ void glm_kda_out_gate_kernel(const float* __restrict__ o,
+                                        const float* __restrict__ norm_w,
+                                        const float* __restrict__ g2,
+                                        int head_dim, int n_head, int T,
+                                        float eps, float* __restrict__ gated) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n_head * T)
     return;
-  float acc = 0.0f;
-  const float* wrow = W + row * n;
-  for (int j = threadIdx.x; j < n; j += blockDim.x)
-    acc += wrow[j] * x[j];
-  red[threadIdx.x] = acc;
+  const int h = idx % n_head;
+  const int t = idx / n_head;
+  const float* ot = o + ((size_t)t * n_head + h) * head_dim;
+  const float* gt = g2 + ((size_t)t * n_head + h) * head_dim;
+
+  float ss = 0.0f;
+  for (int e = 0; e < head_dim; ++e)
+    ss += ot[e] * ot[e];
+  const float inv = rsqrtf(ss / (float)head_dim + eps);
+  for (int e = 0; e < head_dim; ++e)
+    gated[((size_t)t * n_head + h) * head_dim + e] =
+        ot[e] * inv * norm_w[e] * dsigmoid(gt[e]);
+}
+
+// ---- Maya glm_fast.cu kda_rec_block (engine_kind=glm-fast decode) ----
+__global__ void kda_rec_fast_kernel(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g1,
+    const float* __restrict__ beta_raw, float* __restrict__ state,
+    const float* __restrict__ g2, const float* __restrict__ norm_w, float eps,
+    float* __restrict__ out, int n_head) {
+  constexpr int HD = 128;
+  const int h = blockIdx.x;
+  if (h >= n_head)
+    return;
+  const int t = threadIdx.x, j = t & (HD - 1), half = t >> 7;
+  __shared__ float sq[HD], sk[HD], sdec[HD], sdel[HD];
+  __shared__ float sacc[2][HD];
+  __shared__ float sred[32];
+  if (t < HD) {
+    sq[t] = q[h * HD + t];
+    sk[t] = k[h * HD + t];
+    sdec[t] = __expf(g1[h * HD + t]);
+  }
+  const float b = 1.0f / (1.0f + expf(-beta_raw[h]));
   __syncthreads();
-  // In-order reduction on one thread: summation order then matches the CPU
-  // oracle when a thread holds at most one term (a tree reduction can flip
-  // MoE top-k selection through rounding).
-  if (threadIdx.x == 0) {
-    float s = 0.0f;
-    for (int i = 0; i < blockDim.x; ++i)
-      s += red[i];
-    y[row] = s;
+  float* Sh = state + (size_t)h * HD * HD;
+  float reg[64];
+  float A = 0.0f;
+#pragma unroll
+  for (int ii = 0; ii < 64; ++ii) {
+    const int i = half * 64 + ii;
+    const float s = Sh[i * HD + j] * sdec[i];
+    reg[ii] = s;
+    A += s * sk[i];
+  }
+  sacc[half][j] = A;
+  __syncthreads();
+  if (half == 0)
+    sdel[j] = b * (v[h * HD + j] - (sacc[0][j] + sacc[1][j]));
+  __syncthreads();
+  const float dl = sdel[j];
+  float O = 0.0f;
+#pragma unroll
+  for (int ii = 0; ii < 64; ++ii) {
+    const int i = half * 64 + ii;
+    const float s2 = reg[ii] + sk[i] * dl;
+    Sh[i * HD + j] = s2;
+    O += s2 * sq[i];
+  }
+  __syncthreads();
+  sacc[half][j] = O;
+  __syncthreads();
+  const float o = (sacc[0][j] + sacc[1][j]) * rsqrtf((float)HD);
+  float ss = half == 0 ? o * o : 0.0f;
+  {
+    const int lane_id = t & 31, w = t >> 5, nw = 256 >> 5;
+    float vv = ss;
+#pragma unroll
+    for (int o2 = 16; o2 > 0; o2 >>= 1)
+      vv += __shfl_xor_sync(0xffffffffull, vv, o2);
+    __syncthreads();
+    if (lane_id == 0)
+      sred[w] = vv;
+    __syncthreads();
+    vv = 0.0f;
+    for (int i = 0; i < nw; ++i)
+      vv += sred[i];
+    ss = vv;
+  }
+  const float inv = rsqrtf(ss / (float)HD + eps);
+  if (half == 0) {
+    out[h * HD + j] = o * inv * norm_w[j] * dsigmoid(g2[h * HD + j]);
   }
 }
 
-/// Batched MatVec for [m, T] output from [m, n] @ [n, T].
-__global__ void BatchedMatVecKernel(const float* __restrict__ W,
-                                    const float* __restrict__ x,
-                                    float* __restrict__ y, int m, int n,
-                                    int T) {
-  __shared__ float red[256];
-  const int row = blockIdx.x;
-  if (row >= m * T)
+// ---- Maya glm_model.cu l2_heads / sigmoid / axpy (literal) ----------------
+
+__global__ void l2_heads_kernel(const float* __restrict__ x,
+                                float* __restrict__ y, int dk, int n_head,
+                                int T) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n_head * T)
     return;
-  const int t = row / m;
-  const int i = row % m;
-  float acc = 0.0f;
-  const float* wrow = W + i * n;
-  const float* xcol = x + t * n;
-  for (int j = threadIdx.x; j < n; j += blockDim.x)
-    acc += wrow[j] * xcol[j];
-  red[threadIdx.x] = acc;
-  __syncthreads();
-  // In-order reduction on one thread: summation order then matches the CPU
-  // oracle when a thread holds at most one term (a tree reduction can flip
-  // MoE top-k selection through rounding).
-  if (threadIdx.x == 0) {
-    float s = 0.0f;
-    for (int i = 0; i < blockDim.x; ++i)
-      s += red[i];
-    y[row] = s;
-  }
+  const int h = idx % n_head;
+  const int t = idx / n_head;
+  const float* xt = x + ((size_t)t * n_head + h) * dk;
+  float ss = 0.0f;
+  for (int e = 0; e < dk; ++e)
+    ss += xt[e] * xt[e];
+  const float inv = rsqrtf(ss + 1e-6f);
+  float* yt = y + ((size_t)t * n_head + h) * dk;
+  for (int e = 0; e < dk; ++e)
+    yt[e] = xt[e] * inv;
+}
+
+__global__ void sigmoid_kernel(float* __restrict__ x, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  x[i] = 1.0f / (1.0f + expf(-x[i]));
+}
+
+__global__ void axpy_kernel(float* __restrict__ acc, float alpha,
+                            const float* __restrict__ v, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  acc[i] += alpha * v[i];
+}
+
+// ---- optional intermediate dumps (GLM_CB_DIR) ----------------------------
+// Files are tagged with a global call counter so T=1-per-token GpuEngine
+// dumps do not overwrite each other.  Call 0 = first token.
+
+int g_dump_call = -1;  // pre-incremented in KdaPrefillGpu; first call is 0
+
+void DumpF32(const char* name, const float* dev, std::size_t n,
+             hipStream_t stream) {
+  const char* dir = std::getenv("GLM_CB_DIR");
+  if (dir == nullptr || dir[0] == '\0')
+    return;
+  std::vector<float> host(n);
+  if (hipMemcpyAsync(host.data(), dev, n * sizeof(float), hipMemcpyDeviceToHost,
+                     stream) != hipSuccess)
+    return;
+  hipStreamSynchronize(stream);
+  const std::string path = std::string(dir) + "/" + name + "-" +
+                           std::to_string(g_dump_call) + ".f32";
+  FILE* f = std::fopen(path.c_str(), "wb");
+  if (f == nullptr)
+    return;
+  std::fwrite(host.data(), sizeof(float), n, f);
+  std::fclose(f);
 }
 
 }  // namespace
 
+// Maya gm_gemv(W, x, bias, alpha, y, out, in) → native_mmvq(..., n_in=in,
+// n_out=out). This wrapper takes (out, in) like QuantGemm so call sites stay
+// (rows, cols).
+inline bool MayaGemv(const void* W, const float* x, void* q81, float* y,
+                     int out, int in, int ggml_type, hipStream_t stream) {
+  if (ggml_type == 14) {  // Q6_K
+    strata::kernels::native_q6_k_f32(W, x, q81, y, in, out, 1, stream);
+    return true;
+  }
+  if (ggml_type == 8) {  // Q8_0
+    strata::kernels::native_q8_0_f32(W, x, q81, y, in, out, 1, stream);
+    return true;
+  }
+  // F32 / other: QuantGemm fallback (tests use F32).
+  return gpu::QuantGemm(W, x, y, out, in, ggml_type, stream);
+}
+
+// ---- Maya host wrappers (call the copied glm_kda.cu) ---------------------
+
+void GlmKdaConv(const float* x_proj, const float* conv_w, float* conv_state,
+                int d_inner, int d_conv, int T, float* out,
+                hipStream_t stream) {
+  strata::kernels::glm_kda_conv(x_proj, conv_w, conv_state, d_inner, d_conv, T,
+                                out, stream);
+}
+
+void GlmKdaGate(const float* g, const float* ssm_a, float lower_bound,
+                int head_dim, int n_head, int T, float* g1,
+                hipStream_t stream) {
+  strata::kernels::glm_kda_gate(g, ssm_a, lower_bound, head_dim, n_head, T, g1,
+                                stream);
+}
+
+void GlmKdaRecurrence(const float* q, const float* k, const float* v,
+                      const float* g1, const float* beta, float* state,
+                      int n_head, int head_dim, int T, float* out,
+                      hipStream_t stream) {
+  strata::kernels::glm_kda_recurrence(q, k, v, g1, beta, state, n_head,
+                                      head_dim, T, out, stream);
+}
+
+void GlmKdaOutGate(const float* o, const float* norm_w, const float* g2,
+                   int head_dim, int n_head, int T, float eps, float* gated,
+                   hipStream_t stream) {
+  strata::kernels::glm_kda_out_gate(o, norm_w, g2, head_dim, n_head, T, eps,
+                                    gated, stream);
+}
+
+// ---- KdaPrefillGpu: step_layers KDA block, same order ---------------------
+
 std::size_t KdaScratchFloats(const KdaGpuGeometry& geom,
                              std::uint32_t seq_len) {
   const std::uint32_t inner = geom.num_heads * geom.head_dim;
-  return 12ULL * inner * seq_len + 2ULL * geom.num_heads * seq_len +
-         2ULL * geom.head_dim * seq_len;
+  // proj x3 | conv x3 | g | g1 | beta | scan | g2 | gated | fa | fb | ga | gb
+  return 14ULL * inner * seq_len + 2ULL * geom.num_heads * seq_len +
+         4ULL * geom.head_dim * seq_len;
 }
 
 bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
-                   const float* input, float* state, float* out,
-                   std::uint32_t seq_len, float* scratch, hipStream_t stream) {
+                   const float* input, float* state, float* conv_state,
+                   float* out, std::uint32_t seq_len, float* scratch,
+                   hipStream_t stream) {
   const std::uint32_t H = geom.hidden_size;
   const std::uint32_t nh = geom.num_heads;
   const std::uint32_t dk = geom.head_dim;
@@ -296,8 +384,11 @@ bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
   const std::uint32_t K = geom.conv_kernel;
   const float lb = geom.gate_lower_bound;
   const int T = static_cast<int>(seq_len);
+  if (T <= 0)
+    return true;
+  if (std::getenv("GLM_CB_DIR") != nullptr)
+    ++g_dump_call;
 
-  // Device scratch (caller-owned when provided; bump-allocated).
   float* owned = nullptr;
   if (scratch == nullptr) {
     HIP_CHECK(hipMalloc(&owned, KdaScratchFloats(geom, T) * sizeof(float)));
@@ -310,136 +401,152 @@ bool KdaPrefillGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
     return r;
   };
 
-  const std::size_t inner_T = inner * T;
-  float* wq = take(inner_T);
-  float* wk = take(inner_T);
-  float* wv = take(inner_T);
+  const std::size_t inner_T = (std::size_t)inner * T;
+  float* proj_q = take(inner_T);
+  float* proj_k = take(inner_T);
+  float* proj_v = take(inner_T);
   float* q_c = take(inner_T);
   float* k_c = take(inner_T);
   float* v_c = take(inner_T);
   float* g1 = take(inner_T);
-  float* beta = take(nh * T);
-  float* o = take(inner_T);
+  float* beta = take((std::size_t)nh * T);
+  float* scan = take(inner_T);
   float* g2 = take(inner_T);
-  float* normed = take(inner_T);
-  float* fa_out = take(dk * T);
-  float* fb_out = take(inner_T);
-  float* ga_out = take(dk * T);
-  float* gb_out = take(inner_T);
+  float* gated = take(inner_T);
+  float* fa = take((std::size_t)dk * T);
+  float* fb = take(inner_T);  // also carries g after +dt_bias
+  float* ga = take((std::size_t)dk * T);
+  float* gb = take(inner_T);
 
-  const int block = 256;
+  const int block = KD_THREADS;
+  const int grid_inner_T = (int)((inner_T + block - 1) / block);
 
-  // 1. Q/K/V projections (quantized GEMM per token).
-  for (std::uint32_t t = 0; t < T; ++t) {
-    const float* x = input + t * H;
-    if (!gpu::QuantGemm(w.w_q, x, wq + t * inner, inner, H, w.w_q_type,
-                        stream) ||
-        !gpu::QuantGemm(w.w_k, x, wk + t * inner, inner, H, w.w_k_type,
-                        stream) ||
-        !gpu::QuantGemm(w.w_v, x, wv + t * inner, inner, H, w.w_v_type, stream))
-      return false;
+  // Q8_1 activation scratch (Maya gm_gemv) — one buffer, max n_in = inner.
+  const std::size_t q81_bytes =
+      strata::kernels::native_q8_1_bytes((int)inner, 1);
+  std::vector<std::uint8_t> q81_host(q81_bytes);
+  void* q81 = nullptr;
+  HIP_CHECK(hipMalloc(&q81, q81_bytes));
+
+  // ---- step_layers KDA, same order ----
+  // for si in q,k,v: gm_gemv(attn_*) -> proj; glm_kda_conv -> conv[si]
+  const float* wqkv[3] = {w.w_q, w.w_k, w.w_v};
+  const int wqkv_t[3] = {w.w_q_type, w.w_k_type, w.w_v_type};
+  const float* conv_w[3] = {w.conv_q, w.conv_k, w.conv_v};
+  float* proj[3] = {proj_q, proj_k, proj_v};
+  float* conv_out[3] = {q_c, k_c, v_c};
+  const std::size_t conv_stride = (std::size_t)inner * (K - 1);
+  for (int si = 0; si < 3; ++si) {
+    for (int t = 0; t < T; ++t) {
+      if (!MayaGemv(wqkv[si], input + (std::size_t)t * H, q81,
+                    proj[si] + (std::size_t)t * inner, (int)inner, (int)H,
+                    wqkv_t[si], stream)) {
+        hipFree(q81);
+        return false;
+      }
+    }
+    float* cst = nullptr;
+    if (conv_state != nullptr)
+      cst = conv_state + (std::size_t)si * conv_stride;
+    GlmKdaConv(proj[si], conv_w[si], cst, (int)inner, (int)K, T, conv_out[si],
+               stream);
+    if (si == 0)
+      DumpF32("kda_proj_q", proj[si], inner_T, stream);
+    if (si == 0)
+      DumpF32("kda_conv_q", conv_out[si], inner_T, stream);
   }
 
-  // 2. Causal conv + SiLU.
+  // l2_heads on q and k only
   {
-    const int grid_conv = (inner + block - 1) / block;
-    hipLaunchKernelGGL(CausalConv1dKernel, dim3(grid_conv), dim3(block), 0,
-                       stream, wq, w.conv_q, q_c, inner, T, K);
-    hipLaunchKernelGGL(CausalConv1dKernel, dim3(grid_conv), dim3(block), 0,
-                       stream, wk, w.conv_k, k_c, inner, T, K);
-    hipLaunchKernelGGL(CausalConv1dKernel, dim3(grid_conv), dim3(block), 0,
-                       stream, wv, w.conv_v, v_c, inner, T, K);
-    // SiLU must cover all inner*T elements, not just inner.
-    const int grid_act = (inner_T + block - 1) / block;
-    hipLaunchKernelGGL(SiluKernel, dim3(grid_act), dim3(block), 0, stream, q_c,
-                       q_c, inner_T);
-    hipLaunchKernelGGL(SiluKernel, dim3(grid_act), dim3(block), 0, stream, k_c,
-                       k_c, inner_T);
-    hipLaunchKernelGGL(SiluKernel, dim3(grid_act), dim3(block), 0, stream, v_c,
-                       v_c, inner_T);
+    const int total = (int)(nh * T);
+    hipLaunchKernelGGL(
+        l2_heads_kernel, dim3((total + KD_THREADS - 1) / KD_THREADS),
+        dim3(KD_THREADS), 0, stream, q_c, q_c, (int)dk, (int)nh, T);
+    hipLaunchKernelGGL(
+        l2_heads_kernel, dim3((total + KD_THREADS - 1) / KD_THREADS),
+        dim3(KD_THREADS), 0, stream, k_c, k_c, (int)dk, (int)nh, T);
   }
+  DumpF32("kda_q", q_c, inner_T, stream);
+  DumpF32("kda_k", k_c, inner_T, stream);
+  DumpF32("kda_v", v_c, inner_T, stream);
 
-  // 3. L2 norm q, k per head.
-  {
-    const dim3 grid(nh, T);
-    hipLaunchKernelGGL(L2NormKernel, grid, dim3(block), 0, stream, q_c, dk, nh,
-                       T, 1e-6f);
-    hipLaunchKernelGGL(L2NormKernel, grid, dim3(block), 0, stream, k_c, dk, nh,
-                       T, 1e-6f);
-  }
-
-  // 4. Decay gate.
-  {
-    // fa_out = f_a @ x  [dk, T].
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(dk * T), dim3(256), 0, stream,
-                       w.f_a, input, fa_out, dk, H, T);
-    // fb_out = f_b @ fa_out  [inner, T].
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(inner * T), dim3(256), 0,
-                       stream, w.f_b, fa_out, fb_out, inner, dk, T);
-    // g1 = lb * sigmoid(-(fb_out + dt_bias) * A).
-    const int grid_g1 = (inner * T + block - 1) / block;
-    hipLaunchKernelGGL(DecayGateKernel, dim3(grid_g1), dim3(block), 0, stream,
-                       fb_out, w.dt_bias, w.ssm_a, g1, inner, dk, nh, inner * T,
-                       lb);
-  }
-
-  // 5. Beta.
-  {
-    // beta_out = ssm_beta @ x  [nh, T].
-    float* beta_out = take(nh * T);
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(nh * T), dim3(256), 0, stream,
-                       w.ssm_beta, input, beta_out, nh, H, T);
-    hipLaunchKernelGGL(BetaKernel, dim3((nh * T + 255) / 256), dim3(256), 0,
-                       stream, beta_out, beta, nh * T);
-  }
-
-  // 6. Recurrent delta rule.
-  const float scale = 1.0f / sqrtf(static_cast<float>(dk));
+  // g = f_b @ (f_a @ x) + dt_bias; g1 = lb * sigmoid(-g * A)
   for (int t = 0; t < T; ++t) {
-    hipLaunchKernelGGL(StateUpdateKernel, dim3(nh), dim3(block), 0, stream,
-                       state, k_c, v_c, g1, beta, dk, nh, t, inner);
-    hipLaunchKernelGGL(OutputKernel, dim3(nh), dim3(block), 0, stream, state,
-                       q_c, o, dk, nh, t, inner, scale);
-  }
-
-  // 7. Output gate g2.
-  {
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(dk * T), dim3(256), 0, stream,
-                       w.g_a, input, ga_out, dk, H, T);
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(inner * T), dim3(256), 0,
-                       stream, w.g_b, ga_out, gb_out, inner, dk, T);
-  }
-
-  // 8. RMS norm + output gate.
-  {
-    const dim3 grid(nh, T);
-    hipLaunchKernelGGL(RmsNormKernel, grid, dim3(block), 0, stream, o,
-                       w.ssm_norm, dk, nh, T, geom.norm_eps);
-    hipMemcpyAsync(normed, o, inner_T * sizeof(float), hipMemcpyDeviceToDevice,
-                   stream);
-    const int grid_gate = (inner * T + block - 1) / block;
-    hipLaunchKernelGGL(OutputGateKernel, dim3(grid_gate), dim3(block), 0,
-                       stream, normed, gb_out, inner_T);
-  }
-
-  // 9. Output projection (quantized GEMM per token).
-  for (std::uint32_t t = 0; t < T; ++t) {
-    if (!gpu::QuantGemm(w.w_out, normed + t * inner, out + t * H, H, inner,
-                        w.w_out_type, stream))
+    const float* x = input + (std::size_t)t * H;
+    if (!MayaGemv(w.f_a, x, q81, fa + (std::size_t)t * dk, (int)dk, (int)H,
+                  w.f_a_type, stream) ||
+        !MayaGemv(w.f_b, fa + (std::size_t)t * dk, q81,
+                  fb + (std::size_t)t * inner, (int)inner, (int)dk, w.f_b_type,
+                  stream)) {
+      hipFree(q81);
       return false;
+    }
+  }
+  hipLaunchKernelGGL(axpy_kernel, dim3(grid_inner_T), dim3(block), 0, stream,
+                     fb, 1.0f, w.dt_bias, (int)inner_T);
+  DumpF32("kda_fa", fa, (std::size_t)dk * T, stream);
+  DumpF32("kda_gpre", fb, inner_T, stream);
+  // Maya writes the bias-added vector as `g` for the gate; reuse fb in place.
+  hipLaunchKernelGGL(
+      glm_kda_gate_kernel, dim3((int)((inner_T + KD_THREADS - 1) / KD_THREADS)),
+      dim3(KD_THREADS), 0, stream, fb, w.ssm_a, lb, (int)dk, (int)nh, T, g1);
+  DumpF32("kda_g1", g1, inner_T, stream);
+
+  // beta raw → sigmoid (Maya glm_kda_recurrence takes sigmoid'd beta).
+  for (int t = 0; t < T; ++t) {
+    if (!MayaGemv(w.ssm_beta, input + (std::size_t)t * H, q81,
+                  beta + (std::size_t)t * nh, (int)nh, (int)H, w.beta_type,
+                  stream)) {
+      hipFree(q81);
+      return false;
+    }
+  }
+  hipLaunchKernelGGL(sigmoid_kernel, dim3((nh * T + block - 1) / block),
+                     dim3(block), 0, stream, beta, (int)(nh * T));
+  DumpF32("kda_beta", beta, (std::size_t)nh * T, stream);
+
+  // g2 = g_b @ (g_a @ x)
+  for (int t = 0; t < T; ++t) {
+    const float* x = input + (std::size_t)t * H;
+    if (!MayaGemv(w.g_a, x, q81, ga + (std::size_t)t * dk, (int)dk, (int)H,
+                  w.g_a_type, stream) ||
+        !MayaGemv(w.g_b, ga + (std::size_t)t * dk, q81,
+                  gb + (std::size_t)t * inner, (int)inner, (int)dk, w.g_b_type,
+                  stream)) {
+      hipFree(q81);
+      return false;
+    }
+  }
+  DumpF32("kda_g2", gb, inner_T, stream);
+
+  // Maya glm_kda: recurrence then out_gate (step_layers order).
+  GlmKdaRecurrence(q_c, k_c, v_c, g1, beta, state, (int)nh, (int)dk, T, scan,
+                   stream);
+  DumpF32("kda_scan", scan, inner_T, stream);
+  GlmKdaOutGate(scan, w.ssm_norm, gb, (int)dk, (int)nh, T, geom.norm_eps, gated,
+                stream);
+  DumpF32("kda_gated", gated, inner_T, stream);
+
+  for (int t = 0; t < T; ++t) {
+    if (!MayaGemv(w.w_out, gated + (std::size_t)t * inner, q81,
+                  out + (std::size_t)t * H, (int)H, (int)inner, w.w_out_type,
+                  stream)) {
+      hipFree(q81);
+      return false;
+    }
   }
 
-  // Cleanup.
+  hipFree(q81);
   if (owned)
     hipFree(owned);
   return true;
 }
 
 bool KdaDecodeGpu(const KdaGpuGeometry& geom, const KdaGpuWeights& w,
-                  const float* token_input, float* state, float* out,
-                  float* scratch, hipStream_t stream) {
-  // Single-token decode: same as prefill with T=1.
-  return KdaPrefillGpu(geom, w, token_input, state, out, 1, scratch, stream);
+                  const float* token_input, float* state, float* conv_state,
+                  float* out, float* scratch, hipStream_t stream) {
+  return KdaPrefillGpu(geom, w, token_input, state, conv_state, out, 1, scratch,
+                       stream);
 }
 
 }  // namespace gufo::models::glm5_next::rocm

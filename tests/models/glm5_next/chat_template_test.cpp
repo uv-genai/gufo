@@ -162,8 +162,7 @@ void TestSingleUserPromptGolden() {
   const std::string want =
       "[gMASK]<sop><|system|>Reasoning Effort: Max"
       "<|user|>The capital of France is<|assistant|><thinking>";
-  Require(got == want,
-          ("single-user framing mismatch: " + got).c_str());
+  Require(got == want, ("single-user framing mismatch: " + got).c_str());
   std::cout << "TestSingleUserPromptGolden: PASS\n";
 }
 

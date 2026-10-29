@@ -4,14 +4,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <tuple>
 #include <vector>
 
+#include "src/core/quant/ggml_gemm.hpp"
 #include "src/models/glm5_next/gpu_kernels.hpp"
 #include "src/models/glm5_next/kernels/rocm/kda.hpp"
 #include "src/models/glm5_next/kernels/rocm/mhc.hpp"
@@ -158,8 +159,10 @@ void DequantToHost(const TensorRef& t, std::vector<float>& out) {
     }
     return;
   }
-  // Unsupported type — zeros.
-  std::fill(out.begin(), out.end(), 0.0F);
+  // Every other packed type goes through the shared host dequant (llama.cpp
+  // semantics). Previously Q6_K/Q2_K/... fell through to zeros, which silently
+  // zeroed force_f32 shared-expert weights.
+  quant::Dequantize(t.type, t.data, out.data(), n);
 }
 
 }  // namespace
@@ -237,11 +240,11 @@ std::shared_ptr<GpuEngine> GpuEngine::Create(const Config& config,
         {&W.kda.conv1d_v, true},              // kKdaConvV
         {&W.kda.a, true},                     // kKdaA
         {&W.kda.dt_bias, true},               // kKdaDtBias
-        {&W.kda.f_a, true},                   // kKdaFa
-        {&W.kda.f_b, true},                   // kKdaFb
-        {&W.kda.beta, true},                  // kKdaBeta
-        {&W.kda.g_a, true},                   // kKdaGa
-        {&W.kda.g_b, true},                   // kKdaGb
+        {&W.kda.f_a, false},                  // kKdaFa (Q8_0, QuantGemm)
+        {&W.kda.f_b, false},                  // kKdaFb
+        {&W.kda.beta, false},                 // kKdaBeta
+        {&W.kda.g_a, false},                  // kKdaGa
+        {&W.kda.g_b, false},                  // kKdaGb
         {&W.kda.norm, true},                  // kKdaNorm
         {&W.hc.attn_fn, true},                // kHcAttnFn
         {&W.hc.attn_scale, true},             // kHcAttnScale
@@ -609,8 +612,9 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
     // Maya: rms_norm(mixed, attn_norm) before the mixer.
     gpu::LaunchRmsNorm(mixed, w_ptrs_[base + kAttnNorm], H_,
                        config_.layer_norm_rms_eps, stream);
-    DumpSeam(("attn_norm-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
-               mixed, H_, stream);
+    DumpSeam(
+        ("attn_norm-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
+        mixed, H_, stream);
 
     // 2. Attention (KDA mixer or NoPE-MLA + DSA indexer).
     if (config_.IsFullAttention(il)) {
@@ -675,23 +679,32 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
       kda_w.g_a = w_ptrs_[base + kKdaGa];
       kda_w.g_b = w_ptrs_[base + kKdaGb];
       kda_w.ssm_norm = w_ptrs_[base + kKdaNorm];
+      kda_w.f_a_type = w_types_[base + kKdaFa];
+      kda_w.f_b_type = w_types_[base + kKdaFb];
+      kda_w.beta_type = w_types_[base + kKdaBeta];
+      kda_w.g_a_type = w_types_[base + kKdaGa];
+      kda_w.g_b_type = w_types_[base + kKdaGb];
 
       float* state_ptr =
           kda_S_off_[il] >= 0 ? state_ + kda_S_off_[il] : nullptr;
-      if (!rocm::KdaPrefillGpu(kda_geom, kda_w, mixed, state_ptr, attn_out, T,
-                               ws_, stream))
+      float* conv_ptr =
+          kda_conv_off_[il] >= 0 ? state_ + kda_conv_off_[il] : nullptr;
+      if (!rocm::KdaPrefillGpu(kda_geom, kda_w, mixed, state_ptr, conv_ptr,
+                               attn_out, T, ws_, stream))
         return false;
     }
 
-    DumpSeam(("mixer-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
-             attn_out, H_, stream);
+    DumpSeam(
+        ("mixer-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
+        attn_out, H_, stream);
     // 3. mHC write (attn).
     float* R_new = state_ + hc_ * H_;
     if (!rocm::MhcPostGpu(mhc_geom, attn_out, R, post, comb, R_new, T, stream))
       return false;
     R = R_new;
-    DumpSeam(("hc_attn_post-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
-               R, hc_ * H_, stream);
+    DumpSeam(("hc_attn_post-" + std::to_string(il) + "-" + std::to_string(pos))
+                 .c_str(),
+             R, hc_ * H_, stream);
 
     // 4. mHC read (FFN mixer) — uses the FFN mixer weights.
     rocm::MhcGpuWeights mhc_ffn_w;
@@ -701,13 +714,15 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
     if (!rocm::MhcPreGpu(mhc_geom, mhc_ffn_w, R, mixed, post, comb, T, ws_,
                          stream))
       return false;
-    DumpSeam(("hc_ffn_pre-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
-               mixed, H_, stream);
+    DumpSeam(("hc_ffn_pre-" + std::to_string(il) + "-" + std::to_string(pos))
+                 .c_str(),
+             mixed, H_, stream);
     // Maya: rms_norm(mixed, ffn_norm) before the FFN.
     gpu::LaunchRmsNorm(mixed, w_ptrs_[base + kFfnNorm], H_,
                        config_.layer_norm_rms_eps, stream);
-    DumpSeam(("ffn_norm-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
-               mixed, H_, stream);
+    DumpSeam(
+        ("ffn_norm-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
+        mixed, H_, stream);
 
     // 5. FFN (dense for leading layers, MoE otherwise).
     float* ffn_out = sc_ + H_ + hc_ + hc_ * hc_ + H_;
@@ -749,15 +764,17 @@ bool GpuEngine::StepLayers(std::uint32_t pos, hipStream_t stream) {
         return false;
     }
 
-    DumpSeam(("ffn_out-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
-               ffn_out, H_, stream);
+    DumpSeam(
+        ("ffn_out-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
+        ffn_out, H_, stream);
     // 6. mHC write (FFN).
     R_new = (R == state_) ? state_ + hc_ * H_ : state_;
     if (!rocm::MhcPostGpu(mhc_geom, ffn_out, R, post, comb, R_new, T, stream))
       return false;
     R = R_new;
-    DumpSeam(("l_out-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(),
-               R, hc_ * H_, stream);
+    DumpSeam(
+        ("l_out-" + std::to_string(il) + "-" + std::to_string(pos)).c_str(), R,
+        hc_ * H_, stream);
   }
 
   return true;

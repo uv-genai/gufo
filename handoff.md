@@ -232,24 +232,89 @@ disk** (binary is newer). Actual files: `mixer-L`, `attn_norm-L`, `ffn_norm-L`,
 `pf_attn/pf_ctx-L` (11 DSA layers), `pf_shexp-L` (42 MoE layers). The
 `hc_pre/hc_comb/...` names in glm_model.cu are NOT what the binary writes.
 
-**Result so far (relative to rms):**
-- L0 `attn_norm` MATCHES (7e-4) — mHC pre + input rms_norm are correct.
-- L0 `mixer` (KDA output) DIVERGES (rel 3.7) — **root cause: KDA math**.
-- L0 `hc_attn_post`, `ffn_norm`, `ffn_out`, `l_out` all downstream-dirty.
-- L3 `mixer` (DSA) also diverges (rel 3.6) — DSA math also wrong.
+**Result so far (relative to rms), 2026-10-28 late:**
+- L0 `attn_norm` MATCHES (1e-4 T=1 / 7e-4 T=19) — inputs/framing/mHC OK.
+- L0 `mixer` (KDA): **was rel 3.7 → now 1.0e-2 at T=1, 1.5e-2 at last prompt
+  token** (cos 0.999997). Formula confirmed vs Maya `ref/glm.py::kda_layer`.
+  Acceptance target ~1e-3 not yet met — remaining gap is GEMM/fast-math
+  arithmetic (exact Python f64 ref is *farther* (5%) than gufo's f32/Q8_1).
+- L3 `mixer` (DSA) T=1 rel 3e-2 cos 0.99997 — formula close; L7 mixer
+  collapses (input already dirty). `dsa_q/qr/iq` dumps exist in Maya T=1
+  (`/tmp/maya-t1`) but gufo does not dump them yet.
+- L0 `ffn_out` T=1 rel 3.5e-2 (dense FFN OK). L3 `ffn_out` cos 0.94 — MoE
+  top-k/weights still off (or flips under 3% input error).
+- Acceptance prompt still garbage ("( 1. 1 point 2. What is…"), not "Paris".
+
+**KDA bugs FIXED this session (keep these):**
+1. **Conv weight layout + tap order.** GGUF `ssm_conv1d_*` is
+   `(d_conv, 1, inner)` with tap fastest: `conv[tap + K*c]`, tap 0 = **oldest**
+   (Maya `glm_kda_conv` / `ref/glm.py::conv1d_causal`). Old code used
+   `conv[k*inner + c]` with k=0 = newest — both wrong.
+2. **Conv history was never wired.** `kda_conv_off_` existed in the state
+   arena but was not passed to `KdaPrefillGpu`. GpuEngine is T=1-per-token
+   (`StepLayers`), so without `conv_state` every token's conv saw only itself.
+   Now `KdaPrefillGpu(..., state, conv_state, ...)` slides history (Maya
+   layout: 3 streams × (d_conv-1, inner), oldest first).
+3. **`kernels/rocm/kda.cpp` is now a literal port** of Maya
+   `glm_kda.cu` + `l2_heads_kernel`/`sigmoid_kernel`/`axpy_kernel` +
+   step_layers KDA order. Recurrence is one-block-per-head with tokens
+   inside, same phases, `__expf`/`dsigmoid`/`rsqrtf`. Do not re-split those
+   kernels. Small GEMMs use QuantGemm Q8_1 (Maya `native_mmvq`).
+   GFX11 DPP `warp_sum_lanes` ported in `quant_gemv.hip.cpp` (Maya
+   `glm_fast.cu`).
+
+**KDA intermediate localization (T=1, call 0 dumps in GLM_CB_DIR as
+`kda_*-<call>.f32`; compare vs `ref/glm.py` on `attn_norm-0-0`):**
+| tensor | rel vs exact | note |
+| --- | --- | --- |
+| proj_q (Q6_K) | 2.1e-2 | first gap — Q8_1 GEMM vs exact dequant |
+| conv_q | 1.1e-1 max | cos 0.999997 (outliers near 0) |
+| q/k after L2 | 6.7e-2 / 3.2e-2 | |
+| fa / gpre | 8.5e-3 / 3.7e-3 | Q8_0 GEMM much tighter |
+| g1 / beta | 1.4e-2 / 1.4e-3 | gate formula correct |
+| scan / gated / out | 3.9e-2 / 6.2e-2 / 5.5e-2 | |
+vs Maya T=1 `mixer-0`: **rel 9.9e-3**, cos 0.999997 (gate 1e-3 not met).
+vs Maya T=19 last token: rel 1.7e-2.
+
+**Compare-script pitfall:** numpy `reshape(-1)` of `(dk, nh, T)` is
+`e*nh+h`, NOT ggml `e+dk*h`. Use `ref.glm.join_heads` before flattening
+or g1/scan/gated look like cos 0.5 “bugs”.
+
+**KDA math contract (verified — do not re-derive):**
+```
+g  = f_b @ (f_a @ x) + dt_bias          # low-rank, rank = head_dim
+g1 = lb * sigmoid(-g * A)               # A = ssm_a = -exp(A_log) < 0
+beta = sigmoid(ssm_beta @ x)
+S = diag(exp(g1)) @ S;  delta = beta * (v - S^T k);  S += k delta^T
+o = (1/sqrt(dk)) * S^T q
+out = W_o @ (rms_norm_per_head(o, ssm_norm) * sigmoid(g_b @ (g_a @ x)))
+q,k = l2_norm(silu(conv(attn_{q,k} @ x)))   # v NOT l2-normed
+```
+Do NOT use the softplus(qwen4exp) gate form — variants tested, rel 1.2.
+
+**Maya ref oracle:** `project-maya/ref/glm.py` `kda_layer` / `conv1d_causal`
+(+ `ref/load.py` GGUF dequant). Run on strix-halo-1 with
+`PYTHONPATH=.../project-maya:.../tools:.../third_party/llama.cpp/gguf-py`.
+At T=1 the exact ref is 5% from Maya; gufo is 1%. The gap to close is
+arithmetic matching Maya's kernels, not the formula.
 
 ### Next steps (in order)
 
-1. **Fix the KDA math**: side-by-side `src/models/glm5_next/reference.cpp`
-   KdaPrefill (my oracle — wrong) vs Maya `src/core/glm_model.cu` step_layers
-   KDA block (~line 2245-2340) + `src/kernels/cuda/glm_kda.cu`. The
-   `mixer-0` seam is the acceptance check (rel → ~1e-3). Then
-   `kda_gpu_test` should compare against Maya-derived goldens, not just the
-   oracle.
-2. **Fix DSA/MLA** the same way (`dsa_q/qr/iq`, `pf_attn`, `pf_ctx` seams;
-   Maya `glm_dsa.cu`). DSA layers are 3,7,...,43 (11 in the trunk; blk.45 is
-   MTP drafter-only and skipped).
-3. Only then quality (expect "Paris") and speed (117 ms/token → Maya 43 ms).
+1. **Close T=1 `mixer-0` 1e-2 → 1e-3 vs `/tmp/maya-t1/mixer-0.f32`.**
+   KDA elementwise kernels are already a carbon copy. The residual is
+   **QuantGemm Q6_K/Q8_0 vs Maya `native_mmvq`** (proj_q is 2% from exact;
+   Q8_0 fa is 0.8%). Compare `LaunchMmvq` / `RowDotQ8` / `DotQ6_K` to
+   `native_mmvq.cu` `q6_q8_dot` + `native_q6_k_mmvq_kernel` (thread map,
+   block-per-iter, accumulation). DPP `warp_sum_lanes` already ported.
+   Keep `kda_*-<call>.f32` dumps; re-run `/tmp/cmp_kda.py` after each GEMM
+   change (use `join_heads`, not `reshape(-1)`).
+2. **DSA/MLA**: add gufo dumps for `dsa_q/dsa_qr/dsa_iq`; compare vs
+   `/tmp/maya-t1/`. First DSA layer (3) is 3% at T=1. Maya:
+   `src/kernels/cuda/glm_dsa.cu` + step_layers ~2279-2355. Layers
+   3,7,…,43. **`idx_kpool_select_tail` MUST stay true** (Maya
+   `idx_select_tail=1`, refuses false).
+3. **MoE**: L3 `ffn_out` cos 0.94 — re-measure after mixers are tight.
+4. Acceptance prompt → expect "Paris". Only then speed (117 → 43 ms).
 
 ### What is verified correct (do not re-fix)
 
@@ -296,15 +361,12 @@ disk** (binary is newer). Actual files: `mixer-L`, `attn_norm-L`, `ffn_norm-L`,
 
 ### IMMEDIATE NEXT STEPS
 
-1. **Wire real DSA/MLA attention** in `StepLayers` (layers 3,7,…,43 currently
-   copy `mixed → attn_out`; kernels exist in `kernels/rocm/mla.cpp`). This is
-   why output text is degenerate. Parity oracles exist (`mla_oracle_test`).
-2. **Load time 81 s vs Maya 38 s** — profile the load path (`[glm5_gpu]`
-   per-tensor timings are printed); likely host-side dequant and memcpy order.
-3. **Performance**: target >23 tok/s (Maya baseline; measured 17.5 tok/s with
-   MTP spec on a short prompt). Consider the `qfn_mmq` Q8_1/dp4a tier or
-   Maya's `native_mmvq` port for the GEMM hot path.
-4. **MTP draft wiring** for blk.45 (single-host only; fixed width).
+1. **Close the KDA 1% arithmetic gap** (see "Next steps" above) until
+   `mixer-0` T=1 rel < 1e-3 vs `/tmp/maya-t1/mixer-0.f32`.
+2. **DSA/MLA** the same way — add `dsa_q/dsa_qr/dsa_iq` dumps, compare vs
+   Maya T=1. Keep `idx_kpool_select_tail=true`.
+3. **MoE** once mixers are tight (top-k flips under dirty input).
+4. Acceptance prompt → "Paris". Only then speed / load time / MTP.
 
 ### Key files
 

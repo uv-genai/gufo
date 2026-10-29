@@ -6,6 +6,8 @@
 #include <cstring>
 #include <vector>
 
+#include "strata/kernels/glm_hc.hpp"
+
 namespace gufo::models::glm5_next::rocm {
 namespace {
 
@@ -311,87 +313,37 @@ std::size_t MhcScratchFloats(const MhcGpuGeometry& geom,
 bool MhcPreGpu(const MhcGpuGeometry& geom, const MhcGpuWeights& w,
                const float* residual, float* mixed, float* post, float* comb,
                std::uint32_t seq_len, float* scratch, hipStream_t stream) {
-  const std::uint32_t H = geom.hidden_size;
-  const std::uint32_t hc = geom.hc_count;
-  const std::uint32_t mix_dim = geom.hc_mix_dim;
-  const int T = static_cast<int>(seq_len);
-  const std::size_t flat_size = H * hc * T;
-
-  // Device scratch (caller-owned when provided; bump-allocated).
+  // Maya glm_hc_pre — one token (T=1 engine). residual is (hc*n_embd).
+  (void)scratch;
+  strata::kernels::GlmHcShapes s;
+  s.n_embd = geom.hidden_size;
+  s.hc = geom.hc_count;
+  s.sinkhorn_iters = geom.sinkhorn_iters;
+  strata::kernels::GlmHcWorkspace ws;
+  const std::size_t need = strata::kernels::glm_hc_workspace_bytes(s);
   float* owned = nullptr;
   if (scratch == nullptr) {
-    HIP_CHECK(hipMalloc(&owned, MhcScratchFloats(geom, T) * sizeof(float)));
+    if (hipMalloc(&owned, need) != hipSuccess)
+      return false;
     scratch = owned;
   }
-  float* sp = scratch;
-  auto take = [&sp](std::size_t n) {
-    float* r = sp;
-    sp += n;
-    return r;
-  };
-  float* flat = take(flat_size);
-  float* mixes = take(mix_dim * T);
-  float* comb_raw = take(hc * hc * T);
-  float* pre = take(hc * T);
-
-  // Copy residual to flat (stream-major).
-  HIP_CHECK(hipMemcpyAsync(flat, residual, flat_size * sizeof(float),
-                           hipMemcpyDeviceToDevice, stream));
-
-  // 1. Joint inverse-RMS.
-  {
-    const int block = 256;
-    hipLaunchKernelGGL(JointRmsNormKernel, dim3(1), dim3(block), 0, stream,
-                       flat, H * hc, T, geom.norm_eps);
+  strata::kernels::glm_hc_workspace_init(s, scratch, ws);
+  float* pre = nullptr;
+  if (hipMalloc(&pre, (std::size_t)geom.hc_count * sizeof(float)) !=
+      hipSuccess) {
+    if (owned)
+      hipFree(owned);
+    return false;
   }
-
-  // 2. mixes = fn @ flat  [mix_dim, T].
-  {
-    hipLaunchKernelGGL(BatchedMatVecKernel, dim3(mix_dim * T), dim3(256), 0,
-                       stream, w.fn, flat, mixes, mix_dim, H * hc, T);
+  for (std::uint32_t t = 0; t < seq_len; ++t) {
+    strata::kernels::glm_hc_pre(
+        residual + (std::size_t)t * geom.hidden_size * geom.hc_count, w.fn,
+        w.scale, w.base, geom.norm_eps, geom.eps, s, ws,
+        mixed + (std::size_t)t * geom.hidden_size, pre,
+        post + (std::size_t)t * geom.hc_count,
+        comb + (std::size_t)t * geom.hc_count * geom.hc_count, stream);
   }
-
-  // 3. Pre gate.
-  {
-    const int block = 256;
-    const int grid = (hc * T + block - 1) / block;
-    hipLaunchKernelGGL(PreGateKernel, dim3(grid), dim3(block), 0, stream, mixes,
-                       w.scale, w.base, pre, hc, T, geom.eps);
-  }
-
-  // 4. Post gate.
-  {
-    const int block = 256;
-    const int grid = (hc * T + block - 1) / block;
-    hipLaunchKernelGGL(PostGateKernel, dim3(grid), dim3(block), 0, stream,
-                       mixes, w.scale, w.base, post, hc, T);
-  }
-
-  // 5. Comb raw + Sinkhorn.
-  {
-    const int block = 256;
-    const int grid = (hc * hc * T + block - 1) / block;
-    hipLaunchKernelGGL(CombRawKernel, dim3(grid), dim3(block), 0, stream, mixes,
-                       w.scale, w.base, comb_raw, hc, T);
-  }
-
-  // Sinkhorn (fused): softmax dst, +eps, dst-norm, (iters-1)×[src-norm,
-  // dst-norm] — one launch instead of ~2×iters tiny ones.
-  {
-    hipLaunchKernelGGL(SinkhornKernel, dim3(T), dim3(256), 0, stream, comb_raw,
-                       hc, T, geom.sinkhorn_iters, geom.eps);
-    HIP_CHECK(hipMemcpyAsync(comb, comb_raw, hc * hc * T * sizeof(float),
-                             hipMemcpyDeviceToDevice, stream));
-  }
-
-  // 6. Mixed = sum_s pre_s * R_s.
-  {
-    const int block = 256;
-    const int grid = (H * T + block - 1) / block;
-    hipLaunchKernelGGL(MixedKernel, dim3(grid), dim3(block), 0, stream,
-                       residual, pre, mixed, H, hc, T);
-  }
-
+  hipFree(pre);
   if (owned)
     hipFree(owned);
   return true;
@@ -400,18 +352,18 @@ bool MhcPreGpu(const MhcGpuGeometry& geom, const MhcGpuWeights& w,
 bool MhcPostGpu(const MhcGpuGeometry& geom, const float* block_out,
                 const float* residual, const float* post, const float* comb,
                 float* out, std::uint32_t seq_len, hipStream_t stream) {
-  const std::uint32_t H = geom.hidden_size;
-  const std::uint32_t hc = geom.hc_count;
-  const int T = static_cast<int>(seq_len);
-
-  // out_dst = block_out * post_dst + sum_src comb[dst,src] * residual_src.
-  {
-    const int block = 256;
-    const int grid = (H * hc * T + block - 1) / block;
-    hipLaunchKernelGGL(PostKernel, dim3(grid), dim3(block), 0, stream,
-                       block_out, residual, post, comb, out, H, hc, T);
+  strata::kernels::GlmHcShapes s;
+  s.n_embd = geom.hidden_size;
+  s.hc = geom.hc_count;
+  s.sinkhorn_iters = geom.sinkhorn_iters;
+  for (std::uint32_t t = 0; t < seq_len; ++t) {
+    const std::size_t hc_dim = (std::size_t)geom.hidden_size * geom.hc_count;
+    strata::kernels::glm_hc_post(
+        block_out + (std::size_t)t * geom.hidden_size, residual + t * hc_dim,
+        post + (std::size_t)t * geom.hc_count,
+        comb + (std::size_t)t * geom.hc_count * geom.hc_count, s,
+        out + t * hc_dim, stream);
   }
-
   return true;
 }
 
