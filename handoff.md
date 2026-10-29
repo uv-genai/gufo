@@ -6,13 +6,13 @@ redirect until that copy is removed).
 **When state changes** (merge, tag, push, script/config change, incident): **replace
 or edit this file in full** — do not leave stale tips, shas, or “untested” claims.
 
-Last updated: **2026-10-27** (session: v0.24.0 requalify + tag).
+Last updated: **2026-10-29** (session: handoff committed at tip `46eeaf28` = tag `tp2-rdma-merge-v0.25.0-2026-10-27`; upstream **v0.26.0** fetched, not merged).
 
 ---
 
 ## 0. Read next (in order)
 
-1. **This file** (`~/gufo-merge-handoff/handoff.md`)
+1. **This file** (`handoff.md` at the repo root)
 2. Repo `AGENTS.md` (build, remotes, TP2 hazards, **nix count must be 0**)
 3. `docs/MERGE-CHECKLIST.md` (merge + TP2 runtime process)
 4. `docs/models/qwen3.8-flash-next/TP2.md` (collective rules)
@@ -30,8 +30,8 @@ Historical dated handoffs in `~/gufo-merge-handoff/HANDOFF-*.md` are **archive o
 | Branch | **`main`** |
 | Push | **`uv-genai` only** → https://github.com/uv-genai/gufo.git |
 | Upstream | `origin` → gufo-org/gufo; local track **`gufo-org`** — **never push** |
-| Tip | **`106ff0d0`** (`main` == `uv-genai/main` after last push) |
-| Upstream merged through | **v0.24.0** (`0f1bc87a` release); **v0.25.0** fetched not merged |
+| Tip | **`46eeaf28`** = tag **`tp2-rdma-merge-v0.25.0-2026-10-27`** (`main` == `uv-genai/main`) |
+| Upstream merged through | **v0.25.0** (`e3d985f4`); README tracks through v0.25.0 |
 
 **Non-negotiables:** `grep -ci nix AGENTS.md` → **0**; never run that package
 manager; Conventional Commits; ask before any GPU launch.
@@ -43,8 +43,8 @@ manager; Conventional Commits; ask before any GPU launch.
 | | |
 | --- | --- |
 | Path | `build/release/gufo` on **both** hosts |
-| sha256 | **`85fa974cbb7669128416b4cdf8119286da905f225144470e0ff1a8ea8cd10661`** |
-| Built from | `106ff0d0` (v0.24.0 + YaRN group-2 fused attention) |
+| sha256 | **`8602ed01707cbe6c2fcdd48d3a32c9d00e6ee286ce2148997f0454d29433a0c9`** |
+| Built from | tip `46eeaf28` = tag `tp2-rdma-merge-v0.25.0-2026-10-27` (built 2026-10-29 00:53 +0800; **not** yet TP2-smoked this session) |
 | Configure | three host flags in `AGENTS.md` (HIP compiler + `-include format`) |
 
 **TP2 serve defaults** (all four `tools/tp2/rank{0,1}-{q4,q8}.sh`):
@@ -121,7 +121,7 @@ Prompt lookup type: **`speculative::PromptLookup<>`** (moved in v0.22), payload 
 6. **User llama-swap** validation (Q8-tp2).
 7. Tag `tp2-rdma-merge-vX.Y.Z-<YYYY-MM-DD>`; push **uv-genai only**.
 
-Dated tags: v0.16.0-2026-10-17 … **v0.24.0-2026-10-27**. Next: v0.25.0.
+Dated tags: v0.16.0-2026-10-17 … **v0.25.0-2026-10-27**. Next: next upstream.
 
 ---
 
@@ -129,7 +129,7 @@ Dated tags: v0.16.0-2026-10-17 … **v0.24.0-2026-10-27**. Next: v0.25.0.
 
 | Path | Purpose |
 | --- | --- |
-| `README.md` | fork overview; tracks upstream **through v0.23.0**; TP2 table still 2026-10-14 numbers |
+| `README.md` | fork overview; tracks upstream **through v0.25.0** (TP2 table still 2026-10-14 numbers) |
 | `AGENTS.md` | build, remotes, **TP2 hazard table** |
 | `docs/MERGE-CHECKLIST.md` | merge + runtime checklist |
 | `docs/MERGE-UPSTREAM-2026-10-24.md` | series write-up |
