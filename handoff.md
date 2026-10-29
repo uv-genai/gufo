@@ -49,7 +49,8 @@ directive 2026-10-29) so the tag row shows the notes link.
 | sha256 | **`7b9c4e482ceb22dcd2e639f7a336f347d3985935dd46c2d2793025199d1e7ecf`** |
 | Built from | tip **`9b0aabc2`** (v0.26.0 merge; docs-only commits after); format clean |
 | TP2 smoke | **2026-10-29 PASS** on both hosts, sha `7b9c4e48…` matched; `/ready` 200; 10/10 requests (PONG, 3481-tok long, short eBPF NL w/ content asserts, 5× session, 2× agent prefix); logs free of `tp_pair_lost`/mismatch/status5; thinking off via `chat_template_kwargs` for asserts |
-| User llama-swap (Q8-tp2) | **2026-10-29 PASS** — user: prefill “way faster”; token generation **~56 tok/s vs ~45** before |
+| User llama-swap (Q8-tp2) | **2026-10-29 PASS** — user: prefill “way faster”; token gen **~56 vs ~45** (single Jan-client prompt — superseded by three-way spot below) |
+| Three-way spot bench | **2026-10-29** sha `7b9c4e48…`; artifact `artifacts/three-way-2026-10-29.json`; driver `tools/bench/three_way_q4_q8.py` **on strix-halo-1**; REPS medians, unique salts, `cached=0`, `--think off`, ctx 32768 |
 | Released | **`tp2-rdma-merge-v0.26.0-2026-10-29`** on uv-genai (+ GitHub Release notes URL above); **not** pushed to origin |
 | Configure | three host flags in `AGENTS.md` (HIP compiler + `-include format`) |
 
@@ -69,6 +70,25 @@ directive 2026-10-29) so the tag row shows the notes link.
   (rank0 runs from strix-halo-1’s tree). Miss this → config mismatch.
 
 ---
+
+### 2b. Three-way spot numbers (2026-10-29, medians of 5)
+
+Driver: `python3 tools/bench/three_way_q4_q8.py` **on strix-halo-1**.
+Modes AR + MTP; depths short/medium/long; C=4 aggregate in the artifact JSON.
+
+| Depth | Metric | onehost Q4 | Q4 TP2 | Q8 TP2 |
+| --- | --- | ---: | ---: | ---: |
+| short ~200 | pp AR / MTP | 864 / 859 | 609 / 613 | 550 / 573 |
+| short | tg AR / MTP | 27.6 / 43.4 | 33.4 / 46.9 | 30.9 / 45.2 |
+| medium ~2k | pp AR / MTP | 1784 / 1726 | 1822 / 1693 | 1592 / 1527 |
+| medium | tg AR / MTP | 27.2 / 41.9 | **32.6 / 46.8** | 29.8 / 41.1 |
+| long ~8k | pp AR / MTP | 1836 / 1760 | 1895 / 1762 | 1684 / 1639 |
+| long | tg AR / MTP | 27.4 / 42.4 | **32.5 / 46.3** | 30.1 / 40.7 |
+| C=4 short | agg tok/s AR / MTP | 60.2 / 81.4 | 70.1 / 75.1 | 54.0 / 62.7 |
+
+Short-depth `n` is 1–4 where greedy hit EOS before `max_tokens` (rejected).
+`cached=0` on every retained sample. Q8 does not fit one host (no onehost column).
+
 
 ## 3. Hosts & launch
 
