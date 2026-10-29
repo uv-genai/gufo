@@ -6,7 +6,7 @@ redirect until that copy is removed).
 **When state changes** (merge, tag, push, script/config change, incident): **replace
 or edit this file in full** — do not leave stale tips, shas, or “untested” claims.
 
-Last updated: **2026-10-29** (session: **v0.26.0 merged**; tip **`91e4590c`**/`8f7ec822` docs; format + release build; **TP2 Q8 smoke PASS 10/10**; **not** user-llama-swap, **not** tagged/pushed).
+Last updated: **2026-10-29** (session: **v0.26.0 merged**; tip **`6dffaed4`**; format + release build; **TP2 Q8 smoke PASS 10/10**; **user llama-swap PASS — prefill “way faster”**; **not** tagged/pushed).
 
 ---
 
@@ -30,7 +30,7 @@ Historical dated handoffs in `~/gufo-merge-handoff/HANDOFF-*.md` are **archive o
 | Branch | **`main`** |
 | Push | **`uv-genai` only** → https://github.com/uv-genai/gufo.git |
 | Upstream | `origin` → gufo-org/gufo; local track **`gufo-org`** — **never push** |
-| Tip | **`9c7c7274`** (merge + docs; **ahead of** `uv-genai/main`; **do not push** until TP2 smoke) |
+| Tip | **`6dffaed4`** (v0.26.0 merge + docs; **ahead of** `uv-genai/main` @ `46eeaf28`; smoke + user llama-swap green — **ready to tag/push uv-genai**) |
 | Upstream merged through | **v0.26.0** (`78d74185`); README tracks through v0.26.0 |
 
 **Non-negotiables:** `grep -ci nix AGENTS.md` → **0**; never run that package
@@ -46,6 +46,7 @@ manager; Conventional Commits; ask before any GPU launch.
 | sha256 | **`7b9c4e482ceb22dcd2e639f7a336f347d3985935dd46c2d2793025199d1e7ecf`** |
 | Built from | tip **`9b0aabc2`** (v0.26.0 merge; docs-only commits after); format clean |
 | TP2 smoke | **2026-10-29 PASS** on both hosts, sha `7b9c4e48…` matched; `/ready` 200; 10/10 requests (PONG, 3481-tok long, short eBPF NL w/ content asserts, 5× session, 2× agent prefix); logs free of `tp_pair_lost`/mismatch/status5; thinking off via `chat_template_kwargs` for asserts |
+| User llama-swap (Q8-tp2) | **2026-10-29 PASS** — user: “running well and prefill is way faster” |
 | Configure | three host flags in `AGENTS.md` (HIP compiler + `-include format`) |
 
 **TP2 serve defaults** (all four `tools/tp2/rank{0,1}-{q4,q8}.sh`):
@@ -123,7 +124,7 @@ Prompt lookup type: **`speculative::PromptLookup<>`** (moved in v0.22), payload 
 6. **User llama-swap** validation (Q8-tp2).
 7. Tag `tp2-rdma-merge-vX.Y.Z-<YYYY-MM-DD>`; push **uv-genai only**.
 
-Dated tags: v0.16.0-2026-10-17 … **v0.25.0-2026-10-27**. **v0.26.0 merge is untagged** until TP2 smoke + user llama-swap. Next after that tag: next upstream.
+Dated tags: v0.16.0-2026-10-17 … v0.25.0-2026-10-27. **v0.26.0 smoke + user llama-swap green; tag `tp2-rdma-merge-v0.26.0-<date>` and push uv-genai only (not done yet).** Next after that tag: next upstream.
 
 ---
 
