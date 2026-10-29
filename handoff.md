@@ -6,7 +6,7 @@ redirect until that copy is removed).
 **When state changes** (merge, tag, push, script/config change, incident): **replace
 or edit this file in full** — do not leave stale tips, shas, or “untested” claims.
 
-Last updated: **2026-10-29** (session: **v0.26.0 merged**; tip **`9c7c7274`**; format + release build done; **not** TP2-smoked, **not** tagged/pushed).
+Last updated: **2026-10-29** (session: **v0.26.0 merged**; tip **`91e4590c`**/`8f7ec822` docs; format + release build; **TP2 Q8 smoke PASS 10/10**; **not** user-llama-swap, **not** tagged/pushed).
 
 ---
 
@@ -44,7 +44,8 @@ manager; Conventional Commits; ask before any GPU launch.
 | --- | --- |
 | Path | `build/release/gufo` on **both** hosts |
 | sha256 | **`7b9c4e482ceb22dcd2e639f7a336f347d3985935dd46c2d2793025199d1e7ecf`** |
-| Built from | tip **`9c7c7274`** lineage (v0.26.0 merge; binary built before README tip bump — same code tree as merge `9b0aabc2`); format clean; **not** TP2-smoked; **not** shipped to strix-halo-1 |
+| Built from | tip **`9b0aabc2`** (v0.26.0 merge; docs-only commits after); format clean |
+| TP2 smoke | **2026-10-29 PASS** on both hosts, sha `7b9c4e48…` matched; `/ready` 200; 10/10 requests (PONG, 3481-tok long, short eBPF NL w/ content asserts, 5× session, 2× agent prefix); logs free of `tp_pair_lost`/mismatch/status5; thinking off via `chat_template_kwargs` for asserts |
 | Configure | three host flags in `AGENTS.md` (HIP compiler + `-include format`) |
 
 **TP2 serve defaults** (all four `tools/tp2/rank{0,1}-{q4,q8}.sh`):
