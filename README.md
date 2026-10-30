@@ -283,7 +283,8 @@ checks. See [testing](docs/TESTING.md) and [benchmarking](docs/BENCHMARKS.md).
 
 ## License
 
-Gufo's original code is [MIT licensed](LICENSE). Gufo-TP adds RDMA/TP2 work
+[gufo-org/gufo](https://github.com/gufo-org/gufo)'s original code is
+[MIT licensed](LICENSE). Gufo-TP adds RDMA/TP2 work
 under the same license, building on the TP2/RDMA implementation from
 [neuhaus/gufo](https://github.com/neuhaus/gufo). Adapted code and dependencies
 retain their own notices in [NOTICE](NOTICE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
@@ -294,6 +295,9 @@ bundled and retain their publishers' terms.
 
 The initial design is informed by the following open source projects:
 
+- **[gufo-org/gufo](https://github.com/gufo-org/gufo)** — the project Gufo-TP
+  comes from and tracks: all one-host models, kernels, serving and tooling
+  originate there.
 - [neuhaus/gufo](https://github.com/neuhaus/gufo) for the **TP2/RDMA two-host**
   implementation Gufo-TP extends (plus fixes listed under *Why this project*).
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) for compact model serving, GGUF, and CPU/GPU correctness paths.
