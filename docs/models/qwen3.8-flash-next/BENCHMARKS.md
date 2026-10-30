@@ -6,7 +6,7 @@ Positive gain favors Gufo.
 [Quality and measurement details](QUALITY.md#benchmark-method) · [Model identities](artifacts/model-identities.json)
 
 - [Single Strix Halo](#single-strix-halo): Gufo against llama.cpp.
-- [Two Strix Halos over RDMA](#two-strix-halos-over-rdma): Gufo RDMA against
+- [Two Strix Halos over RDMA](#two-strix-halos-over-rdma): Gufo-TP against
   Gufo on one host, deeper contexts, and the full Q8 model.
 
 ## Single Strix Halo
@@ -204,10 +204,10 @@ C1, context capacity 133121, AR. Peak memory reported by HIP.
 
 ## Two Strix Halos over RDMA
 
-Gufo RDMA runs one model on two such hosts: every layer is split between them,
+Gufo-TP runs one model on two such hosts: every layer is split between them,
 and they exchange partial sums over RDMA ([how it works](TP2.md)).
 The workloads are those of the one-host tables; "Gufo" is the same build on
-one host, and gain is Gufo RDMA over it. With twice the memory, single users
+one host, and gain is Gufo-TP over it. With twice the memory, single users
 also reach depths one host cannot (context capacity 262144). Every RDMA table
 was measured on October 9, 2026 (`c85349b5`) over USB4 RoCE v2, with the
 same-build one-host runs beside them, in the balanced power mode (85 W
@@ -218,7 +218,7 @@ host; with a cached prefix, prefill gains 3–15%.
 ### Single user, autoregressive
 
 <!-- bench:single-ar-tp2 -->
-| Flash-Next Q4 AR<br>Depth (tokens) | Gufo pp (tok/s) | Gufo RDMA pp (tok/s) | Gain | Gufo tg (tok/s) | Gufo RDMA tg (tok/s) | Gain |
+| Flash-Next Q4 AR<br>Depth (tokens) | Gufo pp (tok/s) | Gufo-TP pp (tok/s) | Gain | Gufo tg (tok/s) | Gufo-TP tg (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 0 | 1492.22 | 1299.73 | -12.9% | 26.71 | 32.91 | +23.2% |
 | 4,096 | 1342.09 | 1412.63 | +5.3% | 26.69 | 32.81 | +22.9% |
@@ -233,7 +233,7 @@ host; with a cached prefix, prefill gains 3–15%.
 ### Single user, MTP
 
 <!-- bench:single-mtp-tp2 -->
-| Flash-Next Q4 MTP<br>Depth (tokens) | Gufo pp (tok/s) | Gufo RDMA pp (tok/s) | Gain pp | Gufo tg mixed (tok/s) | Gufo RDMA tg mixed (tok/s) | Gain mixed | Gufo tg repetitive (tok/s) | Gufo RDMA tg repetitive (tok/s) | Gain repetitive |
+| Flash-Next Q4 MTP<br>Depth (tokens) | Gufo pp (tok/s) | Gufo-TP pp (tok/s) | Gain pp | Gufo tg mixed (tok/s) | Gufo-TP tg mixed (tok/s) | Gain mixed | Gufo tg repetitive (tok/s) | Gufo-TP tg repetitive (tok/s) | Gain repetitive |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 0 | 1420.72 | 1346.32 | -5.2% | 32.03 | 37.88 | +18.3% | 60.11 | 79.33 | +32.0% |
 | 4,096 | 1301.51 | 1333.77 | +2.5% | 33.25 | 47.46 | +42.7% | 56.03 | 60.82 | +8.5% |
@@ -251,7 +251,7 @@ Same pp2048 prose prompt, tg128, context 4096 per user; every session
 prefills before timed decoding. Rates sum individual decode rates.
 
 <!-- bench:multi-ar-tp2 -->
-| Flash-Next Q4 AR<br>Users | Gufo AR (tok/s) | Gufo RDMA AR (tok/s) | Gain |
+| Flash-Next Q4 AR<br>Users | Gufo AR (tok/s) | Gufo-TP AR (tok/s) | Gain |
 | ---: | ---: | ---: | ---: |
 | 1 | 25.09 | 32.89 | +31.1% |
 | 2 | 46.95 | 56.77 | +20.9% |
@@ -269,7 +269,7 @@ prompts. Every prepared completion, on both topologies and in all modes, matches
 its fresh one-user AR control.
 
 <!-- bench:multi-mtp-tp2 -->
-| Flash-Next Q4 MTP<br>Users | Gufo mixed (tok/s) | Gufo RDMA mixed (tok/s) | Gain | Gufo repetitive (tok/s) | Gufo RDMA repetitive (tok/s) | Gain |
+| Flash-Next Q4 MTP<br>Users | Gufo mixed (tok/s) | Gufo-TP mixed (tok/s) | Gain | Gufo repetitive (tok/s) | Gufo-TP repetitive (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1 | 32.04 | 37.75 | +17.8% | 60.16 | 74.16 | +23.3% |
 | 2 | 53.57 | 66.98 | +25.0% | 84.28 | 113.63 | +34.8% |

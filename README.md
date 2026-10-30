@@ -1,18 +1,19 @@
-# Gufo RDMA: The ***Open Source*** Strix Halo AI engine
+# Gufo-TP: The ***Open Source*** Strix Halo AI engine with tensor parallelism
 
 <p align="center">
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
-Gufo is a vertical local inference engine specifically built and optimized for
-the AMD Strix Halo hardware: Ryzen AI MAX+ 395 systems with Radeon 8060S
-(`gfx1151`), up to 128 GiB of unified memory.
+Gufo-TP is a vertical local inference engine specifically built and optimized
+for the AMD Strix Halo hardware: Ryzen AI MAX+ 395 systems with Radeon 8060S
+(`gfx1151`), up to 128 GiB of unified memory — with **RDMA tensor
+parallelism across two hosts** on top.
 
 > [!IMPORTANT]
-> **This repository is a fork** of
-> [gufo-org/gufo](https://github.com/gufo-org/gufo) that adds **RDMA tensor
-> parallelism (TP2)** for two Strix Halo hosts. It tracks upstream `main`
-> (through **v0.26.0**) and keeps every one-host feature and
+> **Gufo-TP is its own project.** It merges
+> [gufo-org/gufo](https://github.com/gufo-org/gufo) with the **TP2-enabled fork**
+> [neuhaus/gufo](https://github.com/neuhaus/gufo), tracks upstream `main`
+> (through **v0.26.0**), and keeps every one-host feature and
 > fix; the forked work is the two-host path (InfiniBand, RoCE v2, or
 > USB4/Thunderbolt) and its launchers and benchmarks.
 >
@@ -31,10 +32,10 @@ the AMD Strix Halo hardware: Ryzen AI MAX+ 395 systems with Radeon 8060S
 > - **Design and limits**: [TP2.md](docs/models/qwen3.8-flash-next/TP2.md)
 >
 > See the [changelog](CHANGELOG.md) for history. Upstream releases:
-> [gufo-org/gufo](https://github.com/gufo-org/gufo/releases). This fork publishes
-> from [uv-genai/gufo](https://github.com/uv-genai/gufo) (`main` only).
+> [gufo-org/gufo](https://github.com/gufo-org/gufo/releases). Gufo-TP publishes
+> from [uv-genai/gufo-tp](https://github.com/uv-genai/gufo-tp) (`main` only).
 
-## Why this fork
+## Why this project
 
 On one host, Flash-Next decode and prefill are already excellent. **TP2 is
 faster than one host at every concurrency we measured**, and it holds contexts
@@ -282,7 +283,7 @@ checks. See [testing](docs/TESTING.md) and [benchmarking](docs/BENCHMARKS.md).
 
 ## License
 
-Gufo's original code is [MIT licensed](LICENSE). This fork adds RDMA/TP2 work
+Gufo's original code is [MIT licensed](LICENSE). Gufo-TP adds RDMA/TP2 work
 under the same license, building on the TP2/RDMA implementation from
 [neuhaus/gufo](https://github.com/neuhaus/gufo). Adapted code and dependencies
 retain their own notices in [NOTICE](NOTICE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
@@ -294,7 +295,7 @@ bundled and retain their publishers' terms.
 The initial design is informed by the following open source projects:
 
 - [neuhaus/gufo](https://github.com/neuhaus/gufo) for the **TP2/RDMA two-host**
-  implementation this fork extends (plus fixes listed under *Why this fork*).
+  implementation Gufo-TP extends (plus fixes listed under *Why this project*).
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) for compact model serving, GGUF, and CPU/GPU correctness paths.
 - [LaurentZuijdwijk/llama.cpp](https://github.com/LaurentZuijdwijk/llama.cpp), [Nathanw1014/strix-halo-llamacpp](https://github.com/Nathanw1014/strix-halo-llamacpp), and [gaetan-puleo/llama-cpp-strix-halo](https://github.com/gaetan-puleo/llama-cpp-strix-halo) for Strix Halo optimization inspiration.
 - [vLLM](https://github.com/vllm-project/vllm) for continuous batching and paged request scheduling.

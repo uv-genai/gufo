@@ -1,4 +1,4 @@
-# LIVE HANDOFF — gufo TP2 fork
+# LIVE HANDOFF — gufo-tp fork (Gufo-TP)
 
 **Canonical path:** `handoff.md` in **this repository** (`/home/ugo/projects/gufo/handoff.md`).
 **New sessions read this first** (also see `~/gufo-merge-handoff/handoff.md` only as a
@@ -6,7 +6,7 @@ redirect until that copy is removed).
 **When state changes** (merge, tag, push, script/config change, incident): **replace
 or edit this file in full** — do not leave stale tips, shas, or “untested” claims.
 
-Last updated: **2026-10-29** (session: **v0.26.0 merged, smoke + user llama-swap PASS; tagged and released**; user decode report **~56 vs ~45 tok/s** — see §1).
+Last updated: **2026-10-29** (session: **v0.26.0 merged, smoke + user llama-swap PASS; tagged and released**; user decode report **~56 vs ~45 tok/s**; **project renamed to Gufo-TP; repo uv-genai/gufo → uv-genai/gufo-tp** — see §1).
 
 ---
 
@@ -28,11 +28,12 @@ Historical dated handoffs in `~/gufo-merge-handoff/HANDOFF-*.md` are **archive o
 | --- | --- |
 | Tree | `/home/ugo/projects/gufo` |
 | Branch | **`main`** |
-| Push | **`uv-genai` only** → https://github.com/uv-genai/gufo.git |
+| Push | **`uv-genai` only** → https://github.com/uv-genai/gufo-tp.git |
 | Upstream | `origin` → gufo-org/gufo; local track **`gufo-org`** — **never push** |
-| Tip | **`8b229542`** = tag **`tp2-rdma-merge-v0.26.0-2026-10-29`** (`main` == `uv-genai/main`) |
+| Tip | **`8b229542`** = tag **`tp2-rdma-merge-v0.26.0-2026-10-29`** (+ docs commits after) |
 | Upstream merged through | **v0.26.0** (`78d74185`); README tracks through v0.26.0 |
-| Release notes | **https://github.com/uv-genai/gufo/releases/tag/tp2-rdma-merge-v0.26.0-2026-10-29** |
+| Release notes | **https://github.com/uv-genai/gufo-tp/releases/tag/tp2-rdma-merge-v0.26.0-2026-10-29** |
+| Repo rename | 2026-10-29: `uv-genai/gufo` → **`uv-genai/gufo-tp`**; project is **Gufo-TP** (binary/CLI stays `gufo`) |
 
 **Non-negotiables:** `grep -ci nix AGENTS.md` → **0**; never run that package
 manager; Conventional Commits; ask before any GPU launch.
@@ -163,7 +164,7 @@ Dated tags: v0.16.0-2026-10-17 … **v0.26.0-2026-10-29** (Release notes linked)
 | `docs/models/qwen3.8-flash-next/TP2.md` | collective rules |
 | `docs/SERVER.md` / `docs/CLI.md` | `--enable-yarn`, context > 262144 |
 
-External: **uv-genai/gufo issue #1** — comment on YaRN implementation
+External: **uv-genai/gufo-tp issue #1** — comment on YaRN implementation
 (v0.21.0+); still open (NTK / `--rope-scale` API not implemented).
 
 ---

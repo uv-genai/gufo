@@ -9,7 +9,7 @@ one-host tables. The 2026-10-14 post-merge Q4/Q8 depth and concurrency series
 is [2026-10-14-tp2-depth-series.md](2026-10-14-tp2-depth-series.md).
 
 **Origin:** the TP2/RDMA design and implementation come from
-[neuhaus/gufo](https://github.com/neuhaus/gufo). This fork tracks upstream
+[neuhaus/gufo](https://github.com/neuhaus/gufo). Gufo-TP tracks upstream
 gufo-org and adds correctness fixes on that base (mirrored draft counts,
 strided SSM vs TP2 half width, draft-subset single-host only, n-gram
 `embeddings_ready` double-wait), plus launchers under `tools/tp2/`.

@@ -23,7 +23,7 @@ ONE_HOST = "gufo-onehost"
 TABLES = ("single-ar-tp2", "single-mtp-tp2", "multi-ar-tp2", "multi-mtp-tp2", "tp2-q8",
           "tp2-q8-multi")
 # Readers know the link, not the parallelism scheme: tables and charts say RDMA.
-RDMA = "Gufo RDMA"
+RDMA = "Gufo-TP"
 Q8_LABEL = "Flash-Next Q8 RDMA"
 NONE = "—"
 
