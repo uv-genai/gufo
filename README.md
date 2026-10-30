@@ -13,7 +13,7 @@ parallelism across two hosts** on top.
 > **Gufo-TP is its own project.** It merges
 > [gufo-org/gufo](https://github.com/gufo-org/gufo) with the **TP2-enabled fork**
 > [neuhaus/gufo](https://github.com/neuhaus/gufo), tracks upstream `main`
-> (through **v0.26.0**), and keeps every one-host feature and
+> (through **v0.27.0**), and keeps every one-host feature and
 > fix; the forked work is the two-host path (InfiniBand, RoCE v2, or
 > USB4/Thunderbolt) and its launchers and benchmarks.
 >
@@ -40,12 +40,12 @@ parallelism across two hosts** on top.
 On one host, Flash-Next decode and prefill are already excellent. **TP2 is
 faster than one host at every concurrency we measured**, and it holds contexts
 and the full Q8 model that do not fit a single 128 GiB APU. After merging
-upstream through v0.26.0, one-host Flash-Next reports **1,801.01 tok/s AR
+upstream through v0.27.0, one-host Flash-Next reports **1,801.01 tok/s AR
 prefill** and up to **116.93 tok/s tg** (see [Benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md)).
 The matched TP2 series below is from the v0.15.0-era binary (Q4 MTP,
 `pp2048 / tg128`, 2026-10-14). TP2 **runtime** was requalified on
 `tp2-rdma-merge-v0.23.0-2026-10-24` (smoke + user llama-swap); the table
-numbers below have **not** been re-benchmarked on v0.26.0:
+numbers below have **not** been re-benchmarked on v0.27.0:
 
 | Depth (tokens) | 1-host pp | **TP2 pp** | 1-host tg | **TP2 tg** |
 | ---: | ---: | ---: | ---: | ---: |
