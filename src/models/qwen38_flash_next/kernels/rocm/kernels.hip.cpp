@@ -8019,8 +8019,7 @@ bool WmmaCausalAttention(const float* q, const float* gate,
   // One host holds both KV heads; a TP rank holds one with its query group.
   if ((kv_heads != kWmmaKvHeads && kv_heads != 1) ||
       heads != kv_heads * kWmmaGqa || d != kWmmaHeadDim ||
-      ratio != kWmmaRatio || n_tokens == 0 ||
-      (mask != nullptr && mask_words > kWmmaMaxMaskWords)) {
+      ratio != kWmmaRatio || n_tokens == 0) {
     return false;
   }
   if (mask != nullptr) {
