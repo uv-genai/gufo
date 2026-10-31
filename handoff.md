@@ -6,7 +6,7 @@ redirect until that copy is removed).
 **When state changes** (merge, tag, push, script/config change, incident): **replace
 or edit this file in full** — do not leave stale tips, shas, or “untested” claims.
 
-Last updated: **2026-10-30** (session: **v0.27.0 merged, built, format PASS — TP2 smoke PENDING**; blocked by a `maya` GLM-5 process holding ~50 GiB on strix-halo-2; user will say when GPUs are free. Tip **`39a0f3e7`**, **not pushed/tagged** until smoke passes. Project is **Gufo-TP**; repo `uv-genai/gufo-tp`).
+Last updated: **2026-10-31** (session: **v0.27.0 merged, built, TP2 smoke PASS 10/10**; **awaiting user llama-swap** then tag/push. Tip **`ff9ade6a`**, **not pushed**. Project is **Gufo-TP**; repo `uv-genai/gufo-tp`).
 
 ---
 
@@ -30,8 +30,8 @@ Historical dated handoffs in `~/gufo-merge-handoff/HANDOFF-*.md` are **archive o
 | Branch | **`main`** |
 | Push | **`uv-genai` only** → https://github.com/uv-genai/gufo-tp.git |
 | Upstream | `origin` → gufo-org/gufo; local track **`gufo-org`** — **never push** |
-| Tip | **`67e20e61`** = v0.27.0 merge `9d7e7209` + README + kernels fix `67e20e61` (**local only; not pushed**) |
-| Upstream merged through | **v0.27.0** (`de15fdb9`); README tracks through v0.27.0; **smoke pending, do not tag/push** |
+| Tip | **`ff9ade6a`** = v0.27.0 merge + kernels fix + handoff (**local only; not pushed**) |
+| Upstream merged through | **v0.27.0** (`de15fdb9`); README tracks through v0.27.0; smoke PASS — **user llama-swap pending, then tag/push** |
 | v0.26.0 tag | `8b229542` = `tp2-rdma-merge-v0.26.0-2026-10-29` (released; see notes URL) |
 | Release notes | **https://github.com/uv-genai/gufo-tp/releases/tag/tp2-rdma-merge-v0.26.0-2026-10-29** |
 | Repo rename | 2026-10-29: `uv-genai/gufo` → **`uv-genai/gufo-tp`**; project is **Gufo-TP** (binary/CLI stays `gufo`) |
@@ -50,7 +50,7 @@ directive 2026-10-29) so the tag row shows the notes link.
 | Path | `build/release/gufo` on **both** hosts |
 | sha256 | **`bcba05beca2503ec76dc823b97aa414daa163622f0c7896258610f166de8555d`** (v0.27.0) — shipped to strix-halo-1 already |
 | Built from | tip **`67e20e61`** (v0.27.0 merge + kernels `kWmmaMemberShift` fix); format clean; tree == HEAD |
-| TP2 smoke | **2026-10-30 PENDING** — merge touches `engine.cpp` (logprobs), `executor.cpp` (`kMtpDraftExtraRows`), `device_model.cpp` (F32 Q8_0 expansion), `speculative_verifier` (logprobs). One build fix applied: fork's `WmmaCausalAttention` updated from removed `kWmmaMaxMaskWords` to upstream `kWmmaMemberShift` limit. Wait for user: `maya` holds ~50 GiB on strix-halo-2. |
+| TP2 smoke | **2026-10-31 PASS 10/10** on both hosts, sha `bcba05be…` matched; `/ready` 200; PONG, 3481-tok long, short eBPF NL content asserts, 5× session, 2× agent prefix; logs free of `tp_pair_lost`/mismatch/status5; only expected `q8_0_expanded` WARN (upstream #788, 168 tensors); pair stopped for user llama-swap |
 | v0.26.0 smoke | **2026-10-29 PASS** on both hosts, sha `7b9c4e48…` matched; `/ready` 200; 10/10 requests (PONG, 3481-tok long, short eBPF NL w/ content asserts, 5× session, 2× agent prefix); logs free of `tp_pair_lost`/mismatch/status5; thinking off via `chat_template_kwargs` for asserts |
 | User llama-swap (Q8-tp2) | **2026-10-29 PASS** — user: prefill “way faster”; token gen **~56 vs ~45** (single Jan-client prompt — superseded by three-way spot below) |
 | Three-way spot bench | **2026-10-29** sha `7b9c4e48…`; artifact `artifacts/three-way-2026-10-29.json`; driver `tools/bench/three_way_q4_q8.py` **on strix-halo-1**; REPS medians, unique salts, `cached=0`, `--think off`, ctx 32768 |
