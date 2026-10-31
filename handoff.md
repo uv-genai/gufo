@@ -30,10 +30,10 @@ Historical dated handoffs in `~/gufo-merge-handoff/HANDOFF-*.md` are **archive o
 | Branch | **`main`** |
 | Push | **`uv-genai` only** → https://github.com/uv-genai/gufo-tp.git |
 | Upstream | `origin` → gufo-org/gufo; local track **`gufo-org`** — **never push** |
-| Tip | **`ff9ade6a`** = v0.27.0 merge + kernels fix + handoff (**local only; not pushed**) |
-| Upstream merged through | **v0.27.0** (`de15fdb9`); README tracks through v0.27.0; smoke PASS — **user llama-swap pending, then tag/push** |
-| v0.26.0 tag | `8b229542` = `tp2-rdma-merge-v0.26.0-2026-10-29` (released; see notes URL) |
-| Release notes | **https://github.com/uv-genai/gufo-tp/releases/tag/tp2-rdma-merge-v0.26.0-2026-10-29** |
+| Tip | **`65493ca6`** = tag **`tp2-rdma-merge-v0.27.0-2026-10-31`** (`main` == `uv-genai/main`) |
+| Upstream merged through | **v0.27.0** (`de15fdb9`); README tracks through v0.27.0; smoke 10/10 + user llama-swap PASS; **released** |
+| v0.26.0 tag | `8b229542` = `tp2-rdma-merge-v0.26.0-2026-10-29` (released) |
+| Release notes | **v0.27.0**: https://github.com/uv-genai/gufo-tp/releases/tag/tp2-rdma-merge-v0.27.0-2026-10-31 · v0.26.0: …/tp2-rdma-merge-v0.26.0-2026-10-29 |
 | Repo rename | 2026-10-29: `uv-genai/gufo` → **`uv-genai/gufo-tp`**; project is **Gufo-TP** (binary/CLI stays `gufo`) |
 
 **Non-negotiables:** `grep -ci nix AGENTS.md` → **0**; never run that package
@@ -54,7 +54,7 @@ directive 2026-10-29) so the tag row shows the notes link.
 | v0.26.0 smoke | **2026-10-29 PASS** on both hosts, sha `7b9c4e48…` matched; `/ready` 200; 10/10 requests (PONG, 3481-tok long, short eBPF NL w/ content asserts, 5× session, 2× agent prefix); logs free of `tp_pair_lost`/mismatch/status5; thinking off via `chat_template_kwargs` for asserts |
 | User llama-swap (Q8-tp2) | **2026-10-29 PASS** (v0.26.0) — prefill “way faster”, decode ~56 vs ~45; **2026-10-31 PASS** (v0.27.0): “works well” |
 | Three-way spot bench | **2026-10-29** sha `7b9c4e48…`; artifact `artifacts/three-way-2026-10-29.json`; driver `tools/bench/three_way_q4_q8.py` **on strix-halo-1**; REPS medians, unique salts, `cached=0`, `--think off`, ctx 32768 |
-| Released | **`tp2-rdma-merge-v0.26.0-2026-10-29`** on uv-genai (+ GitHub Release notes URL above); **not** pushed to origin |
+| Released | **`tp2-rdma-merge-v0.27.0-2026-10-31`** (this tag) and `tp2-rdma-merge-v0.26.0-2026-10-29` on uv-genai with GitHub Release notes; **not** pushed to origin |
 | Configure | three host flags in `AGENTS.md` (HIP compiler + `-include format`) |
 
 **TP2 serve defaults** (all four `tools/tp2/rank{0,1}-{q4,q8}.sh`):
@@ -151,7 +151,7 @@ Prompt lookup type: **`speculative::PromptLookup<>`** (moved in v0.22), payload 
 6. **User llama-swap** validation (Q8-tp2).
 7. Tag `tp2-rdma-merge-vX.Y.Z-<YYYY-MM-DD>`; push **uv-genai only**.
 
-Dated tags: v0.16.0-2026-10-17 … **v0.26.0-2026-10-29** (Release notes linked). Next: next upstream. **Each new tag: push uv-genai + create GitHub Release with notes.**
+Dated tags: v0.16.0-2026-10-17 … **v0.27.0-2026-10-31** (Release notes linked). Next: next upstream. **Each new tag: push uv-genai + create GitHub Release with notes.**
 
 ---
 
